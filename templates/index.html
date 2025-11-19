@@ -2,51 +2,139 @@
 <html>
     <head>
         <title>Live Transcription</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 800px;
+                margin: 50px auto;
+                padding: 20px;
+            }
+            #status {
+                padding: 10px;
+                border-radius: 5px;
+                margin: 20px 0;
+            }
+            .connected {
+                background-color: #d4edda;
+                color: #155724;
+            }
+            .disconnected {
+                background-color: #f8d7da;
+                color: #721c24;
+            }
+            button {
+                padding: 10px 20px;
+                font-size: 16px;
+                cursor: pointer;
+            }
+            #transcript {
+                margin-top: 20px;
+                padding: 15px;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                min-height: 200px;
+                background-color: #f9f9f9;
+            }
+        </style>
     </head>
     <body>
         <h1>Transcribe Audio With FastAPI</h1>
-        <p id="status">Connection status will go here</p>
-        <p id="transcript"></p>
+        <p id="status" class="disconnected">Not Connected</p>
+        <button id="recordButton">Start Recording</button>
+        <div id="transcript"></div>
 
         <script>
-               navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-            if (!MediaRecorder.isTypeSupported('audio/webm'))
-                return alert('Browser not supported')
+            const recordButton = document.getElementById('recordButton');
+            const statusEl = document.getElementById('status');
+            const transcriptEl = document.getElementById('transcript');
+            
+            let mediaRecorder = null;
+            let socket = null;
+            let isRecording = false;
 
-            const mediaRecorder = new MediaRecorder(stream, {
-                mimeType: 'audio/webm',
-            })
+            // Determine WebSocket URL dynamically
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/listen`;
+            
+            console.log('WebSocket URL:', wsUrl);
 
-            const socket = new WebSocket('ws://localhost:8000/listen')
-
-            socket.onopen = () => {
-                document.querySelector('#status').textContent = 'Connected'
-                console.log({ event: 'onopen' })
-                mediaRecorder.addEventListener('dataavailable', async (event) => {
-                    if (event.data.size > 0 && socket.readyState == 1) {
-                        socket.send(event.data)
-                    }
-            })
-            mediaRecorder.start(250)
-            }
-
-            socket.onmessage = (message) => {
-                const received = message.data
-                if (received) {
-                    console.log(received)
-                    document.querySelector('#transcript').textContent += ' ' + received
+            recordButton.addEventListener('click', async () => {
+                if (!isRecording) {
+                    await startRecording();
+                } else {
+                    stopRecording();
                 }
-           }
+            });
 
-           socket.onclose = () => {
-            console.log({ event: 'onclose' })
-        }
+            async function startRecording() {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    
+                    if (!MediaRecorder.isTypeSupported('audio/webm')) {
+                        alert('Browser not supported');
+                        return;
+                    }
 
-            socket.onerror = (error) => {
-                console.log({ event: 'onerror', error })
+                    mediaRecorder = new MediaRecorder(stream, {
+                        mimeType: 'audio/webm',
+                    });
+
+                    socket = new WebSocket(wsUrl);
+
+                    socket.onopen = () => {
+                        statusEl.textContent = 'Connected - Recording...';
+                        statusEl.className = 'connected';
+                        console.log('WebSocket connected');
+                        
+                        mediaRecorder.addEventListener('dataavailable', async (event) => {
+                            if (event.data.size > 0 && socket.readyState === 1) {
+                                socket.send(event.data);
+                            }
+                        });
+                        
+                        mediaRecorder.start(250);
+                        isRecording = true;
+                        recordButton.textContent = 'Stop Recording';
+                    };
+
+                    socket.onmessage = (message) => {
+                        const received = message.data;
+                        if (received) {
+                            console.log('Received:', received);
+                            transcriptEl.textContent += ' ' + received;
+                        }
+                    };
+
+                    socket.onclose = () => {
+                        console.log('WebSocket closed');
+                        statusEl.textContent = 'Disconnected';
+                        statusEl.className = 'disconnected';
+                    };
+
+                    socket.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        statusEl.textContent = 'Connection Error';
+                        statusEl.className = 'disconnected';
+                    };
+
+                } catch (error) {
+                    console.error('Error starting recording:', error);
+                    alert('Error accessing microphone: ' + error.message);
+                }
             }
 
-           })
+            function stopRecording() {
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.stop();
+                }
+                if (socket) {
+                    socket.close();
+                }
+                isRecording = false;
+                recordButton.textContent = 'Start Recording';
+                statusEl.textContent = 'Stopped';
+                statusEl.className = 'disconnected';
+            }
         </script>
     </body>
 </html>
