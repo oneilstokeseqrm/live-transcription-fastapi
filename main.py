@@ -5,12 +5,14 @@ from typing import Dict, Callable
 from deepgram import Deepgram
 from dotenv import load_dotenv
 import os
+from services.event_publisher import EventPublisher
 
 load_dotenv()
 
 app = FastAPI()
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
+event_publisher = EventPublisher()
 
 templates = Jinja2Templates(directory="templates")
 
@@ -21,6 +23,14 @@ async def process_audio(fast_socket: WebSocket):
         
             if transcript:
                 await fast_socket.send_text(transcript)
+                
+                if data.get('is_final', False):
+                    tenant_id = os.getenv('MOCK_TENANT_ID', 'default_org')
+                    await event_publisher.publish_transcript_event(
+                        transcript=transcript,
+                        metadata=data,
+                        tenant_id=tenant_id
+                    )
 
     deepgram_socket = await connect_to_deepgram(get_transcript)
 
