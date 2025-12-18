@@ -8,6 +8,7 @@ import os
 import sys
 import uuid
 import logging
+import json
 from services.event_publisher import EventPublisher
 from services.cleaner_service import CleanerService
 
@@ -84,16 +85,39 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info(f"WebSocket connection established: session_id={session_id}")
 
+    deepgram_socket = None
+    
     try:
         deepgram_socket = await process_audio(websocket, session_id) 
 
         while True:
-            data = await websocket.receive_bytes()
-            deepgram_socket.send(data)
+            # Use receive() instead of receive_bytes() to handle both audio and control messages
+            message = await websocket.receive()
+            
+            if "bytes" in message:
+                # It's audio data -> Send to Deepgram
+                deepgram_socket.send(message["bytes"])
+            elif "text" in message:
+                # It's a control signal -> Check for stop
+                try:
+                    data = json.loads(message["text"])
+                    if data.get("type") == "stop_recording":
+                        logger.info(f"Stop signal received: session_id={session_id}")
+                        break  # Exit loop -> Enters 'finally' block -> Triggers Cleaning
+                except json.JSONDecodeError:
+                    logger.warning(f"Received non-JSON text message: {message['text']}")
+                    
     except Exception as e:
         logger.error(f"WebSocket error: session_id={session_id}, error={e}")
-        raise Exception(f'Could not process audio: {e}')
     finally:
+        # Close Deepgram connection
+        if deepgram_socket:
+            try:
+                deepgram_socket.finish()
+                logger.info(f"Deepgram connection closed: session_id={session_id}")
+            except Exception as e:
+                logger.warning(f"Error closing Deepgram socket: {e}")
+        
         # Step 1: Retrieve raw transcript
         try:
             raw_transcript = await event_publisher.get_final_transcript(session_id)
@@ -105,24 +129,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
                 
                 # Step 2: Clean and structure the transcript
+                logger.info(f"Starting transcript cleaning: session_id={session_id}")
                 meeting_output = await cleaner_service.clean_transcript(
                     raw_transcript,
                     session_id
                 )
+                logger.info(f"Transcript cleaning complete: session_id={session_id}")
                 
-                # Step 3: Send structured output to client
-                await websocket.send_json({
-                    "type": "session_complete",
-                    "summary": meeting_output.summary,
-                    "action_items": meeting_output.action_items,
-                    "cleaned_transcript": meeting_output.cleaned_transcript,
-                    "raw_transcript": raw_transcript
-                })
-                
-                logger.info(
-                    f"Session complete: session_id={session_id}, "
-                    f"action_items={len(meeting_output.action_items)}"
-                )
+                # Step 3: Send structured output to client (only if socket is still open)
+                try:
+                    await websocket.send_json({
+                        "type": "session_complete",
+                        "summary": meeting_output.summary,
+                        "action_items": meeting_output.action_items,
+                        "cleaned_transcript": meeting_output.cleaned_transcript,
+                        "raw_transcript": raw_transcript
+                    })
+                    
+                    logger.info(
+                        f"Session complete message sent: session_id={session_id}, "
+                        f"action_items={len(meeting_output.action_items)}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Could not send session_complete (socket may be closed): "
+                        f"session_id={session_id}, error={e}"
+                    )
             else:
                 logger.warning(f"Session {session_id} had no transcript to retrieve")
                 
@@ -132,5 +164,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 exc_info=True
             )
         
-        logger.info(f"WebSocket disconnected: session_id={session_id}")
-        await websocket.close()
+        # Close WebSocket
+        try:
+            await websocket.close()
+            logger.info(f"WebSocket closed: session_id={session_id}")
+        except Exception as e:
+            logger.debug(f"WebSocket already closed: session_id={session_id}")

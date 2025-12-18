@@ -35,6 +35,46 @@
                 min-height: 200px;
                 background-color: #f9f9f9;
             }
+            #sessionComplete {
+                margin-top: 30px;
+                padding: 20px;
+                border: 2px solid #28a745;
+                border-radius: 5px;
+                background-color: #d4edda;
+                display: none;
+            }
+            #sessionComplete h2 {
+                margin-top: 0;
+                color: #155724;
+            }
+            #sessionComplete h3 {
+                color: #155724;
+                margin-top: 20px;
+                margin-bottom: 10px;
+            }
+            #sessionComplete .summary {
+                font-style: italic;
+                margin-bottom: 15px;
+            }
+            #sessionComplete .action-items {
+                list-style-type: none;
+                padding-left: 0;
+            }
+            #sessionComplete .action-items li {
+                padding: 8px;
+                margin: 5px 0;
+                background-color: #fff;
+                border-left: 3px solid #28a745;
+                padding-left: 15px;
+            }
+            #sessionComplete .cleaned-transcript {
+                white-space: pre-wrap;
+                background-color: #fff;
+                padding: 15px;
+                border-radius: 3px;
+                max-height: 400px;
+                overflow-y: auto;
+            }
         </style>
     </head>
     <body>
@@ -42,6 +82,19 @@
         <p id="status" class="disconnected">Not Connected</p>
         <button id="recordButton">Start Recording</button>
         <div id="transcript"></div>
+        
+        <div id="sessionComplete">
+            <h2>✓ Session Complete</h2>
+            
+            <h3>Summary</h3>
+            <div class="summary" id="summary"></div>
+            
+            <h3>Action Items</h3>
+            <ul class="action-items" id="actionItems"></ul>
+            
+            <h3>Cleaned Transcript</h3>
+            <div class="cleaned-transcript" id="cleanedTranscript"></div>
+        </div>
 
         <script>
             const recordButton = document.getElementById('recordButton');
@@ -101,7 +154,34 @@
                         const received = message.data;
                         if (received) {
                             console.log('Received:', received);
-                            transcriptEl.textContent += ' ' + received;
+                            
+                            // Try to parse as JSON first
+                            try {
+                                const data = JSON.parse(received);
+                                
+                                // Handle session_complete message
+                                if (data.type === 'session_complete') {
+                                    console.log('Session complete received:', data);
+                                    displaySessionComplete(data);
+                                    
+                                    // Now that we've received and rendered the final data, close the socket
+                                    console.log('Closing socket after session_complete');
+                                    socket.close();
+                                    statusEl.textContent = 'Session Complete';
+                                    statusEl.className = 'disconnected';
+                                } else if (data.type === 'error') {
+                                    console.error('Error from server:', data.message);
+                                    transcriptEl.textContent += '\n[Error: ' + data.message + ']';
+                                } else {
+                                    // Other JSON messages - just append text if available
+                                    if (data.text) {
+                                        transcriptEl.textContent += ' ' + data.text;
+                                    }
+                                }
+                            } catch (e) {
+                                // Not JSON, treat as plain text transcript
+                                transcriptEl.textContent += ' ' + received;
+                            }
                         }
                     };
 
@@ -127,13 +207,62 @@
                 if (mediaRecorder && mediaRecorder.state !== 'inactive') {
                     mediaRecorder.stop();
                 }
-                if (socket) {
-                    socket.close();
+                
+                // Send stop signal to backend instead of closing immediately
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    console.log('Sending stop_recording signal');
+                    socket.send(JSON.stringify({type: "stop_recording"}));
+                    
+                    // Safety timeout: force close if no response within 30 seconds
+                    setTimeout(() => {
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            console.warn('No session_complete received within 30s, forcing close');
+                            alert('Session cleanup timed out. Closing connection.');
+                            socket.close();
+                            statusEl.textContent = 'Stopped (timeout)';
+                            statusEl.className = 'disconnected';
+                        }
+                    }, 30000);
                 }
+                
                 isRecording = false;
                 recordButton.textContent = 'Start Recording';
-                statusEl.textContent = 'Stopped';
+                statusEl.textContent = 'Processing...';
                 statusEl.className = 'disconnected';
+            }
+
+            function displaySessionComplete(data) {
+                const sessionCompleteEl = document.getElementById('sessionComplete');
+                const summaryEl = document.getElementById('summary');
+                const actionItemsEl = document.getElementById('actionItems');
+                const cleanedTranscriptEl = document.getElementById('cleanedTranscript');
+                
+                // Display summary
+                summaryEl.textContent = data.summary || 'No summary available';
+                
+                // Display action items
+                actionItemsEl.innerHTML = '';
+                if (data.action_items && data.action_items.length > 0) {
+                    data.action_items.forEach(item => {
+                        const li = document.createElement('li');
+                        li.textContent = item;
+                        actionItemsEl.appendChild(li);
+                    });
+                } else {
+                    const li = document.createElement('li');
+                    li.textContent = 'No action items identified';
+                    li.style.fontStyle = 'italic';
+                    actionItemsEl.appendChild(li);
+                }
+                
+                // Display cleaned transcript
+                cleanedTranscriptEl.textContent = data.cleaned_transcript || 'No cleaned transcript available';
+                
+                // Show the session complete section
+                sessionCompleteEl.style.display = 'block';
+                
+                // Scroll to the session complete section
+                sessionCompleteEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
             }
         </script>
     </body>
