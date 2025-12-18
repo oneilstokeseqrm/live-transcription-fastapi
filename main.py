@@ -9,6 +9,7 @@ import sys
 import uuid
 import logging
 from services.event_publisher import EventPublisher
+from services.cleaner_service import CleanerService
 
 load_dotenv()
 
@@ -19,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Validate required environment variables
-REQUIRED_ENV_VARS = ["DEEPGRAM_API_KEY", "REDIS_URL"]
+REQUIRED_ENV_VARS = ["DEEPGRAM_API_KEY", "REDIS_URL", "OPENAI_API_KEY"]
 
 def validate_environment():
     """Validate that all required environment variables are set."""
@@ -36,6 +37,7 @@ app = FastAPI()
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
 event_publisher = EventPublisher()
+cleaner_service = CleanerService()
 
 templates = Jinja2Templates(directory="templates")
 
@@ -92,15 +94,43 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket error: session_id={session_id}, error={e}")
         raise Exception(f'Could not process audio: {e}')
     finally:
-        # Retrieve final transcript
+        # Step 1: Retrieve raw transcript
         try:
-            final_transcript = await event_publisher.get_final_transcript(session_id)
-            if final_transcript:
-                logger.info(f"Session {session_id} retrieved {len(final_transcript)} chars")
+            raw_transcript = await event_publisher.get_final_transcript(session_id)
+            
+            if raw_transcript:
+                logger.info(
+                    f"Retrieved raw transcript: session_id={session_id}, "
+                    f"length={len(raw_transcript)} chars"
+                )
+                
+                # Step 2: Clean and structure the transcript
+                meeting_output = await cleaner_service.clean_transcript(
+                    raw_transcript,
+                    session_id
+                )
+                
+                # Step 3: Send structured output to client
+                await websocket.send_json({
+                    "type": "session_complete",
+                    "summary": meeting_output.summary,
+                    "action_items": meeting_output.action_items,
+                    "cleaned_transcript": meeting_output.cleaned_transcript,
+                    "raw_transcript": raw_transcript
+                })
+                
+                logger.info(
+                    f"Session complete: session_id={session_id}, "
+                    f"action_items={len(meeting_output.action_items)}"
+                )
             else:
                 logger.warning(f"Session {session_id} had no transcript to retrieve")
+                
         except Exception as e:
-            logger.error(f"Failed to retrieve transcript: session_id={session_id}, error={e}")
+            logger.error(
+                f"Failed to process final transcript: session_id={session_id}, error={e}",
+                exc_info=True
+            )
         
         logger.info(f"WebSocket disconnected: session_id={session_id}")
         await websocket.close()
