@@ -11,6 +11,7 @@ import logging
 import json
 from services.event_publisher import EventPublisher
 from services.cleaner_service import CleanerService
+from services.aws_event_publisher import AWSEventPublisher
 from routers import batch
 
 load_dotenv()
@@ -32,8 +33,40 @@ def validate_environment():
         sys.exit(1)
     logger.info("Environment validation passed")
 
+def validate_aws_credentials():
+    """
+    Validate AWS credentials and log EventBridge integration status.
+    
+    This function checks for AWS credentials and logs the configuration.
+    If credentials are missing, EventBridge integration will be disabled
+    but the application will continue to run.
+    """
+    aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    
+    if aws_access_key and aws_secret_key:
+        # Credentials present - log enabled status
+        aws_region = os.getenv("AWS_REGION", "us-east-1")
+        eventbridge_bus = os.getenv("EVENTBRIDGE_BUS_NAME", "default")
+        event_source = os.getenv("EVENT_SOURCE", "com.yourapp.transcription")
+        
+        logger.info("=" * 60)
+        logger.info("EventBridge integration ENABLED")
+        logger.info(f"  AWS Region: {aws_region}")
+        logger.info(f"  EventBridge Bus: {eventbridge_bus}")
+        logger.info(f"  Event Source: {event_source}")
+        logger.info("=" * 60)
+    else:
+        # Credentials missing - log warning
+        logger.warning("=" * 60)
+        logger.warning("EventBridge integration DISABLED")
+        logger.warning("Missing AWS credentials (AWS_ACCESS_KEY_ID and/or AWS_SECRET_ACCESS_KEY)")
+        logger.warning("Batch processing will continue without event publishing")
+        logger.warning("=" * 60)
+
 # Call validation at startup
 validate_environment()
+validate_aws_credentials()
 
 app = FastAPI()
 

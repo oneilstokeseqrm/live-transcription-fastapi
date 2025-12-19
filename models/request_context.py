@@ -1,0 +1,29 @@
+"""
+Request Context Data Model
+
+This module defines the RequestContext dataclass for extracting and storing
+tenant, user, and account identity information from request headers.
+"""
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class RequestContext:
+    """
+    Context information extracted from request headers and environment.
+    
+    This dataclass holds identity information for multi-tenant scenarios,
+    enabling proper event attribution and routing.
+    
+    Attributes:
+        tenant_id: UUID v4 identifying the tenant/organization
+        user_id: String identifying the user who initiated the request
+        account_id: Optional string for additional account-level context
+        interaction_id: UUID v4 uniquely identifying this specific request
+    """
+    tenant_id: str
+    user_id: str
+    account_id: Optional[str]
+    interaction_id: str
