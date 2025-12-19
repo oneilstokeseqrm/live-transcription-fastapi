@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/batch", tags=["batch"])
 
 # File validation constants
-ALLOWED_EXTENSIONS = {"wav", "mp3", "flac", "m4a"}
+ALLOWED_EXTENSIONS = {"wav", "mp3", "flac", "m4a", "webm", "mp4"}
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB in bytes
 
 
@@ -78,7 +78,9 @@ async def process_batch_audio(file: UploadFile):
         "wav": "audio/wav",
         "mp3": "audio/mpeg",
         "flac": "audio/flac",
-        "m4a": "audio/mp4"
+        "m4a": "audio/mp4",
+        "webm": "audio/webm",
+        "mp4": "audio/mp4"
     }
     mime_type = mime_type_map.get(file_extension, "audio/wav")
     

@@ -89,7 +89,7 @@
   - Create `routers/batch.py` with FastAPI router
   - Define POST endpoint at `/batch/process`
   - Accept `file: UploadFile` parameter
-  - Implement file validation: check format (WAV, MP3, FLAC, M4A) and size (max 100MB)
+  - Implement file validation: check format (WAV, MP3, FLAC, M4A, WebM, MP4) and size (max 100MB)
   - Generate unique processing_id using UUID v4
   - Read audio bytes from uploaded file
   - Call BatchService.transcribe_audio with audio bytes and MIME type

@@ -121,7 +121,7 @@ class BatchService:
         """
         
     def _get_mimetype_from_extension(self, filename: str) -> str:
-        """Map file extension to MIME type."""
+        """Map file extension to MIME type (wav, mp3, flac, m4a, webm, mp4)."""
 ```
 
 **Deepgram Configuration:**
@@ -205,7 +205,7 @@ async def process_batch_audio(file: UploadFile) -> dict:
     Process uploaded audio file with diarization and cleaning.
     
     Args:
-        file: Uploaded audio file (WAV, MP3, FLAC, M4A)
+        file: Uploaded audio file (WAV, MP3, FLAC, M4A, WebM, MP4)
         
     Returns:
         {
@@ -220,7 +220,7 @@ async def process_batch_audio(file: UploadFile) -> dict:
 ```
 
 **Validation:**
-- File format: WAV, MP3, FLAC, M4A
+- File format: WAV, MP3, FLAC, M4A, WebM, MP4
 - File size: Maximum 100MB
 - Content type: Verify MIME type matches extension
 
@@ -363,7 +363,7 @@ cleaned_transcript: str
 
 ### Property 4: MIME types are correctly mapped from extensions
 
-*For any* file extension in {wav, mp3, flac, m4a}, the system should return the correct corresponding MIME type {audio/wav, audio/mpeg, audio/flac, audio/mp4}.
+*For any* file extension in {wav, mp3, flac, m4a, webm, mp4}, the system should return the correct corresponding MIME type {audio/wav, audio/mpeg, audio/flac, audio/mp4, audio/webm, audio/mp4}.
 
 **Validates: Requirements 2.3**
 

@@ -152,7 +152,9 @@ class BatchService:
             'wav': 'audio/wav',
             'mp3': 'audio/mpeg',
             'flac': 'audio/flac',
-            'm4a': 'audio/mp4'
+            'm4a': 'audio/mp4',
+            'webm': 'audio/webm',
+            'mp4': 'audio/mp4'
         }
         
         return mime_map.get(extension, 'audio/wav')

@@ -26,7 +26,7 @@ This specification defines a parallel batch processing pipeline for the live-tra
 
 #### Acceptance Criteria
 
-1. WHEN a user uploads an audio file, THE system SHALL accept files in WAV, MP3, FLAC, and M4A formats
+1. WHEN a user uploads an audio file, THE system SHALL accept files in WAV, MP3, FLAC, M4A, WebM, and MP4 formats
 2. WHEN receiving an uploaded file, THE system SHALL validate the file size does not exceed 100MB
 3. WHEN processing begins, THE system SHALL generate a unique processing_id using UUID v4 format
 4. WHEN the file is valid, THE system SHALL pass the audio bytes to the BatchService for processing
