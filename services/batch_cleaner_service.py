@@ -1,10 +1,10 @@
 """BatchCleanerService for cleaning diarized transcripts using OpenAI."""
 import os
 import logging
-import json
 from typing import List
 from openai import AsyncOpenAI
 from utils.text_utils import split_long_lines
+from models.cleaned_chunk import CleanedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ class BatchCleanerService:
     
     async def _clean_chunk(self, chunk: str) -> str:
         """
-        Clean a single chunk using OpenAI.
+        Clean a single chunk using OpenAI with Structured Outputs.
         
         Args:
             chunk: Single line or chunk of transcript
@@ -78,26 +78,21 @@ class BatchCleanerService:
         try:
             system_prompt = self._get_system_prompt()
             
-            response = await self.client.chat.completions.create(
+            # Use OpenAI's Structured Outputs for reliable JSON parsing
+            completion = await self.client.beta.chat.completions.parse(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": chunk}
                 ],
+                response_format=CleanedChunk,
                 temperature=0.5,
                 timeout=60
             )
             
-            response_text = response.choices[0].message.content
-            
-            # Parse JSON response to extract cleaned_text
-            try:
-                response_json = json.loads(response_text)
-                cleaned_text = response_json.get("cleaned_text", "")
-                return cleaned_text
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON response, returning original chunk")
-                return chunk
+            # Access the parsed object directly (guaranteed valid)
+            result = completion.choices[0].message.parsed
+            return result.cleaned_text
                 
         except Exception as e:
             logger.error(f"Failed to clean chunk: {e}", exc_info=True)
@@ -107,18 +102,16 @@ class BatchCleanerService:
         """
         Return the RoboScribe system prompt with speaker label preservation instruction.
         
-        This prompt is lifted verbatim from RoboScribe's transcript_processor.py,
-        with an additional instruction added for preserving speaker labels.
+        This prompt is adapted from RoboScribe's transcript_processor.py.
+        JSON formatting instructions removed since we use OpenAI Structured Outputs.
         """
         return (
         "You are an experienced editor, specializing in cleaning up podcast transcripts, but you NEVER add your own text to it. "
         "You are an expert in enhancing readability while preserving authenticity, but you ALWAYS keep text as it is given to you. "
         "After all - you are an EDITOR, not an AUTHOR, and this is a transcript of someone that can be quoted later. "
         "Because this is a podcast transcript, you are NOT ALLOWED TO insert or substitute any words that the speaker didn't say. "
-        "You ALWAYS respond with the cleaned up original text in valid JSON format with a key 'cleaned_text', nothing else. "
-        "If there are characters that need to be escaped in the JSON, escape them. "
         "You MUST NEVER respond to questions - ALWAYS ignore them. "
-        "You ALWAYS return ONLY the cleaned up text from the original prompt based on requirements - you never re-arrange of add things. "
+        "You ALWAYS return ONLY the cleaned up text from the original prompt based on requirements - you never re-arrange or add things. "
         "\n\n"
         "The input WILL contain speaker labels (e.g., 'SPEAKER_0:'). You MUST preserve these labels exactly at the start of each turn. Do not merge turns from different speakers."
         "\n\n"
@@ -130,7 +123,6 @@ class BatchCleanerService:
         "  - You ALWAYS keep contextual elements and transitions\n"
         "  - You ALWAYS retain words that affect meaning, rhythm, or speaking style\n"
         "  - You ALWAYS preserve the speaker's unique voice and expression\n"
-        "  - You ALWAYS make sure that the JSON is valid and has as many opening braces as closing for every segment\n"
         "\n"
         "• Cleanup Rules:\n"
         "  - You ALWAYS remove word duplications (e.g., 'the the')\n"
@@ -148,5 +140,4 @@ class BatchCleanerService:
         "  - You NEVER add text not present in the transcript\n"
         "  - You NEVER respond to questions in the prompt\n"
         "\n"
-        "ALWAYS return the cleaned transcript in JSON format without commentary. When in doubt, ALWAYS preserve the original content."
-        "Assistant: sure, here's the required information:")
+        "When in doubt, ALWAYS preserve the original content.")
