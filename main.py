@@ -11,6 +11,7 @@ import logging
 import json
 from services.event_publisher import EventPublisher
 from services.cleaner_service import CleanerService
+from routers import batch
 
 load_dotenv()
 
@@ -35,6 +36,9 @@ def validate_environment():
 validate_environment()
 
 app = FastAPI()
+
+# Include routers
+app.include_router(batch.router)
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
 event_publisher = EventPublisher()

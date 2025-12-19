@@ -75,10 +75,50 @@
                 max-height: 400px;
                 overflow-y: auto;
             }
+            hr {
+                margin: 40px 0;
+                border: none;
+                border-top: 2px solid #ddd;
+            }
+            #batch-section {
+                margin-top: 40px;
+            }
+            #batch-results {
+                width: 100%;
+                min-height: 300px;
+                margin-top: 15px;
+                padding: 15px;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                background-color: #f9f9f9;
+                font-family: monospace;
+                font-size: 14px;
+                resize: vertical;
+            }
+            #batch-status {
+                margin-top: 10px;
+                font-weight: bold;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            .batch-processing {
+                background-color: #fff3cd;
+                color: #856404;
+            }
+            .batch-success {
+                background-color: #d4edda;
+                color: #155724;
+            }
+            .batch-error {
+                background-color: #f8d7da;
+                color: #721c24;
+            }
         </style>
     </head>
     <body>
         <h1>Transcribe Audio With FastAPI</h1>
+        
+        <h2>Live Transcription Mode</h2>
         <p id="status" class="disconnected">Not Connected</p>
         <button id="recordButton">Start Recording</button>
         <div id="transcript"></div>
@@ -96,6 +136,15 @@
             <div class="cleaned-transcript" id="cleanedTranscript"></div>
         </div>
 
+        <hr>
+
+        <div id="batch-section">
+            <h2>Batch Recording Mode (Diarized)</h2>
+            <button id="batch-record-btn">Record & Process (Batch)</button>
+            <div id="batch-status"></div>
+            <textarea id="batch-results" placeholder="Cleaned, diarized transcript will appear here..." readonly></textarea>
+        </div>
+
         <script>
             const recordButton = document.getElementById('recordButton');
             const statusEl = document.getElementById('status');
@@ -104,6 +153,15 @@
             let mediaRecorder = null;
             let socket = null;
             let isRecording = false;
+
+            // Batch recording variables
+            const batchRecordBtn = document.getElementById('batch-record-btn');
+            const batchStatusEl = document.getElementById('batch-status');
+            const batchResultsEl = document.getElementById('batch-results');
+            
+            let batchRecorder = null;
+            let batchChunks = [];
+            let isBatchRecording = false;
 
             // Determine WebSocket URL dynamically
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -263,6 +321,101 @@
                 
                 // Scroll to the session complete section
                 sessionCompleteEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+
+            // Batch Recording Logic
+            batchRecordBtn.addEventListener('click', async () => {
+                if (!isBatchRecording) {
+                    await startBatchRecording();
+                } else {
+                    await stopBatchRecording();
+                }
+            });
+
+            async function startBatchRecording() {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    
+                    if (!MediaRecorder.isTypeSupported('audio/webm')) {
+                        alert('Browser not supported');
+                        return;
+                    }
+
+                    batchChunks = [];
+                    batchRecorder = new MediaRecorder(stream, {
+                        mimeType: 'audio/webm',
+                    });
+
+                    batchRecorder.addEventListener('dataavailable', (event) => {
+                        if (event.data.size > 0) {
+                            batchChunks.push(event.data);
+                        }
+                    });
+
+                    batchRecorder.start();
+                    isBatchRecording = true;
+                    batchRecordBtn.textContent = 'Stop & Process';
+                    batchStatusEl.textContent = 'Recording...';
+                    batchStatusEl.className = 'batch-processing';
+                    batchResultsEl.value = '';
+
+                } catch (error) {
+                    console.error('Error starting batch recording:', error);
+                    alert('Error accessing microphone: ' + error.message);
+                }
+            }
+
+            async function stopBatchRecording() {
+                if (batchRecorder && batchRecorder.state !== 'inactive') {
+                    batchRecorder.stop();
+                    
+                    // Wait for the final dataavailable event
+                    await new Promise(resolve => {
+                        batchRecorder.addEventListener('stop', resolve, { once: true });
+                    });
+                }
+
+                isBatchRecording = false;
+                batchRecordBtn.textContent = 'Record & Process (Batch)';
+                batchRecordBtn.disabled = true;
+                
+                batchStatusEl.textContent = 'Processing... (This may take up to 2 minutes)';
+                batchStatusEl.className = 'batch-processing';
+
+                try {
+                    // Create blob from recorded chunks
+                    const audioBlob = new Blob(batchChunks, { type: 'audio/webm' });
+                    
+                    // Create FormData and append the audio file
+                    const formData = new FormData();
+                    formData.append('file', audioBlob, 'recording.webm');
+
+                    // Send to backend
+                    const response = await fetch('/batch/process', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(errorData.detail || 'Processing failed');
+                    }
+
+                    const result = await response.json();
+                    
+                    // Display the cleaned transcript
+                    batchResultsEl.value = result.cleaned_transcript;
+                    batchStatusEl.textContent = 'Processing complete!';
+                    batchStatusEl.className = 'batch-success';
+
+                } catch (error) {
+                    console.error('Error processing batch recording:', error);
+                    batchStatusEl.textContent = 'Error: ' + error.message;
+                    batchStatusEl.className = 'batch-error';
+                } finally {
+                    batchRecordBtn.disabled = false;
+                    batchChunks = [];
+                }
             }
         </script>
     </body>
