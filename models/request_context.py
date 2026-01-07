@@ -22,8 +22,10 @@ class RequestContext:
         user_id: String identifying the user who initiated the request
         account_id: Optional string for additional account-level context
         interaction_id: UUID v4 uniquely identifying this specific request
+        trace_id: UUID v4 for distributed tracing (from X-Trace-Id header or generated)
     """
     tenant_id: str
     user_id: str
     account_id: Optional[str]
     interaction_id: str
+    trace_id: str

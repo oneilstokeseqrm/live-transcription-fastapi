@@ -13,6 +13,7 @@ from services.event_publisher import EventPublisher
 from services.cleaner_service import CleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from routers import batch
+from routers import text
 
 load_dotenv()
 
@@ -72,6 +73,7 @@ app = FastAPI()
 
 # Include routers
 app.include_router(batch.router)
+app.include_router(text.router, prefix="/text", tags=["text"])
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
 event_publisher = EventPublisher()

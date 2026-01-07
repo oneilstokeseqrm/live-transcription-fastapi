@@ -1,24 +1,39 @@
 """
 Batch processing router for audio file transcription and cleaning.
+
+This router provides the POST /batch/process endpoint for processing audio
+files through transcription and cleaning, publishing EnvelopeV1 events.
 """
 import logging
 import uuid
+from datetime import datetime, timezone
+from uuid import UUID
 from fastapi import APIRouter, UploadFile, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from models.envelope import EnvelopeV1, ContentModel
 from services.batch_service import BatchService
 from services.batch_cleaner_service import BatchCleanerService
 from services.aws_event_publisher import AWSEventPublisher
-from utils.context_utils import get_request_context
+from utils.context_utils import get_validated_context
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/batch", tags=["batch"])
+
+
+class BatchProcessResponse(BaseModel):
+    """Response from the batch processing endpoint."""
+    raw_transcript: str = Field(..., description="Original transcript from Deepgram")
+    cleaned_transcript: str = Field(..., description="Cleaned transcript")
+    interaction_id: str = Field(..., description="Unique identifier for this interaction")
 
 # File validation constants
 ALLOWED_EXTENSIONS = {"wav", "mp3", "flac", "m4a", "webm", "mp4"}
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB in bytes
 
 
-@router.post("/process")
+@router.post("/process", response_model=BatchProcessResponse)
 async def process_batch_audio(file: UploadFile, request: Request):
     """
     Process an uploaded audio file through transcription and cleaning pipeline.
@@ -28,13 +43,16 @@ async def process_batch_audio(file: UploadFile, request: Request):
         request: FastAPI Request object for context extraction
         
     Returns:
-        JSON response with raw_transcript and cleaned_transcript fields
+        BatchProcessResponse with raw_transcript, cleaned_transcript, and interaction_id
         
     Raises:
         HTTPException: 400 for validation errors, 500 for processing errors
+        
+    Requirements: 1.1, 1.2, 2.1, 2.2, 2.3, 2.4, 2.5
     """
-    # Extract request context for traceability
-    context = get_request_context(request)
+    # Extract and validate request context (raises HTTPException 400 on failure)
+    # Requirements: 1.1, 1.2
+    context = get_validated_context(request)
     
     processing_id = str(uuid.uuid4())
     logger.info(
@@ -150,29 +168,37 @@ async def process_batch_audio(file: UploadFile, request: Request):
             detail="Transcript cleaning service failed. Please try again."
         )
     
-    # Step 3: Publish event to EventBridge (resilient - don't fail request if this fails)
+    # Step 3: Build and publish EnvelopeV1 event (resilient - don't fail request if this fails)
+    # Requirements: 2.4 - interaction_type="transcript"
     try:
+        envelope = EnvelopeV1(
+            tenant_id=UUID(context.tenant_id),
+            user_id=context.user_id,
+            interaction_type="transcript",
+            content=ContentModel(text=cleaned_transcript, format="diarized"),
+            timestamp=datetime.now(timezone.utc),
+            source="upload",
+            extras={},
+            interaction_id=UUID(context.interaction_id),
+            trace_id=context.trace_id
+        )
+        
         event_publisher = AWSEventPublisher()
         logger.info(
-            f"Publishing batch completed event: processing_id={processing_id}, "
+            f"Publishing envelope: processing_id={processing_id}, "
             f"interaction_id={context.interaction_id}"
         )
-        event_id = event_publisher.publish_batch_completed_event(
-            interaction_id=context.interaction_id,
-            tenant_id=context.tenant_id,
-            user_id=context.user_id,
-            account_id=context.account_id,
-            raw_transcript=raw_transcript,
-            cleaned_transcript=cleaned_transcript
-        )
+        publish_results = await event_publisher.publish_envelope(envelope)
         logger.info(
-            f"Event published successfully: processing_id={processing_id}, "
-            f"interaction_id={context.interaction_id}, event_id={event_id}"
+            f"Envelope published: processing_id={processing_id}, "
+            f"interaction_id={context.interaction_id}, "
+            f"kinesis={'success' if publish_results['kinesis_sequence'] else 'failed'}, "
+            f"eventbridge={'success' if publish_results['eventbridge_id'] else 'failed'}"
         )
     except Exception as e:
         # Log error but don't fail the request - event publishing is non-critical
         logger.error(
-            f"Event publishing failed (non-critical): processing_id={processing_id}, "
+            f"Envelope publishing failed (non-critical): processing_id={processing_id}, "
             f"interaction_id={context.interaction_id}, error={type(e).__name__}: {str(e)}",
             exc_info=True
         )
@@ -182,7 +208,9 @@ async def process_batch_audio(file: UploadFile, request: Request):
         f"interaction_id={context.interaction_id}"
     )
     
-    return {
-        "raw_transcript": raw_transcript,
-        "cleaned_transcript": cleaned_transcript
-    }
+    # Requirement 2.3 - return response with interaction_id
+    return BatchProcessResponse(
+        raw_transcript=raw_transcript,
+        cleaned_transcript=cleaned_transcript,
+        interaction_id=context.interaction_id
+    )

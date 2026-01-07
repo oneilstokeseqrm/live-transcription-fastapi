@@ -1,18 +1,27 @@
 """
-Property-Based Tests for Context Extraction Fallback Chain
+Property-Based Tests for Context Extraction
 
-Feature: event-driven-architecture, Property 2: Context Extraction Fallback Chain
-Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11
+This module contains two sets of property tests:
 
-This module tests that context extraction follows the correct fallback chain
-and always returns valid context regardless of input combinations.
+1. Lenient Context Extraction (get_request_context)
+   Feature: event-driven-architecture, Property 2: Context Extraction Fallback Chain
+   Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11
+
+2. Strict Context Validation (get_validated_context)
+   Feature: unified-ingestion-upgrade
+   - Property 1: Tenant ID UUID Validation
+   - Property 2: User ID Required Validation
+   - Property 3: Trace ID Generation and Preservation
+   Validates: Requirements 1.1-1.7, 8.1-8.6
 """
 
 import os
 import uuid
 from unittest.mock import Mock
+import pytest
+from fastapi import HTTPException
 from hypothesis import given, strategies as st, settings, assume
-from utils.context_utils import get_request_context
+from utils.context_utils import get_request_context, get_validated_context
 from models.request_context import RequestContext
 
 
@@ -213,7 +222,7 @@ def test_tenant_id_fallback_to_environment(tenant_id):
         del os.environ["MOCK_TENANT_ID"]
 
 
-@given(st.text(min_size=1, max_size=100))
+@given(st.text(min_size=1, max_size=100, alphabet=st.characters(blacklist_characters='\x00')))
 @settings(max_examples=50)
 def test_user_id_fallback_to_environment(user_id):
     """
@@ -225,6 +234,9 @@ def test_user_id_fallback_to_environment(user_id):
     Feature: event-driven-architecture, Property 2: Context Extraction Fallback Chain
     Validates: Requirements 2.5, 2.6
     """
+    # Skip null bytes which can't be set as environment variables
+    assume('\x00' not in user_id)
+    
     # Set environment variable
     os.environ["MOCK_USER_ID"] = user_id
     
@@ -387,3 +399,442 @@ def test_interaction_id_always_unique():
     # Verify both are valid UUID v4
     uuid.UUID(context1.interaction_id, version=4)
     uuid.UUID(context2.interaction_id, version=4)
+
+
+# =============================================================================
+# STRICT VALIDATION TESTS (get_validated_context)
+# Feature: unified-ingestion-upgrade
+# Properties 1, 2, 3: Context Extraction Validation
+# Validates: Requirements 1.1-1.7, 8.1-8.6
+# =============================================================================
+
+
+def create_mock_request_with_trace(
+    tenant_id=None,
+    user_id=None,
+    account_id=None,
+    trace_id=None
+):
+    """
+    Create a mock FastAPI Request object with specified headers including trace_id.
+    
+    Args:
+        tenant_id: Value for X-Tenant-ID header (None to omit)
+        user_id: Value for X-User-ID header (None to omit)
+        account_id: Value for X-Account-ID header (None to omit)
+        trace_id: Value for X-Trace-Id header (None to omit)
+        
+    Returns:
+        Mock Request object
+    """
+    headers = {}
+    
+    if tenant_id is not None:
+        headers["X-Tenant-ID"] = tenant_id
+    if user_id is not None:
+        headers["X-User-ID"] = user_id
+    if account_id is not None:
+        headers["X-Account-ID"] = account_id
+    if trace_id is not None:
+        headers["X-Trace-Id"] = trace_id
+    
+    request = Mock()
+    request.headers = Mock()
+    request.headers.get = lambda key, default=None: headers.get(key, default)
+    
+    return request
+
+
+@st.composite
+def valid_uuid_string(draw):
+    """Generate a valid UUID string (any version)."""
+    return str(uuid.uuid4())
+
+
+@st.composite
+def non_uuid_string(draw):
+    """Generate strings that are definitely not valid UUIDs."""
+    return draw(st.one_of(
+        st.just("not-a-uuid"),
+        st.just("12345"),
+        st.just("invalid-uuid-format"),
+        st.just("abc-def-ghi"),
+        st.text(min_size=1, max_size=10, alphabet=st.characters(whitelist_categories=('L',))),
+    ))
+
+
+@st.composite
+def whitespace_only_string(draw):
+    """Generate strings containing only whitespace characters."""
+    return draw(st.one_of(
+        st.just(""),
+        st.just(" "),
+        st.just("  "),
+        st.just("\t"),
+        st.just("\n"),
+        st.just("   \t\n  "),
+    ))
+
+
+@st.composite
+def non_empty_string(draw):
+    """Generate non-empty strings with at least one non-whitespace character."""
+    # Generate a string with at least one printable non-whitespace character
+    base = draw(st.text(
+        min_size=1, 
+        max_size=100,
+        alphabet=st.characters(whitelist_categories=('L', 'N', 'P', 'S'))
+    ))
+    assume(base.strip() != "")
+    return base
+
+
+# -----------------------------------------------------------------------------
+# Property 1: Tenant ID UUID Validation
+# For any string value provided as X-Tenant-ID header, the context extractor
+# SHALL accept it if and only if it is a valid UUID format, and SHALL reject
+# with HTTP 400 otherwise.
+# Validates: Requirements 1.1, 1.3, 8.1, 8.6
+# -----------------------------------------------------------------------------
+
+@given(valid_uuid_string())
+@settings(max_examples=100)
+def test_property1_valid_uuid_tenant_id_accepted(tenant_id):
+    """
+    Feature: unified-ingestion-upgrade, Property 1: Tenant ID UUID Validation
+    
+    For any valid UUID string provided as X-Tenant-ID, the context extractor
+    SHALL accept it and return a context with that tenant_id.
+    
+    **Validates: Requirements 1.1, 1.3, 8.1**
+    """
+    request = create_mock_request_with_trace(
+        tenant_id=tenant_id,
+        user_id="test-user"
+    )
+    
+    context = get_validated_context(request)
+    
+    assert context.tenant_id == tenant_id, \
+        "Valid UUID tenant_id should be accepted and preserved"
+    assert isinstance(context, RequestContext), \
+        "Should return RequestContext object"
+
+
+@given(non_uuid_string())
+@settings(max_examples=100)
+def test_property1_invalid_uuid_tenant_id_rejected(invalid_tenant_id):
+    """
+    Feature: unified-ingestion-upgrade, Property 1: Tenant ID UUID Validation
+    
+    For any invalid UUID string provided as X-Tenant-ID, the context extractor
+    SHALL reject with HTTP 400 and message "X-Tenant-ID must be a valid UUID".
+    
+    **Validates: Requirements 1.7, 8.6**
+    """
+    # Ensure the string is not accidentally a valid UUID
+    try:
+        uuid.UUID(invalid_tenant_id)
+        assume(False)  # Skip if it's actually valid
+    except (ValueError, AttributeError):
+        pass  # Good, it's invalid
+    
+    request = create_mock_request_with_trace(
+        tenant_id=invalid_tenant_id,
+        user_id="test-user"
+    )
+    
+    with pytest.raises(HTTPException) as exc_info:
+        get_validated_context(request)
+    
+    assert exc_info.value.status_code == 400, \
+        "Should return HTTP 400 for invalid UUID"
+    assert exc_info.value.detail == "X-Tenant-ID must be a valid UUID", \
+        "Should return correct error message"
+
+
+def test_property1_missing_tenant_id_rejected():
+    """
+    Feature: unified-ingestion-upgrade, Property 1: Tenant ID UUID Validation
+    
+    When X-Tenant-ID header is missing, the context extractor SHALL reject
+    with HTTP 400 and message "X-Tenant-ID header is required".
+    
+    **Validates: Requirements 1.7, 8.4**
+    """
+    request = create_mock_request_with_trace(
+        tenant_id=None,
+        user_id="test-user"
+    )
+    
+    with pytest.raises(HTTPException) as exc_info:
+        get_validated_context(request)
+    
+    assert exc_info.value.status_code == 400, \
+        "Should return HTTP 400 for missing tenant_id"
+    assert exc_info.value.detail == "X-Tenant-ID header is required", \
+        "Should return correct error message"
+
+
+# -----------------------------------------------------------------------------
+# Property 2: User ID Required Validation
+# For any request to protected endpoints, the context extractor SHALL accept
+# the X-User-ID header if and only if it is a non-empty string (after trimming
+# whitespace), and SHALL reject with HTTP 400 otherwise.
+# Validates: Requirements 1.2, 1.4, 8.2, 8.5
+# -----------------------------------------------------------------------------
+
+@given(non_empty_string())
+@settings(max_examples=100)
+def test_property2_non_empty_user_id_accepted(user_id):
+    """
+    Feature: unified-ingestion-upgrade, Property 2: User ID Required Validation
+    
+    For any non-empty string (after trimming) provided as X-User-ID, the context
+    extractor SHALL accept it and return a context with that user_id.
+    
+    **Validates: Requirements 1.2, 1.4, 8.2**
+    """
+    tenant_id = str(uuid.uuid4())
+    request = create_mock_request_with_trace(
+        tenant_id=tenant_id,
+        user_id=user_id
+    )
+    
+    context = get_validated_context(request)
+    
+    assert context.user_id == user_id, \
+        "Non-empty user_id should be accepted and preserved"
+    assert isinstance(context, RequestContext), \
+        "Should return RequestContext object"
+
+
+@given(whitespace_only_string())
+@settings(max_examples=50)
+def test_property2_whitespace_only_user_id_rejected(whitespace_user_id):
+    """
+    Feature: unified-ingestion-upgrade, Property 2: User ID Required Validation
+    
+    For any string composed entirely of whitespace provided as X-User-ID,
+    the context extractor SHALL reject with HTTP 400.
+    
+    **Validates: Requirements 1.7, 8.5**
+    """
+    tenant_id = str(uuid.uuid4())
+    request = create_mock_request_with_trace(
+        tenant_id=tenant_id,
+        user_id=whitespace_user_id
+    )
+    
+    with pytest.raises(HTTPException) as exc_info:
+        get_validated_context(request)
+    
+    assert exc_info.value.status_code == 400, \
+        "Should return HTTP 400 for whitespace-only user_id"
+    assert exc_info.value.detail == "X-User-ID header is required", \
+        "Should return correct error message"
+
+
+def test_property2_missing_user_id_rejected():
+    """
+    Feature: unified-ingestion-upgrade, Property 2: User ID Required Validation
+    
+    When X-User-ID header is missing, the context extractor SHALL reject
+    with HTTP 400 and message "X-User-ID header is required".
+    
+    **Validates: Requirements 1.7, 8.5**
+    """
+    tenant_id = str(uuid.uuid4())
+    request = create_mock_request_with_trace(
+        tenant_id=tenant_id,
+        user_id=None
+    )
+    
+    with pytest.raises(HTTPException) as exc_info:
+        get_validated_context(request)
+    
+    assert exc_info.value.status_code == 400, \
+        "Should return HTTP 400 for missing user_id"
+    assert exc_info.value.detail == "X-User-ID header is required", \
+        "Should return correct error message"
+
+
+# -----------------------------------------------------------------------------
+# Property 3: Trace ID Generation and Preservation
+# For any request, if X-Trace-Id header is provided and is a valid UUID, the
+# resulting context SHALL contain that exact trace_id; if not provided, the
+# context SHALL contain a newly generated valid UUID v4.
+# Validates: Requirements 1.5, 1.6, 8.3
+# -----------------------------------------------------------------------------
+
+@given(valid_uuid_string())
+@settings(max_examples=100)
+def test_property3_valid_trace_id_preserved(trace_id):
+    """
+    Feature: unified-ingestion-upgrade, Property 3: Trace ID Generation and Preservation
+    
+    For any valid UUID provided as X-Trace-Id, the context extractor SHALL
+    preserve that exact trace_id in the returned context.
+    
+    **Validates: Requirements 1.6, 8.3**
+    """
+    tenant_id = str(uuid.uuid4())
+    request = create_mock_request_with_trace(
+        tenant_id=tenant_id,
+        user_id="test-user",
+        trace_id=trace_id
+    )
+    
+    context = get_validated_context(request)
+    
+    assert context.trace_id == trace_id, \
+        "Valid trace_id should be preserved exactly"
+
+
+def test_property3_missing_trace_id_generates_new_uuid():
+    """
+    Feature: unified-ingestion-upgrade, Property 3: Trace ID Generation and Preservation
+    
+    When X-Trace-Id header is not provided, the context extractor SHALL
+    generate a new valid UUID v4 for trace_id.
+    
+    **Validates: Requirements 1.5**
+    """
+    tenant_id = str(uuid.uuid4())
+    request = create_mock_request_with_trace(
+        tenant_id=tenant_id,
+        user_id="test-user",
+        trace_id=None
+    )
+    
+    context = get_validated_context(request)
+    
+    assert context.trace_id is not None, \
+        "trace_id should be generated when not provided"
+    
+    # Verify it's a valid UUID
+    parsed_uuid = uuid.UUID(context.trace_id)
+    assert parsed_uuid is not None, \
+        "Generated trace_id should be a valid UUID"
+
+
+@given(non_uuid_string())
+@settings(max_examples=100)
+def test_property3_invalid_trace_id_rejected(invalid_trace_id):
+    """
+    Feature: unified-ingestion-upgrade, Property 3: Trace ID Generation and Preservation
+    
+    For any invalid UUID string provided as X-Trace-Id, the context extractor
+    SHALL reject with HTTP 400 and message "X-Trace-Id must be a valid UUID if provided".
+    
+    **Validates: Requirements 1.6, 8.3**
+    """
+    # Ensure the string is not accidentally a valid UUID
+    try:
+        uuid.UUID(invalid_trace_id)
+        assume(False)  # Skip if it's actually valid
+    except (ValueError, AttributeError):
+        pass  # Good, it's invalid
+    
+    tenant_id = str(uuid.uuid4())
+    request = create_mock_request_with_trace(
+        tenant_id=tenant_id,
+        user_id="test-user",
+        trace_id=invalid_trace_id
+    )
+    
+    with pytest.raises(HTTPException) as exc_info:
+        get_validated_context(request)
+    
+    assert exc_info.value.status_code == 400, \
+        "Should return HTTP 400 for invalid trace_id"
+    assert exc_info.value.detail == "X-Trace-Id must be a valid UUID if provided", \
+        "Should return correct error message"
+
+
+def test_property3_trace_id_uniqueness_when_generated():
+    """
+    Feature: unified-ingestion-upgrade, Property 3: Trace ID Generation and Preservation
+    
+    When trace_id is generated (not provided), each call should produce
+    a unique trace_id.
+    
+    **Validates: Requirements 1.5**
+    """
+    tenant_id = str(uuid.uuid4())
+    
+    # Make multiple requests without trace_id
+    trace_ids = set()
+    for _ in range(10):
+        request = create_mock_request_with_trace(
+            tenant_id=tenant_id,
+            user_id="test-user",
+            trace_id=None
+        )
+        context = get_validated_context(request)
+        trace_ids.add(context.trace_id)
+    
+    assert len(trace_ids) == 10, \
+        "Each generated trace_id should be unique"
+
+
+# -----------------------------------------------------------------------------
+# Combined Validation Tests
+# Test that all validations work together correctly
+# -----------------------------------------------------------------------------
+
+@given(valid_uuid_string(), non_empty_string(), valid_uuid_string())
+@settings(max_examples=100)
+def test_validated_context_with_all_valid_headers(tenant_id, user_id, trace_id):
+    """
+    Feature: unified-ingestion-upgrade, Properties 1, 2, 3
+    
+    For any valid combination of headers, the context extractor SHALL return
+    a valid RequestContext with all fields properly populated.
+    
+    **Validates: Requirements 1.1-1.6, 8.1-8.3**
+    """
+    request = create_mock_request_with_trace(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        trace_id=trace_id
+    )
+    
+    context = get_validated_context(request)
+    
+    assert isinstance(context, RequestContext), \
+        "Should return RequestContext object"
+    assert context.tenant_id == tenant_id, \
+        "tenant_id should match header"
+    assert context.user_id == user_id, \
+        "user_id should match header"
+    assert context.trace_id == trace_id, \
+        "trace_id should match header"
+    assert context.interaction_id is not None, \
+        "interaction_id should be generated"
+    
+    # Verify interaction_id is a valid UUID
+    uuid.UUID(context.interaction_id)
+
+
+def test_validated_context_interaction_id_always_unique():
+    """
+    Feature: unified-ingestion-upgrade, Properties 1, 2, 3
+    
+    Each call to get_validated_context should generate a unique interaction_id.
+    
+    **Validates: Requirements 1.1-1.6**
+    """
+    tenant_id = str(uuid.uuid4())
+    
+    interaction_ids = set()
+    for _ in range(10):
+        request = create_mock_request_with_trace(
+            tenant_id=tenant_id,
+            user_id="test-user"
+        )
+        context = get_validated_context(request)
+        interaction_ids.add(context.interaction_id)
+    
+    assert len(interaction_ids) == 10, \
+        "Each call should generate a unique interaction_id"
