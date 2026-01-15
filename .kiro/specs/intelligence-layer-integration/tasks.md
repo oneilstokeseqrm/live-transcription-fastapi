@@ -427,13 +427,13 @@ Export new models from the models package.
 Verify the deployment works correctly with the new Intelligence Layer.
 
 ### Acceptance Criteria
-- [ ] DATABASE_URL configured in Railway environment
-- [ ] Deployment succeeds without errors
-- [ ] Health check passes
-- [ ] Test WebSocket connection with transcript
-- [ ] Verify intelligence data persisted to Postgres
-- [ ] Verify existing Kinesis/EventBridge flow unaffected
-- [ ] Test batch endpoint creates intelligence rows
+- [x] DATABASE_URL configured in Railway environment
+- [x] Deployment succeeds without errors
+- [x] Health check passes
+- [x] Test WebSocket connection with transcript
+- [x] Verify intelligence data persisted to Postgres
+- [x] Verify existing Kinesis/EventBridge flow unaffected
+- [x] Test batch endpoint creates intelligence rows
 
 ### Verification Steps
 1. Deploy to Railway

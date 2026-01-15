@@ -300,6 +300,9 @@ class AWSEventPublisher:
         Publishing failures are logged but never raise exceptions - the user
         request should succeed regardless of publishing failures.
         
+        Feature Flag: ENABLE_EVENT_PUBLISHING (default: true)
+        Set to "false" to skip all event publishing (useful for testing).
+        
         Args:
             envelope: The EnvelopeV1 instance to publish
             
@@ -309,6 +312,14 @@ class AWSEventPublisher:
         
         Requirements: 5.1, 5.4, 5.5, 5.6, 5.7, 7.2, 7.3, 7.5
         """
+        # Feature flag to disable event publishing
+        if os.getenv("ENABLE_EVENT_PUBLISHING", "true").lower() == "false":
+            logger.warning(
+                f"Event publishing disabled via configuration. Skipping Kinesis/EventBridge. "
+                f"interaction_id={envelope.interaction_id}, tenant_id={envelope.tenant_id}"
+            )
+            return {"status": "skipped", "kinesis_sequence": None, "eventbridge_id": None}
+        
         results: Dict[str, Optional[str]] = {
             "kinesis_sequence": None,
             "eventbridge_id": None
