@@ -3,11 +3,14 @@
   "metadata": {
     "source": "manual_e2e_test",
     "priority": "high",
-    "tested_by": "Peter"
+    "tested_by": "Peter",
+    "publisher_service": "live-transcription-fastapi",
+    "publisher_run_id": "lts-rerun-20260113T031500Z-a1b2c3d4",
+    "publisher_sent_at": "2026-01-13T03:15:00Z"
   },
   "headers": {
     "X-Tenant-ID": "11111111-1111-4111-8111-111111111111",
     "X-User-ID": "user_manual_test_001",
-    "X-Trace-Id": "a469ccd6-217a-4d81-bf74-a82a84c501b8"
+    "X-Trace-Id": "7c3f7b54-6f3a-4b1c-bf6d-0f8b2c3a1d9e"
   }
 }

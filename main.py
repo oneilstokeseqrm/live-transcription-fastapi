@@ -1,17 +1,21 @@
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from typing import Dict, Callable
+from typing import Dict, Callable, Optional
 from deepgram import Deepgram
 from dotenv import load_dotenv
 import os
 import sys
 import uuid
+import asyncio
 import logging
 import json
+from datetime import datetime, timezone
 from services.event_publisher import EventPublisher
 from services.cleaner_service import CleanerService
 from services.aws_event_publisher import AWSEventPublisher
+from services.intelligence_service import IntelligenceService
+from models.envelope import EnvelopeV1, ContentModel
 from routers import batch
 from routers import text
 
@@ -24,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Validate required environment variables
-REQUIRED_ENV_VARS = ["DEEPGRAM_API_KEY", "REDIS_URL", "OPENAI_API_KEY"]
+REQUIRED_ENV_VARS = ["DEEPGRAM_API_KEY", "REDIS_URL", "OPENAI_API_KEY", "DATABASE_URL"]
 
 def validate_environment():
     """Validate that all required environment variables are set."""
@@ -194,6 +198,65 @@ async def websocket_endpoint(websocket: WebSocket):
                         f"Could not send session_complete (socket may be closed): "
                         f"session_id={session_id}, error={e}"
                     )
+                
+                # Step 4: Async Fork - Execute Lane 1 (publishing) and Lane 2 (intelligence) concurrently
+                tenant_id = os.getenv('MOCK_TENANT_ID', 'default_org')
+                trace_id = str(uuid.uuid4())
+                
+                async def _lane1_publish() -> Optional[dict]:
+                    """Lane 1: Publish envelope to Kinesis/EventBridge."""
+                    try:
+                        envelope = EnvelopeV1(
+                            tenant_id=uuid.UUID(tenant_id) if len(tenant_id) == 36 else uuid.uuid4(),
+                            user_id="websocket_user",
+                            interaction_type="meeting",
+                            content=ContentModel(text=meeting_output.cleaned_transcript, format="diarized"),
+                            timestamp=datetime.now(timezone.utc),
+                            source="websocket",
+                            extras={},
+                            interaction_id=uuid.UUID(session_id),
+                            trace_id=trace_id
+                        )
+                        aws_publisher = AWSEventPublisher()
+                        return await aws_publisher.publish_envelope(envelope)
+                    except Exception as e:
+                        logger.error(f"Lane 1 (publishing) error: session_id={session_id}, error={e}")
+                        raise
+                
+                async def _lane2_intelligence() -> Optional[object]:
+                    """Lane 2: Extract and persist intelligence."""
+                    try:
+                        intelligence_service = IntelligenceService()
+                        return await intelligence_service.process_transcript(
+                            cleaned_transcript=meeting_output.cleaned_transcript,
+                            interaction_id=session_id,
+                            tenant_id=tenant_id,
+                            trace_id=trace_id,
+                            interaction_type="meeting"
+                        )
+                    except Exception as e:
+                        logger.error(f"Lane 2 (intelligence) error: session_id={session_id}, error={e}")
+                        raise
+                
+                # Execute both lanes concurrently with error isolation
+                results = await asyncio.gather(
+                    _lane1_publish(),
+                    _lane2_intelligence(),
+                    return_exceptions=True
+                )
+                
+                # Log any exceptions without failing
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        lane_name = "Lane 1 (publishing)" if i == 0 else "Lane 2 (intelligence)"
+                        logger.error(
+                            f"{lane_name} failed: session_id={session_id}, error={result}",
+                            exc_info=result
+                        )
+                    else:
+                        lane_name = "Lane 1 (publishing)" if i == 0 else "Lane 2 (intelligence)"
+                        logger.info(f"{lane_name} completed: session_id={session_id}")
+                        
             else:
                 logger.warning(f"Session {session_id} had no transcript to retrieve")
                 

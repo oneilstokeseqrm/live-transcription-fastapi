@@ -1,0 +1,1579 @@
+// CI schema check trigger (safe, identical in canonical & writer)
+// datasource db defines the database connection details.
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// generator client specifies the Prisma Client generator.
+// Changed to Python-only for ingestion pipeline services
+generator client {
+  provider                    = "prisma-client-py"
+  interface                   = "asyncio"
+  recursive_type_depth        = -1
+  enable_experimental_decimal = true
+}
+
+// --- General Recommendations Based on Feedback ---
+// 1. RLS (Row-Level Security): Strongly recommend implementing RLS policies in PostgreSQL
+//    for an additional layer of tenant data isolation beyond application logic.
+// 2. JSON Standardization: Recommend defining and enforcing consistent schemas/structures
+//    for all JSON/JsonB fields (e.g., customFields, aiWorkflowMetadata) via application
+//    logic and documentation.
+// 3. Polymorphic Validation: Application logic MUST validate 'entityType' and 'entityId'
+//    for all polymorphic link tables to ensure data integrity. Document allowed types per table.
+// 4. Role Assignment Validation: Application logic MUST verify that a User's assigned 'roleId'
+//    exists and is active for their 'tenantId' in the 'TenantRole' table before assignment/update.
+
+// --- Enums (Global - Unchanged) ---
+enum UserRoleName {
+  admin
+  sales
+  marketing
+  support
+  success
+  product
+  finance
+  executive_leadership
+  product_leadership
+  gtm_leadership
+}
+
+enum ActionItemStatus {
+  pending
+  in_progress
+  completed
+}
+
+enum ActionItemPriority {
+  low
+  medium
+  high
+  critical
+}
+
+enum ActionItemLinkEntityType {
+  account
+  contact
+  opportunity
+  meeting
+  interaction
+}
+
+enum InteractionLinkEntityType {
+  account
+  contact
+  opportunity
+  initiative
+}
+
+enum AiInsightLinkEntityType {
+  account
+  contact
+  opportunity
+  initiative
+  interaction
+}
+
+enum PublicDataIngestionStatus {
+  pending
+  processing
+  processed
+  failed
+}
+
+enum PublicDataLinkEntityType {
+  account
+  contact
+  opportunity
+  initiative
+}
+
+enum PendingValidationReason {
+  low_confidence_match
+  missing_required_fields
+  potential_duplicate
+  other
+}
+
+enum PendingValidationStatus {
+  pending
+  validated
+  rejected
+}
+
+enum MeetingAttendeeStatus {
+  invited
+  accepted
+  declined
+}
+
+enum MeetingLinkingMethod {
+  calendar_id
+  time
+  email
+  LLM_similarity
+}
+
+enum MeetingStatus {
+  pending
+  matched
+  completed
+}
+
+enum ContactValidationStatus {
+  pending
+  verified
+  discarded
+}
+
+enum GraphTrendSourceEntityType {
+  account
+  contact
+  opportunity
+  interaction
+}
+
+enum GraphTrendRelevanceLevel {
+  strong
+  moderate
+  weak
+}
+
+// --- V2 Schema Enums (Ingestion Pipeline V2) ---
+enum SummaryLevel {
+  title
+  headline
+  brief
+  detailed
+  spotlight
+  unknown // Fallback for future levels
+}
+
+enum ProfileType {
+  rich
+  lite
+}
+
+enum InsightType {
+  action_item
+  key_takeaway
+  decision_made
+  risk
+  product_feedback      // NEW - for product-related feedback from interactions
+  market_intelligence   // NEW - for market/competitive intelligence
+  unknown // Fallback for future types
+}
+
+enum RiskSeverity {
+  low
+  medium
+  high
+  unknown // Fallback
+}
+
+// --- Tenant Model ---
+model Tenant {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // --- Relations to Tenant-Specific Tables ---
+  users                     User[]
+  accounts                  Account[]
+  contacts                  Contact[]
+  opportunities             Opportunity[]
+  initiatives               Initiative[]
+  rawInteractions           RawInteraction[]
+  holisticSummaries         HolisticSummary[]
+  interactionSummaries      InteractionSummary[]
+  insights                  Insight[]
+  actionItems               ActionItem[]
+  aiInsights                AiInsight[]
+  publicData                PublicData[]
+  trendTags                 TrendTag[]
+  accountTrends             AccountTrend[]
+  contactTrends             ContactTrend[]
+  opportunityTrends         OpportunityTrend[]
+  userTrendTrackers         UserTrendTracker[]
+  pendingValidations        PendingValidation[]
+  aiEvolutionLogs           AiEvolutionLog[]
+  validationHistories       ValidationHistory[]
+  upcomingMeetings          UpcomingMeeting[]
+  meetingAiAnalyses         MeetingAiAnalysis[]
+  meetingAttendees          MeetingAttendee[]
+  graphTrends               GraphTrend[]
+  graphTrendSourceExamples  GraphTrendSourceExample[]
+  actionItemLinks           ActionItemLink[]
+  interactionLinks          InteractionLink[]
+  aiInsightLinks            AiInsightLink[]
+  publicDataLinks           PublicDataLink[]
+  tenantRoles               TenantRole[] // Relation to tenant role activations
+  draftInteractions         DraftInteraction[] // V1 Ingestion Pipeline
+  interactionSummaryEntries InteractionSummaryEntry[] // V2 Normalized Schema
+  interactionInsights       InteractionInsight[] // V2 Normalized Schema
+
+  @@map("tenants")
+}
+
+// --- GLOBAL Reference/Lookup Tables (No Tenant ID) ---
+// Note: Ensure application-level access control restricts write access to appropriate admin roles.
+
+model UserRole {
+  id          String       @id @default(uuid()) @db.Uuid
+  roleName    UserRoleName @unique @map("role_name")
+  users       User[] // Users assigned this role globally (validation needed)
+  tenantRoles TenantRole[] // Relation to tenant activations
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("user_roles")
+}
+
+// --- NEW: Tenant-Specific Role Activation Table ---
+model TenantRole {
+  tenantId  String   @map("tenant_id") @db.Uuid
+  roleId    String   @map("role_id") @db.Uuid
+  isActive  Boolean  @default(true) // Controls if the role is active for this tenant
+  createdAt DateTime @default(now())
+
+  tenant Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade) // Cascade delete activation if Tenant deleted
+  role   UserRole @relation(fields: [roleId], references: [id], onDelete: Cascade) // Cascade delete activation if global Role deleted
+
+  @@id([tenantId, roleId]) // Unique combination of tenant and role
+  @@index([tenantId]) // Index for faster lookup by tenant
+  @@index([roleId]) // ADDED: Index for faster lookup by role
+  @@map("tenant_roles")
+}
+
+model InteractionType {
+  interactionType String           @id @map("interaction_type") @db.Text
+  description     String?          @db.Text
+  rawInteractions RawInteraction[]
+
+  @@map("interaction_types")
+}
+
+model InsightCategory {
+  insightTypeId String               @id @default(uuid()) @map("insight_type_id") @db.Uuid
+  categoryName  String               @unique @map("category_name") @db.Text
+  subcategories InsightSubcategory[]
+  insights      Insight[]
+
+  @@map("insight_categories")
+}
+
+model InsightSubcategory {
+  subcategoryId   String    @id @default(uuid()) @map("subcategory_id") @db.Uuid
+  insightTypeId   String    @map("insight_type_id") @db.Uuid
+  subcategoryName String    @map("subcategory_name") @db.Text
+  insights        Insight[]
+
+  category InsightCategory @relation(fields: [insightTypeId], references: [insightTypeId])
+
+  @@map("insight_subcategories")
+}
+
+model Category {
+  id            String        @id @default(uuid()) @db.Uuid
+  categoryName  String        @map("category_name")
+  subcategories Subcategory[]
+  trendTags     TrendTag[]
+
+  @@index([id])
+  @@map("categories")
+}
+
+model Subcategory {
+  id              String  @id @default(uuid()) @db.Uuid
+  subcategoryName String  @map("subcategory_name")
+  categoryId      String? @map("category_id") @db.Uuid
+
+  category  Category?  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  trendTags TrendTag[]
+
+  @@index([id])
+  @@index([categoryId])
+  @@map("subcategories")
+}
+
+model GraphTrendCategory {
+  id            String                   @id @default(uuid()) @db.Uuid
+  categoryName  String                   @unique @map("category_name") @db.Text
+  subcategories GraphTrendSubcategory[]
+  categoryLinks GraphTrendCategoryLink[]
+
+  @@map("graph_trend_categories")
+}
+
+model GraphTrendSubcategory {
+  id              String @id @default(uuid()) @db.Uuid
+  subcategoryName String @map("subcategory_name") @db.Text
+  categoryId      String @map("category_id") @db.Uuid
+
+  category      GraphTrendCategory       @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  categoryLinks GraphTrendCategoryLink[]
+
+  @@map("graph_trend_subcategories")
+}
+
+// --- GLOBAL Metadata Tables (No Tenant ID) ---
+// Note: Ensure application-level access control restricts write access.
+model ValidationThreshold {
+  entityType String   @id @map("entity_type") @db.Text
+  threshold  Decimal  @db.Decimal(5, 2)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@index([entityType])
+  @@map("validation_thresholds")
+}
+
+model FieldMetadata {
+  id          String   @id @default(uuid()) @db.Uuid
+  tableName   String   @map("table_name") @db.Text
+  fieldName   String   @map("field_name") @db.Text
+  displayName String?  @map("display_name") @db.Text
+  dataType    String   @map("data_type") @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+  isActive    Boolean  @default(true) @map("is_active")
+
+  @@index([tableName])
+  @@index([isActive])
+  @@map("field_metadata")
+}
+
+// --- BUSINESS DATA Tables (WITH Tenant ID) ---
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  name      String
+  email     String
+  roleId    String?  @map("role_id") @db.Uuid // FK to GLOBAL UserRole.id
+  // NOTE: Application MUST validate that this roleId is active for this user's tenantId via TenantRole table.
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant               Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  role                 UserRole?           @relation(fields: [roleId], references: [id], onDelete: SetNull) // Relation to global role defintion
+  ownedAccounts        Account[]           @relation("AccountOwner")
+  ownedOpportunities   Opportunity[]       @relation("OpportunityOwner")
+  ownedInitiatives     Initiative[]        @relation("InitiativeOwner")
+  ownedActionItems     ActionItem[]        @relation("ActionItemOwner")
+  completedActionItems ActionItem[]        @relation("ActionItemCompleter")
+  userTrendTrackers    UserTrendTracker[]
+  pendingValidations   PendingValidation[]
+  validationHistories  ValidationHistory[]
+  draftInteractions    DraftInteraction[] // V1 Ingestion Pipeline
+
+  @@unique([tenantId, email]) // Email unique per tenant
+  @@index([tenantId])
+  @@map("users")
+}
+
+model Account {
+  id                 String   @id @default(uuid()) @db.Uuid
+  tenantId           String   @map("tenant_id") @db.Uuid
+  name               String // AUDIT: Does 'name' need @@unique([tenantId, name])?
+  industry           String?
+  companySize        String?  @map("company_size") @db.VarChar(50)
+  region             String?  @db.VarChar(100)
+  website            String? // AUDIT: Does 'website' need @@unique([tenantId, website])?
+  address            String?  @db.Text
+  phone              String?  @db.VarChar(50)
+  status             String?  @db.VarChar(50)
+  ownerId            String?  @map("owner_id") @db.Uuid
+  accountType        String?  @map("account_type") @db.VarChar(50)
+  parentAccountId    String?  @map("parent_account_id") @db.Uuid
+  annualRevenue      Decimal? @map("annual_revenue") @db.Decimal(15, 2)
+  numberOfEmployees  Int?     @map("number_of_employees")
+  description        String?  @db.Text
+  customFields       Json?    @map("custom_fields") @db.JsonB // Recommend standardizing structure
+  latestAiSummary    String?  @map("latest_ai_summary") @db.Text
+  aiEvolutionSummary String?  @map("ai_evolution_summary") @db.Text
+  aiWorkflowTrigger  Boolean  @default(false) @map("ai_workflow_trigger")
+  aiWorkflowMetadata Json?    @map("ai_workflow_metadata") @db.JsonB // Recommend standardizing structure
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  tenant                    Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  owner                     User?                     @relation("AccountOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  parentAccount             Account?                  @relation("ParentChildAccount", fields: [parentAccountId], references: [id], onDelete: NoAction)
+  childAccounts             Account[]                 @relation("ParentChildAccount")
+  contacts                  Contact[]
+  opportunities             Opportunity[]
+  initiatives               Initiative[]
+  accountTrends             AccountTrend[]
+  accountContactRels        AccountContactRel[]
+  accountOpportunityRels    AccountOpportunityRel[]
+  accountInitiativeRels     AccountInitiativeRel[]
+  upcomingMeetings          UpcomingMeeting[]
+  interactionSummaries      InteractionSummary[]      @relation("AccountInteractionSummaries")
+  interactionAccountLinks   InteractionAccountLink[]
+  interactionSummaryEntries InteractionSummaryEntry[] // V2 Normalized Schema
+  interactionInsights       InteractionInsight[] // V2 Normalized Schema
+
+  @@index([tenantId])
+  @@index([name])
+  @@index([industry])
+  @@index([createdAt])
+  @@map("accounts")
+}
+
+model Contact {
+  id                     String                   @id @default(uuid()) @db.Uuid
+  tenantId               String                   @map("tenant_id") @db.Uuid
+  accountId              String?                  @map("account_id") @db.Uuid // Should likely be required if a contact *must* belong to an account
+  firstName              String?                  @map("first_name") @db.VarChar(100)
+  lastName               String?                  @map("last_name") @db.VarChar(100)
+  email                  String?                  @db.VarChar(255) // AUDIT: Does 'email' need @@unique([tenantId, accountId, email]) or @@unique([tenantId, email])?
+  phoneNumber            String?                  @map("phone_number") @db.VarChar(50)
+  jobTitle               String?                  @map("job_title") @db.VarChar(255)
+  department             String?                  @db.VarChar(100)
+  contactType            String?                  @map("contact_type") @db.VarChar(50)
+  mailingAddress         String?                  @map("mailing_address") @db.Text
+  linkedinUrl            String?                  @map("linkedin_url") @db.VarChar(255)
+  twitterHandle          String?                  @map("twitter_handle") @db.VarChar(50)
+  preferredContactMethod String?                  @map("preferred_contact_method") @db.VarChar(50)
+  reportsToId            String?                  @map("reports_to_id") @db.Uuid
+  leadSource             String?                  @map("lead_source") @db.VarChar(50)
+  lifecycleStage         String?                  @map("lifecycle_stage") @db.VarChar(50)
+  notes                  String?                  @db.Text
+  doNotEmail             Boolean?                 @map("do_not_email")
+  doNotCall              Boolean?                 @map("do_not_call")
+  customFields           Json?                    @map("custom_fields") @db.JsonB // Recommend standardizing structure
+  latestAiSummary        String?                  @map("latest_ai_summary") @db.Text
+  aiEvolutionSummary     String?                  @map("ai_evolution_summary") @db.Text
+  aiWorkflowTrigger      Boolean                  @default(false) @map("ai_workflow_trigger")
+  aiWorkflowMetadata     Json?                    @map("ai_workflow_metadata") @db.JsonB // Recommend standardizing structure
+  createdAt              DateTime                 @default(now()) @map("created_at")
+  updatedAt              DateTime                 @updatedAt @map("updated_at")
+  validationStatus       ContactValidationStatus? @default(pending) @map("validation_status")
+  source                 String?                  @default("manual") @db.Text
+
+  tenant                     Tenant                      @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  account                    Account?                    @relation(fields: [accountId], references: [id], onDelete: Cascade) // Cascade delete contact if account is deleted? Or Restrict/SetNull? Review needed.
+  reportsTo                  Contact?                    @relation("ContactHierarchy", fields: [reportsToId], references: [id], onDelete: SetNull)
+  directReports              Contact[]                   @relation("ContactHierarchy")
+  contactTrends              ContactTrend[]
+  accountContactRels         AccountContactRel[]
+  contactOpportunityRels     ContactOpportunityRel[]
+  meetingAttendees           MeetingAttendee[]
+  interactionSummaries       InteractionSummary[]        @relation("ContactInteractionSummaries")
+  interactionContactLinks    InteractionContactLink[]
+  interactionSummaryContacts InteractionSummaryContact[] // V2 Normalized Schema
+  interactionInsightContacts InteractionInsightContact[] // V2 Normalized Schema
+
+  @@index([tenantId])
+  @@index([accountId])
+  @@index([email])
+  @@index([createdAt])
+  @@map("contacts")
+}
+
+model Opportunity {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenantId           String    @map("tenant_id") @db.Uuid
+  accountId          String?   @map("account_id") @db.Uuid // Should likely be required if an opportunity *must* belong to an account
+  opportunityName    String    @map("opportunity_name") // AUDIT: Does 'opportunityName' need @@unique([tenantId, accountId, opportunityName])?
+  type               String?   @db.VarChar(100)
+  leadSource         String?   @map("lead_source") @db.VarChar(100)
+  campaign           String?   @db.VarChar(100)
+  amount             Decimal?  @db.Decimal(15, 2)
+  currency           String?   @db.VarChar(10)
+  closeDate          DateTime? @map("close_date") @db.Date
+  stage              String?   @db.VarChar(100)
+  probability        Decimal?  @db.Decimal(5, 2)
+  forecastCategory   String?   @map("forecast_category") @db.VarChar(50)
+  expectedRevenue    Decimal?  @map("expected_revenue") @db.Decimal(15, 2)
+  dealStatus         String?   @map("deal_status") @db.VarChar(50)
+  lostReason         String?   @map("lost_reason")
+  openDate           DateTime? @map("open_date") @db.Date
+  actualCloseDate    DateTime? @map("actual_close_date") @db.Date
+  salesCycleDays     Int?      @map("sales_cycle_days")
+  nextStep           String?   @map("next_step") @db.Text
+  opportunityOwnerId String?   @map("opportunity_owner_id") @db.Uuid
+  aiWinProbability   Decimal?  @map("ai_win_probability") @db.Decimal(5, 2)
+  predictedCloseDate DateTime? @map("predicted_close_date") @db.Date
+  dealRiskLevel      String?   @map("deal_risk_level") @db.VarChar(50)
+  description        String?   @db.Text
+  customFields       Json?     @map("custom_fields") @db.JsonB // Recommend standardizing structure
+  latestAiSummary    String?   @map("latest_ai_summary") @db.Text
+  aiEvolutionSummary String?   @map("ai_evolution_summary") @db.Text
+  aiWorkflowTrigger  Boolean   @default(false) @map("ai_workflow_trigger")
+  aiWorkflowMetadata Json?     @map("ai_workflow_metadata") @db.JsonB // Recommend standardizing structure
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  tenant                      Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  account                     Account?                     @relation(fields: [accountId], references: [id], onDelete: Cascade) // Cascade delete opportunity if account is deleted? Or Restrict? Review needed.
+  opportunityOwner            User?                        @relation("OpportunityOwner", fields: [opportunityOwnerId], references: [id], onDelete: SetNull)
+  opportunityTrends           OpportunityTrend[]
+  opportunityInitiativeRels   OpportunityInitiativeRel[]
+  accountOpportunityRels      AccountOpportunityRel[]
+  contactOpportunityRels      ContactOpportunityRel[]
+  interactionSummaries        InteractionSummary[]         @relation("OpportunityInteractionSummaries")
+  interactionOpportunityLinks InteractionOpportunityLink[]
+
+  @@index([tenantId])
+  @@index([accountId])
+  @@index([dealStatus])
+  @@index([createdAt])
+  @@map("opportunities")
+}
+
+model Initiative {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenantId           String    @map("tenant_id") @db.Uuid
+  accountId          String?   @map("account_id") @db.Uuid // Should likely be required if an initiative *must* belong to an account
+  initiativeName     String    @map("initiative_name") // AUDIT: Does 'initiativeName' need @@unique([tenantId, accountId, initiativeName])?
+  status             String?   @db.VarChar(50)
+  objective          String?   @db.Text
+  startDate          DateTime? @map("start_date") @db.Date
+  endDate            DateTime? @map("end_date") @db.Date
+  priority           String?   @db.VarChar(50)
+  ownerId            String?   @map("owner_id") @db.Uuid
+  budget             Decimal?  @db.Decimal(15, 2)
+  customFields       Json?     @map("custom_fields") @db.JsonB // Recommend standardizing structure
+  latestAiSummary    String?   @map("latest_ai_summary") @db.Text
+  aiEvolutionSummary String?   @map("ai_evolution_summary") @db.Text
+  aiWorkflowTrigger  Boolean   @default(false) @map("ai_workflow_trigger")
+  aiWorkflowMetadata Json?     @map("ai_workflow_metadata") @db.JsonB // Recommend standardizing structure
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  tenant                     Tenant                      @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  account                    Account?                    @relation(fields: [accountId], references: [id], onDelete: Cascade) // Cascade delete initiative if account is deleted? Or Restrict? Review needed.
+  owner                      User?                       @relation("InitiativeOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  opportunityInitiativeRels  OpportunityInitiativeRel[]
+  accountInitiativeRels      AccountInitiativeRel[]
+  interactionSummaries       InteractionSummary[]        @relation("InitiativeInteractionSummaries")
+  interactionInitiativeLinks InteractionInitiativeLink[]
+
+  @@index([tenantId])
+  @@index([accountId])
+  @@index([createdAt])
+  @@map("initiatives")
+}
+
+model RawInteraction {
+  interactionId   String   @id @default(uuid()) @map("interaction_id") @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  interactionType String   @map("interaction_type") @db.Text
+  rawText         String?  @map("raw_text") @db.Text
+  mediaUrl        String?  @map("media_url") @db.Text
+  userId          String?  @map("user_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  type               InteractionType     @relation(fields: [interactionType], references: [interactionType])
+  interactionSummary InteractionSummary?
+
+  @@index([tenantId])
+  @@index([interactionType])
+  @@map("raw_interactions")
+}
+
+model HolisticSummary {
+  holisticSummaryId String   @id @default(uuid()) @map("holistic_summary_id") @db.Uuid
+  tenantId          String   @map("tenant_id") @db.Uuid
+  summaryTitle      String?  @map("summary_title") @db.Text
+  summaryHeadline   String?  @map("summary_headline") @db.Text
+  briefSummary      String?  @map("brief_summary") @db.Text
+  detailedSummary   String?  @map("detailed_summary") @db.Text
+  spotlightSummary  String?  @map("spotlight_summary") @db.Text
+  interactionCount  Int?     @map("interaction_count")
+  timeSpan          String?  @map("time_span") @db.Text
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  tenant               Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  interactionSummaries InteractionSummary[]
+  holisticSummaryLinks HolisticSummaryLink[]
+
+  @@index([tenantId])
+  @@map("holistic_summaries")
+}
+
+model InteractionSummary {
+  summaryId          String  @id @default(uuid()) @map("summary_id") @db.Uuid
+  tenantId           String  @map("tenant_id") @db.Uuid
+  interactionId      String  @unique @map("interaction_id") @db.Uuid // Link to RawInteraction
+  summaryTitle       String? @map("summary_title") @db.Text
+  summaryHeadline    String? @map("summary_headline") @db.Text
+  briefSummary       String? @map("brief_summary") @db.Text
+  detailedSummary    String? @map("detailed_summary") @db.Text
+  spotlightSummary   String? @map("spotlight_summary") @db.Text
+  trendSummary       String? @map("trend_summary") @db.Text
+  aiWorkflowTrigger  Boolean @default(false) @map("ai_workflow_trigger")
+  aiWorkflowMetadata Json?   @map("ai_workflow_metadata") @db.JsonB // Recommend standardizing structure
+  tags               Json?   @db.JsonB // Recommend standardizing structure
+  holisticSummaryId  String? @map("holistic_summary_id") @db.Uuid
+  summaryType        String  @map("summary_type") @db.Text
+  userId             String? @map("user_id") @db.Text
+  source             String? @map("source") @db.Text
+  llmVersion         String? @map("llm_version") @db.Text
+  inputTokens        Int?    @map("input_tokens")
+  outputTokens       Int?    @map("output_tokens")
+
+  // NEW: V1 Ingestion Pipeline - Persona-specific summaries (LEGACY - kept for backward compatibility)
+  gtmHighLevel       String? @map("gtm_high_level") @db.Text
+  gtmDetailed        String? @map("gtm_detailed") @db.Text
+  productHighLevel   String? @map("product_high_level") @db.Text
+  productDetailed    String? @map("product_detailed") @db.Text
+  executiveHighLevel String? @map("executive_high_level") @db.Text
+  executiveDetailed  String? @map("executive_detailed") @db.Text
+
+  // NEW: V1 Ingestion Pipeline - Structured insights (LEGACY - deprecated, not used for queries)
+  insightsJson Json? @map("insights_json") @db.JsonB
+  // Structure: { action_items: [], key_takeaways: [], decisions_made: [], risks_identified: [] }
+
+  // NEW: V2 Schema - GTM Persona Summaries
+  gtmTitle            String?      @map("gtm_title") @db.Text
+  gtmHeadline         String?      @map("gtm_headline") @db.Text
+  gtmBriefSummary     String?      @map("gtm_brief_summary") @db.Text
+  gtmSpotlightSummary String?      @map("gtm_spotlight_summary") @db.Text
+  profileGtm          ProfileType? @map("profile_gtm")
+
+  // NEW: V2 Schema - Product Persona Summaries
+  productTitle            String?      @map("product_title") @db.Text
+  productHeadline         String?      @map("product_headline") @db.Text
+  productBriefSummary     String?      @map("product_brief_summary") @db.Text
+  productSpotlightSummary String?      @map("product_spotlight_summary") @db.Text
+  profileProduct          ProfileType? @map("profile_product")
+
+  // NEW: V2 Schema - Executive Persona Summaries
+  executiveTitle            String?      @map("executive_title") @db.Text
+  executiveHeadline         String?      @map("executive_headline") @db.Text
+  executiveBriefSummary     String?      @map("executive_brief_summary") @db.Text
+  executiveSpotlightSummary String?      @map("executive_spotlight_summary") @db.Text
+  profileExecutive          ProfileType? @map("profile_executive")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  rawInteraction  RawInteraction   @relation(fields: [interactionId], references: [interactionId])
+  holisticSummary HolisticSummary? @relation(fields: [holisticSummaryId], references: [holisticSummaryId])
+  accounts        Account[]        @relation("AccountInteractionSummaries")
+  contacts        Contact[]        @relation("ContactInteractionSummaries")
+  opportunities   Opportunity[]    @relation("OpportunityInteractionSummaries")
+  initiatives     Initiative[]     @relation("InitiativeInteractionSummaries")
+
+  holisticSummaryLinks         HolisticSummaryLink[]
+  insights                     Insight[]
+  interactionAccountLinks      InteractionAccountLink[]
+  interactionContactLinks      InteractionContactLink[]
+  interactionOpportunityLinks  InteractionOpportunityLink[]
+  interactionInitiativeLinks   InteractionInitiativeLink[]
+  trendTags                    TrendTag[]
+  accountTrends                AccountTrend[]
+  contactTrends                ContactTrend[]
+  opportunityTrends            OpportunityTrend[]
+  aiTrendLinks                 AiTrendLink[]
+  graphTrendInteractionLinks   GraphTrendInteractionLink[]
+  meetingToInteractionMappings MeetingToInteractionMapping[]
+  aiInsightLinks               AiInsightLink[]
+  interactionLinks             InteractionLink[]
+
+  @@index([tenantId])
+  @@index([summaryType])
+  @@map("interaction_summaries")
+}
+
+model Insight {
+  insightId       String   @id @default(uuid()) @map("insight_id") @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  interactionId   String   @map("interaction_id") @db.Uuid
+  insightTypeId   String   @map("insight_type_id") @db.Uuid
+  subcategoryId   String?  @map("subcategory_id") @db.Uuid
+  insightText     String?  @map("insight_text") @db.Text
+  confidenceScore Decimal? @map("confidence_score") @db.Decimal(5, 2)
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  interactionSummary InteractionSummary  @relation(fields: [interactionId], references: [summaryId])
+  category           InsightCategory     @relation(fields: [insightTypeId], references: [insightTypeId])
+  subcategory        InsightSubcategory? @relation(fields: [subcategoryId], references: [subcategoryId])
+
+  @@index([tenantId])
+  @@map("insights")
+}
+
+model ActionItem {
+  id                        String              @id @default(uuid()) @db.Uuid
+  tenantId                  String              @map("tenant_id") @db.Uuid
+  title                     String?
+  description               String?             @db.Text
+  status                    ActionItemStatus?
+  priority                  ActionItemPriority?
+  dueDate                   DateTime?           @map("due_date") @db.Timestamp()
+  ownerId                   String?             @map("owner_id") @db.Uuid
+  completedByUserId         String?             @map("completed_by_user_id") @db.Uuid
+  generatedByAi             Boolean?            @map("generated_by_ai")
+  aiSuggestionDetails       Json?               @map("ai_suggestion_details") @db.JsonB // Recommend standardizing structure
+  workflowTriggered         Boolean?            @map("workflow_triggered")
+  workflowMetadata          Json?               @map("workflow_metadata") @db.JsonB // Recommend standardizing structure
+  generatedOutputType       String?             @map("generated_output_type") @db.VarChar(50)
+  aiGeneratedOutput         String?             @map("ai_generated_output") @db.Text
+  aiGeneratedOutputMetadata Json?               @map("ai_generated_output_metadata") @db.JsonB // Recommend standardizing structure
+  completionTimestamp       DateTime?           @map("completion_timestamp") @db.Timestamp()
+  createdAt                 DateTime            @default(now()) @map("created_at")
+  updatedAt                 DateTime            @updatedAt @map("updated_at")
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  owner           User?            @relation("ActionItemOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  completedByUser User?            @relation("ActionItemCompleter", fields: [completedByUserId], references: [id], onDelete: SetNull)
+  actionItemLinks ActionItemLink[]
+
+  @@index([tenantId])
+  @@index([ownerId])
+  @@index([status])
+  @@index([dueDate])
+  @@index([priority])
+  @@map("action_items")
+}
+
+model AiInsight {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @map("tenant_id") @db.Uuid
+  sourceTable      String?  @map("source_table") @db.Text
+  sourceId         String?  @map("source_id") @db.Uuid
+  insightType      String?  @map("insight_type") @db.Text
+  parentInsightId  String?  @map("parent_insight_id") @db.Uuid
+  summaryText      String?  @map("summary_text") @db.Text
+  relatedTrendTags Json?    @map("related_trend_tags") @db.JsonB // Recommend standardizing structure
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  parentInsight  AiInsight?      @relation("InsightHierarchy", fields: [parentInsightId], references: [id], onDelete: NoAction)
+  childInsights  AiInsight[]     @relation("InsightHierarchy")
+  aiInsightLinks AiInsightLink[]
+  aiTrendLinks   AiTrendLink[]
+
+  @@index([tenantId])
+  @@index([sourceTable])
+  @@index([sourceId])
+  @@index([insightType])
+  @@index([createdAt])
+  @@map("ai_insights")
+}
+
+model PublicData {
+  id              String                    @id @default(uuid()) @db.Uuid
+  tenantId        String                    @map("tenant_id") @db.Uuid
+  entityType      String?                   @map("entity_type") @db.Text
+  entityId        String?                   @map("entity_id") @db.Uuid
+  dataSource      String?                   @map("data_source")
+  rawText         String?                   @map("raw_text") @db.Text
+  aiSummary       String?                   @map("ai_summary") @db.Text
+  processedFields Json?                     @map("processed_fields") @db.JsonB // Recommend standardizing structure
+  ingestionStatus PublicDataIngestionStatus @default(pending) @map("ingestion_status")
+  ingestedAt      DateTime                  @default(now()) @map("ingested_at")
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  publicDataLinks PublicDataLink[]
+
+  @@index([tenantId])
+  @@index([entityType])
+  @@index([entityId])
+  @@index([ingestedAt])
+  @@map("public_data")
+}
+
+model TrendTag {
+  id            String  @id @default(uuid()) @db.Uuid
+  tenantId      String  @map("tenant_id") @db.Uuid
+  interactionId String? @map("interaction_id") @db.Uuid
+  categoryId    String? @map("category_id") @db.Uuid
+  subcategoryId String? @map("subcategory_id") @db.Uuid
+  weighting     Int?
+  extractedText String? @map("extracted_text") @db.Text
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  interactionSummary InteractionSummary? @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade) // Cascade OK if InteractionSummary deletion means tag is irrelevant? Review needed.
+  category           Category?           @relation(fields: [categoryId], references: [id], onDelete: Cascade) // Cascade OK if Category deleted? Probably yes.
+  subcategory        Subcategory?        @relation(fields: [subcategoryId], references: [id], onDelete: Cascade) // Cascade OK if Subcategory deleted? Probably yes.
+  accountTrends      AccountTrend[]
+  contactTrends      ContactTrend[]
+  opportunityTrends  OpportunityTrend[]
+  aiTrendLinks       AiTrendLink[]
+  userTrendTrackers  UserTrendTracker[]
+
+  @@index([tenantId])
+  @@index([interactionId])
+  @@index([categoryId])
+  @@index([subcategoryId])
+  @@index([extractedText])
+  @@map("trend_tags")
+}
+
+model AccountTrend {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  accountId     String   @map("account_id") @db.Uuid
+  trendTagId    String?  @map("trend_tag_id") @db.Uuid
+  interactionId String?  @map("interaction_id") @db.Uuid
+  insightText   String?  @map("insight_text") @db.Text
+  weighting     Int?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  account            Account             @relation(fields: [accountId], references: [id], onDelete: Cascade) // Cascade OK if account deleted? Probably yes.
+  trendTag           TrendTag?           @relation(fields: [trendTagId], references: [id], onDelete: Cascade) // Cascade OK if tag deleted? Probably yes.
+  interactionSummary InteractionSummary? @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade) // Cascade OK if interaction deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([accountId])
+  @@index([trendTagId])
+  @@index([interactionId])
+  @@map("account_trends")
+}
+
+model ContactTrend {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  contactId     String   @map("contact_id") @db.Uuid
+  trendTagId    String?  @map("trend_tag_id") @db.Uuid
+  interactionId String?  @map("interaction_id") @db.Uuid
+  insightText   String?  @map("insight_text") @db.Text
+  weighting     Int?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  contact            Contact             @relation(fields: [contactId], references: [id], onDelete: Cascade) // Cascade OK if contact deleted? Probably yes.
+  trendTag           TrendTag?           @relation(fields: [trendTagId], references: [id], onDelete: Cascade) // Cascade OK if tag deleted? Probably yes.
+  interactionSummary InteractionSummary? @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade) // Cascade OK if interaction deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([contactId])
+  @@index([trendTagId])
+  @@index([interactionId])
+  @@map("contact_trends")
+}
+
+model OpportunityTrend {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  opportunityId String   @map("opportunity_id") @db.Uuid
+  trendTagId    String?  @map("trend_tag_id") @db.Uuid
+  interactionId String?  @map("interaction_id") @db.Uuid
+  insightText   String?  @map("insight_text") @db.Text
+  weighting     Int?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  opportunity        Opportunity         @relation(fields: [opportunityId], references: [id], onDelete: Cascade) // Cascade OK if opportunity deleted? Probably yes.
+  trendTag           TrendTag?           @relation(fields: [trendTagId], references: [id], onDelete: Cascade) // Cascade OK if tag deleted? Probably yes.
+  interactionSummary InteractionSummary? @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade) // Cascade OK if interaction deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([opportunityId])
+  @@index([trendTagId])
+  @@index([interactionId])
+  @@map("opportunity_trends")
+}
+
+model UserTrendTracker {
+  id             String    @id @default(uuid()) @db.Uuid
+  tenantId       String    @map("tenant_id") @db.Uuid
+  userId         String?   @map("user_id") @db.Uuid
+  trendTagId     String?   @map("trend_tag_id") @db.Uuid
+  creationDate   DateTime? @map("creation_date") @db.Timestamp()
+  expirationDate DateTime? @map("expiration_date") @db.Timestamp()
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  user     User?     @relation(fields: [userId], references: [id], onDelete: Cascade) // Cascade OK if user deleted? Or SetNull? Review needed.
+  trendTag TrendTag? @relation(fields: [trendTagId], references: [id], onDelete: Cascade) // Cascade OK if tag deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([userId])
+  @@map("user_trend_trackers")
+}
+
+model PendingValidation {
+  id               String                   @id @default(uuid()) @db.Uuid
+  tenantId         String                   @map("tenant_id") @db.Uuid
+  entityType       String                   @map("entity_type") @db.Text
+  entityId         String?                  @map("entity_id") @db.Uuid
+  validationReason PendingValidationReason? @map("validation_reason")
+  confidenceScore  Decimal?                 @map("confidence_score") @db.Decimal(5, 2)
+  suggestedValue   Json?                    @map("suggested_value") @db.JsonB // Recommend standardizing structure
+  validationStatus PendingValidationStatus? @map("validation_status")
+  validatedBy      String?                  @map("validated_by") @db.Uuid
+  validatedAt      DateTime?                @map("validated_at") @db.Timestamp()
+  isArchived       Boolean?                 @map("is_archived")
+
+  tenant            Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  validator         User?               @relation(fields: [validatedBy], references: [id], onDelete: SetNull)
+  validationHistory ValidationHistory[]
+
+  @@index([tenantId])
+  @@index([entityType])
+  @@index([validationStatus])
+  @@map("pending_validations")
+}
+
+model AiEvolutionLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  entityType  String?  @map("entity_type") @db.VarChar(50)
+  entityId    String   @map("entity_id") @db.Uuid
+  summary     String?  @db.Text
+  eventType   String?  @map("event_type") @db.Text
+  impactScore Int?     @map("impact_score")
+  timestamp   DateTime @default(now()) @db.Timestamp()
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+
+  @@index([tenantId])
+  @@index([entityType])
+  @@index([entityId])
+  @@index([timestamp])
+  @@map("ai_evolution_logs")
+}
+
+model ValidationHistory {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenantId            String   @map("tenant_id") @db.Uuid
+  pendingValidationId String?  @map("pending_validation_id") @db.Uuid
+  previousValue       Json?    @map("previous_value") @db.JsonB // Recommend standardizing structure
+  updatedValue        Json?    @map("updated_value") @db.JsonB // Recommend standardizing structure
+  validatedBy         String?  @map("validated_by") @db.Uuid
+  validatedAt         DateTime @default(now()) @map("validated_at")
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  pendingValidation PendingValidation? @relation(fields: [pendingValidationId], references: [id], onDelete: Cascade) // Cascade OK if pending validation deleted? Probably yes.
+  validator         User?              @relation(fields: [validatedBy], references: [id], onDelete: SetNull) // SetNull on validator deletion seems reasonable
+
+  @@index([tenantId])
+  @@index([pendingValidationId])
+  @@index([validatedBy])
+  @@index([validatedAt])
+  @@map("validation_history")
+}
+
+model UpcomingMeeting {
+  id          Int      @id @default(autoincrement())
+  tenantId    String   @map("tenant_id") @db.Uuid
+  title       String   @db.Text
+  description String?  @db.Text
+  dateTime    DateTime @map("date_time") @db.Timestamp()
+  location    String?  @db.Text
+  calendarId  String?  @map("calendar_id") @db.Text
+  accountId   String?  @map("account_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant              Tenant                        @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  account             Account?                      @relation(fields: [accountId], references: [id], onDelete: SetNull) // SetNull OK if Account deleted but Meeting remains? Review needed.
+  aiAnalysis          MeetingAiAnalysis?
+  attendees           MeetingAttendee[]
+  interactionMappings MeetingToInteractionMapping[]
+
+  @@unique([tenantId, calendarId]) // Calendar ID unique per tenant
+  @@index([tenantId])
+  @@index([dateTime])
+  @@map("upcoming_meetings")
+}
+
+model MeetingAiAnalysis {
+  meetingId           Int      @id @map("meeting_id")
+  tenantId            String   @map("tenant_id") @db.Uuid
+  headline            String?  @db.Text
+  summary             String?  @db.Text
+  relevantContext     Json?    @map("relevant_context") @db.JsonB // Recommend standardizing structure
+  relatedInteractions Json?    @map("related_interactions") @db.JsonB // Recommend standardizing structure
+  prepMaterials       Json?    @map("prep_materials") @db.JsonB // Recommend standardizing structure
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  meeting UpcomingMeeting @relation(fields: [meetingId], references: [id], onDelete: Cascade) // Cascade OK if meeting deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([meetingId])
+  @@map("meeting_ai_analysis")
+}
+
+model MeetingAttendee {
+  id        Int                   @id @default(autoincrement())
+  tenantId  String                @map("tenant_id") @db.Uuid
+  meetingId Int                   @map("meeting_id")
+  contactId String?               @map("contact_id") @db.Uuid
+  email     String                @db.Text
+  role      String?               @db.Text
+  status    MeetingAttendeeStatus @default(invited)
+  createdAt DateTime              @default(now()) @map("created_at")
+  updatedAt DateTime              @updatedAt @map("updated_at")
+
+  tenant  Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  meeting UpcomingMeeting @relation(fields: [meetingId], references: [id], onDelete: Cascade) // Cascade OK if meeting deleted? Probably yes.
+  contact Contact?        @relation(fields: [contactId], references: [id], onDelete: SetNull) // SetNull OK if Contact deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([email])
+  @@index([meetingId])
+  @@index([contactId])
+  @@map("meeting_attendees")
+}
+
+model GraphTrend {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @map("tenant_id") @db.Uuid
+  trendText         String   @map("trend_text") @db.Text
+  trendOriginSource String?  @map("trend_origin_source") @db.Text
+  confidenceScore   Decimal? @map("confidence_score") @db.Decimal(5, 2)
+  processedAt       DateTime @default(now()) @map("processed_at")
+  isActive          Boolean  @default(true) @map("is_active")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  tenant                     Tenant                      @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  categoryLinks              GraphTrendCategoryLink[]
+  sourceExamples             GraphTrendSourceExample[]
+  graphTrendInteractionLinks GraphTrendInteractionLink[]
+
+  @@index([tenantId])
+  @@index([confidenceScore])
+  @@index([createdAt])
+  @@map("graph_trends")
+}
+
+model GraphTrendSourceExample {
+  id                    String                      @id @default(uuid()) @db.Uuid
+  tenantId              String                      @map("tenant_id") @db.Uuid
+  trendId               String                      @map("trend_id") @db.Uuid
+  entityType            GraphTrendSourceEntityType? @map("entity_type")
+  entityId              String                      @map("entity_id") @db.Uuid
+  sourceSummary         String?                     @map("source_summary") @db.Text
+  sourceInteractionType String?                     @map("source_interaction_type") @db.Text
+  createdAt             DateTime                    @default(now()) @map("created_at")
+  updatedAt             DateTime                    @updatedAt @map("updated_at")
+
+  tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  trend  GraphTrend @relation(fields: [trendId], references: [id], onDelete: Cascade) // Cascade OK if trend deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([entityType])
+  @@index([entityId])
+  @@index([trendId])
+  @@map("graph_trend_source_examples")
+}
+
+// --- JOIN / LINK Tables ---
+// TenantId generally not needed here if linking two tenant-specific tables.
+// Ensure application logic prevents cross-tenant linking.
+
+model OpportunityInitiativeRel {
+  opportunityId String @map("opportunity_id") @db.Uuid
+  initiativeId  String @map("initiative_id") @db.Uuid
+
+  opportunity Opportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+  initiative  Initiative  @relation(fields: [initiativeId], references: [id], onDelete: Cascade)
+
+  @@id([opportunityId, initiativeId])
+  @@map("opportunity_initiative_rel")
+}
+
+model AccountContactRel {
+  accountId String @map("account_id") @db.Uuid
+  contactId String @map("contact_id") @db.Uuid
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@id([accountId, contactId])
+  @@index([accountId])
+  @@index([contactId])
+  @@map("account_contact_rel")
+}
+
+model AccountOpportunityRel {
+  accountId     String @map("account_id") @db.Uuid
+  opportunityId String @map("opportunity_id") @db.Uuid
+
+  account     Account     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  opportunity Opportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  @@id([accountId, opportunityId])
+  @@index([accountId])
+  @@index([opportunityId])
+  @@map("account_opportunity_rel")
+}
+
+model ContactOpportunityRel {
+  contactId     String @map("contact_id") @db.Uuid
+  opportunityId String @map("opportunity_id") @db.Uuid
+
+  contact     Contact     @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  opportunity Opportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  @@id([contactId, opportunityId])
+  @@index([contactId])
+  @@index([opportunityId])
+  @@map("contact_opportunity_rel")
+}
+
+model AccountInitiativeRel {
+  accountId    String @map("account_id") @db.Uuid
+  initiativeId String @map("initiative_id") @db.Uuid
+
+  account    Account    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  initiative Initiative @relation(fields: [initiativeId], references: [id], onDelete: Cascade)
+
+  @@id([accountId, initiativeId])
+  @@index([accountId])
+  @@index([initiativeId])
+  @@map("account_initiative_rel")
+}
+
+model HolisticSummaryLink {
+  id                String   @id @default(uuid()) @db.Uuid
+  holisticSummaryId String   @map("holistic_summary_id") @db.Uuid
+  summaryId         String   @map("summary_id") @db.Uuid
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  holisticSummary    HolisticSummary    @relation(fields: [holisticSummaryId], references: [holisticSummaryId])
+  interactionSummary InteractionSummary @relation(fields: [summaryId], references: [summaryId])
+
+  @@map("holistic_summary_links")
+}
+
+model InteractionAccountLink {
+  linkId                String  @id @default(uuid()) @map("link_id") @db.Uuid
+  interactionSummaryId  String  @map("interaction_id") @db.Uuid
+  accountId             String  @map("account_id") @db.Uuid
+  entitySpecificSummary String? @map("entity_specific_summary") @db.Text
+
+  interactionSummary InteractionSummary @relation(fields: [interactionSummaryId], references: [summaryId])
+  account            Account            @relation(fields: [accountId], references: [id])
+
+  @@map("interaction_account_links")
+}
+
+model InteractionContactLink {
+  linkId                String  @id @default(uuid()) @map("link_id") @db.Uuid
+  interactionSummaryId  String  @map("interaction_id") @db.Uuid
+  contactId             String  @map("contact_id") @db.Uuid
+  entitySpecificSummary String? @map("entity_specific_summary") @db.Text
+
+  interactionSummary InteractionSummary @relation(fields: [interactionSummaryId], references: [summaryId])
+  contact            Contact            @relation(fields: [contactId], references: [id])
+
+  @@map("interaction_contact_links")
+}
+
+model InteractionOpportunityLink {
+  linkId                String  @id @default(uuid()) @map("link_id") @db.Uuid
+  interactionSummaryId  String  @map("interaction_id") @db.Uuid
+  opportunityId         String  @map("opportunity_id") @db.Uuid
+  entitySpecificSummary String? @map("entity_specific_summary") @db.Text
+
+  interactionSummary InteractionSummary @relation(fields: [interactionSummaryId], references: [summaryId])
+  opportunity        Opportunity        @relation(fields: [opportunityId], references: [id])
+
+  @@map("interaction_opportunity_links")
+}
+
+model InteractionInitiativeLink {
+  linkId                String  @id @default(uuid()) @map("link_id") @db.Uuid
+  interactionSummaryId  String  @map("interaction_id") @db.Uuid
+  initiativeId          String  @map("initiative_id") @db.Uuid
+  entitySpecificSummary String? @map("entity_specific_summary") @db.Text
+
+  interactionSummary InteractionSummary @relation(fields: [interactionSummaryId], references: [summaryId])
+  initiative         Initiative         @relation(fields: [initiativeId], references: [id])
+
+  @@map("interaction_initiative_links")
+}
+
+model GraphTrendCategoryLink {
+  id            String  @id @default(uuid()) @db.Uuid
+  trendId       String  @map("trend_id") @db.Uuid
+  categoryId    String  @map("category_id") @db.Uuid
+  subcategoryId String? @map("subcategory_id") @db.Uuid
+  isPrimary     Boolean @default(false) @map("is_primary")
+
+  trend       GraphTrend             @relation(fields: [trendId], references: [id], onDelete: Cascade)
+  category    GraphTrendCategory     @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  subcategory GraphTrendSubcategory? @relation(fields: [subcategoryId], references: [id], onDelete: Cascade)
+
+  @@index([trendId])
+  @@index([categoryId])
+  @@index([subcategoryId])
+  @@map("graph_trend_category_links")
+}
+
+model GraphTrendInteractionLink {
+  id             String                   @id @default(uuid()) @db.Uuid
+  trendId        String                   @map("trend_id") @db.Uuid
+  interactionId  String                   @map("interaction_id") @db.Uuid
+  relevanceLevel GraphTrendRelevanceLevel @default(moderate) @map("relevance_level")
+  isPivotal      Boolean                  @default(false) @map("is_pivotal")
+  createdAt      DateTime                 @default(now()) @map("created_at")
+
+  trend              GraphTrend         @relation(fields: [trendId], references: [id], onDelete: Cascade)
+  interactionSummary InteractionSummary @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade)
+
+  @@index([trendId])
+  @@index([interactionId])
+  @@map("graph_trend_interaction_links")
+}
+
+model MeetingToInteractionMapping {
+  id            Int                  @id @default(autoincrement())
+  meetingId     Int                  @map("meeting_id")
+  interactionId String               @map("interaction_id") @db.Uuid
+  linkingMethod MeetingLinkingMethod @default(calendar_id) @map("linking_method")
+  status        MeetingStatus        @default(pending)
+  createdAt     DateTime             @default(now()) @map("created_at")
+
+  meeting            UpcomingMeeting    @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  interactionSummary InteractionSummary @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade)
+
+  @@index([meetingId])
+  @@index([interactionId])
+  @@map("meeting_to_interaction_mapping")
+}
+
+model AiTrendLink {
+  id            String  @id @default(uuid()) @db.Uuid
+  aiInsightId   String? @map("ai_insight_id") @db.Uuid
+  trendTagId    String? @map("trend_tag_id") @db.Uuid
+  interactionId String? @map("interaction_id") @db.Uuid
+  weighting     Int?
+
+  aiInsight          AiInsight?          @relation(fields: [aiInsightId], references: [id], onDelete: Cascade)
+  trendTag           TrendTag?           @relation(fields: [trendTagId], references: [id], onDelete: Cascade)
+  interactionSummary InteractionSummary? @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade)
+
+  @@index([aiInsightId])
+  @@index([trendTagId])
+  @@index([interactionId])
+  @@map("ai_trend_links")
+}
+
+// --- POLYMORPHIC Link Tables (Need Tenant ID on Link Table) ---
+// Application logic MUST validate entityType/entityId against tenantId.
+
+model ActionItemLink {
+  id           String                   @id @default(uuid()) @db.Uuid
+  tenantId     String                   @map("tenant_id") @db.Uuid
+  actionItemId String                   @map("action_item_id") @db.Uuid
+  entityType   ActionItemLinkEntityType @map("entity_type")
+  entityId     String                   @map("entity_id") @db.Uuid
+  createdAt    DateTime                 @default(now()) @map("created_at")
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  actionItem ActionItem @relation(fields: [actionItemId], references: [id], onDelete: Cascade) // Cascade OK if action item deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([actionItemId])
+  @@index([entityType, entityId]) // Compound index often useful for polymorphic lookups
+  @@map("action_item_links")
+}
+
+model InteractionLink {
+  id            String                    @id @default(uuid()) @db.Uuid
+  tenantId      String                    @map("tenant_id") @db.Uuid
+  interactionId String                    @map("interaction_id") @db.Uuid
+  entityType    InteractionLinkEntityType @map("entity_type")
+  entityId      String                    @map("entity_id") @db.Uuid
+  createdAt     DateTime                  @default(now()) @map("created_at")
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  interactionSummary InteractionSummary @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade) // Cascade OK if interaction summary deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([interactionId])
+  @@index([entityType, entityId])
+  @@map("interaction_links")
+}
+
+model AiInsightLink {
+  id            String                  @id @default(uuid()) @db.Uuid
+  tenantId      String                  @map("tenant_id") @db.Uuid
+  aiInsightId   String                  @map("ai_insight_id") @db.Uuid
+  entityType    AiInsightLinkEntityType @map("entity_type")
+  entityId      String?                 @map("entity_id") @db.Uuid
+  interactionId String?                 @map("interaction_id") @db.Uuid
+  isPrimary     Boolean?                @map("is_primary")
+  createdAt     DateTime                @default(now()) @map("created_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  aiInsight          AiInsight           @relation(fields: [aiInsightId], references: [id], onDelete: Cascade) // Cascade OK if AI insight deleted? Probably yes.
+  interactionSummary InteractionSummary? @relation(fields: [interactionId], references: [summaryId], onDelete: Cascade) // Cascade OK if interaction summary deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([aiInsightId])
+  @@index([entityType, entityId])
+  @@index([interactionId])
+  @@map("ai_insight_links")
+}
+
+model PublicDataLink {
+  id           String                   @id @default(uuid()) @db.Uuid
+  tenantId     String                   @map("tenant_id") @db.Uuid
+  publicDataId String                   @map("public_data_id") @db.Uuid
+  entityType   PublicDataLinkEntityType @map("entity_type")
+  entityId     String                   @map("entity_id") @db.Uuid
+  createdAt    DateTime                 @default(now()) @map("created_at")
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict) // MODIFIED: Restrict delete
+  publicData PublicData @relation(fields: [publicDataId], references: [id], onDelete: Cascade) // Cascade OK if public data record deleted? Probably yes.
+
+  @@index([tenantId])
+  @@index([publicDataId])
+  @@index([entityType, entityId])
+  @@map("public_data_links")
+}
+
+// ========================================
+// V1 INGESTION PIPELINE MODELS
+// ========================================
+
+// DraftInteraction: Stores interactions awaiting validation or user input (HIL)
+model DraftInteraction {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  userId   String @map("user_id") @db.Uuid
+
+  // Envelope storage (full or partial)
+  envelope Json @db.JsonB
+
+  // Validation state
+  interactionType String   @map("interaction_type")
+  status          String   @default("validating")
+  // Status values: validating | awaiting_user | needs_review | ready | processing | completed | failed | expired
+  missingFields   String[] @map("missing_fields")
+
+  // Source tracking
+  createdBySource String @map("created_by_source")
+  // Source values: ui | api | automation | email-sync | slack-bot
+
+  // Timestamps
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  expiresAt   DateTime? @map("expires_at")
+  completedAt DateTime? @map("completed_at")
+
+  // Relations
+  tenant   Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  user     User                @relation(fields: [userId], references: [id], onDelete: Restrict)
+  messages ValidationMessage[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([userId, status])
+  @@index([expiresAt])
+  @@map("draft_interactions")
+}
+
+// ValidationMessage: Chat history for validation conversations (HIL)
+model ValidationMessage {
+  id        String   @id @default(uuid()) @db.Uuid
+  draftId   String   @map("draft_id") @db.Uuid
+  role      String // system | user | assistant
+  content   String   @db.Text
+  timestamp DateTime @default(now())
+
+  // Relations
+  draft DraftInteraction @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  @@index([draftId, timestamp])
+  @@map("validation_messages")
+}
+
+// ========================================
+// V2 NORMALIZED SCHEMA MODELS
+// ========================================
+
+// Persona: Registry of available personas (GTM, Product, Executive, Operations)
+model Persona {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String   @unique // 'gtm' | 'product' | 'executive' | 'ops'
+  label       String // 'Go-To-Market', 'Product', 'Executive', 'Operations'
+  description String?  @db.Text
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  summaryEntries InteractionSummaryEntry[]
+  insights       InteractionInsight[]
+  fieldValues    FieldValue[]
+
+  @@map("personas")
+}
+
+// InteractionSummaryEntry: Normalized 5-level summaries per persona
+model InteractionSummaryEntry {
+  id                   String       @id @default(uuid()) @db.Uuid
+  tenantId             String       @map("tenant_id") @db.Uuid
+  interactionId        String       @map("interaction_id") @db.Uuid
+  personaId            String       @map("persona_id") @db.Uuid
+  level                SummaryLevel // Enum: title | headline | brief | detailed | spotlight | unknown
+  text                 String       @db.Text
+  wordCount            Int?         @map("word_count")
+  profileType          ProfileType  @map("profile_type") // Enum: rich | lite
+  source               String? // e.g., 'bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0'
+  traceId              String       @map("trace_id") @db.Uuid
+  interactionType      String       @map("interaction_type")
+  accountId            String?      @map("account_id") @db.Uuid
+  interactionTimestamp DateTime     @map("interaction_timestamp")
+  createdAt            DateTime     @default(now()) @map("created_at")
+  updatedAt            DateTime     @updatedAt @map("updated_at")
+
+  tenant   Tenant                      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  persona  Persona                     @relation(fields: [personaId], references: [id], onDelete: Restrict)
+  account  Account?                    @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  contacts InteractionSummaryContact[]
+
+  @@unique([tenantId, interactionId, personaId, level], name: "tenantId_interactionId_personaId_level")
+  @@index([tenantId, interactionId])
+  @@index([tenantId, personaId])
+  @@index([accountId])
+  @@index([traceId])
+  @@index([tenantId, interactionTimestamp])
+  @@map("interaction_summary_entries")
+}
+
+// InteractionSummaryContact: N-to-M relationship between summaries and contacts
+model InteractionSummaryContact {
+  summaryEntryId String @map("summary_entry_id") @db.Uuid
+  contactId      String @map("contact_id") @db.Uuid
+  tenantId       String @map("tenant_id") @db.Uuid
+
+  summaryEntry InteractionSummaryEntry @relation(fields: [summaryEntryId], references: [id], onDelete: Cascade)
+  contact      Contact                 @relation(fields: [contactId], references: [id], onDelete: Restrict)
+
+  @@id([summaryEntryId, contactId], name: "summaryEntryId_contactId")
+  @@index([contactId])
+  @@index([tenantId])
+  @@map("interaction_summary_contacts")
+}
+
+// InteractionInsight: Typed insights (action_items, key_takeaways, decisions_made, risks_identified)
+model InteractionInsight {
+  id            String      @id @default(uuid()) @db.Uuid
+  tenantId      String      @map("tenant_id") @db.Uuid
+  interactionId String      @map("interaction_id") @db.Uuid
+  personaId     String      @map("persona_id") @db.Uuid
+  type          InsightType // Enum: action_item | key_takeaway | decision_made | risk | unknown
+
+  // Typed columns (nullable, only populated based on type)
+  description String?       @db.Text // For action_item
+  owner       String?       @db.Text // For action_item
+  dueDate     DateTime?     @map("due_date") // For action_item
+  text        String?       @db.Text // For key_takeaway
+  decision    String?       @db.Text // For decision_made
+  rationale   String?       @db.Text // For decision_made
+  risk        String?       @db.Text // For risk
+  severity    RiskSeverity? // Enum: low | medium | high | unknown
+  mitigation  String?       @db.Text // For risk
+
+  // Idempotency
+  contentHash String @map("content_hash") @db.Text
+
+  // Metadata
+  traceId              String   @map("trace_id") @db.Uuid
+  interactionType      String   @map("interaction_type")
+  accountId            String?  @map("account_id") @db.Uuid
+  interactionTimestamp DateTime @map("interaction_timestamp")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant                      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  persona  Persona                     @relation(fields: [personaId], references: [id], onDelete: Restrict)
+  account  Account?                    @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  contacts InteractionInsightContact[]
+
+  @@unique([tenantId, interactionId, personaId, type, contentHash], name: "tenantId_interactionId_personaId_type_contentHash")
+  @@index([tenantId, interactionId])
+  @@index([tenantId, personaId])
+  @@index([tenantId, personaId, type])
+  @@index([accountId])
+  @@index([traceId])
+  @@index([tenantId, interactionTimestamp])
+  @@map("interaction_insights")
+}
+
+// InteractionInsightContact: N-to-M relationship between insights and contacts
+model InteractionInsightContact {
+  insightId String @map("insight_id") @db.Uuid
+  contactId String @map("contact_id") @db.Uuid
+  tenantId  String @map("tenant_id") @db.Uuid
+
+  insight InteractionInsight @relation(fields: [insightId], references: [id], onDelete: Cascade)
+  contact Contact            @relation(fields: [contactId], references: [id], onDelete: Restrict)
+
+  @@id([insightId, contactId], name: "insightId_contactId")
+  @@index([contactId])
+  @@index([tenantId])
+  @@map("interaction_insight_contacts")
+}
+
+// FieldGroup: Grouping for dynamic field definitions (Optional - V1.1+)
+model FieldGroup {
+  id           String   @id @default(uuid()) @db.Uuid
+  key          String   @unique @db.Text
+  label        String   @db.Text
+  displayOrder Int      @default(0) @map("display_order")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  fields FieldDefinition[]
+
+  @@map("field_groups")
+}
+
+// FieldDefinition: Define custom fields without schema changes (Optional - V1.1+)
+model FieldDefinition {
+  id                String   @id @default(uuid()) @db.Uuid
+  fieldKey          String   @unique @map("field_key") @db.Text
+  label             String   @db.Text
+  dataType          String   @map("data_type") @db.Text // 'text' | 'number' | 'boolean' | 'date' | 'json'
+  appliesToPersonas String[] @map("applies_to_personas") // ['gtm', 'product', 'executive', 'ops']
+  appliesToEntities String[] @map("applies_to_entities") // ['account', 'contact', 'opportunity']
+  groupId           String?  @map("group_id") @db.Uuid
+  displayOrder      Int?     @map("display_order")
+  isRequired        Boolean  @default(false) @map("is_required")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  group       FieldGroup?  @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  fieldValues FieldValue[]
+
+  @@map("field_definitions")
+}
+
+// FieldValue: Store values for dynamic fields (Optional - V1.1+)
+model FieldValue {
+  id            String  @id @default(uuid()) @db.Uuid
+  tenantId      String  @map("tenant_id") @db.Uuid
+  interactionId String  @map("interaction_id") @db.Uuid
+  personaId     String? @map("persona_id") @db.Uuid
+  fieldId       String  @map("field_id") @db.Uuid
+
+  // Value columns (only one populated based on dataType)
+  valueText    String?   @map("value_text") @db.Text
+  valueNumber  Decimal?  @map("value_number") @db.Decimal(15, 2)
+  valueBoolean Boolean?  @map("value_boolean")
+  valueDate    DateTime? @map("value_date") @db.Timestamp()
+  valueJson    Json?     @map("value_json") @db.JsonB
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  persona Persona?        @relation(fields: [personaId], references: [id], onDelete: Restrict)
+  field   FieldDefinition @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, interactionId, personaId, fieldId], name: "tenantId_interactionId_personaId_fieldId")
+  @@index([tenantId, interactionId])
+  @@map("field_values")
+}

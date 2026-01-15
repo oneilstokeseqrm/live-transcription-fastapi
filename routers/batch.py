@@ -4,9 +4,11 @@ Batch processing router for audio file transcription and cleaning.
 This router provides the POST /batch/process endpoint for processing audio
 files through transcription and cleaning, publishing EnvelopeV1 events.
 """
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, UploadFile, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -15,6 +17,7 @@ from models.envelope import EnvelopeV1, ContentModel
 from services.batch_service import BatchService
 from services.batch_cleaner_service import BatchCleanerService
 from services.aws_event_publisher import AWSEventPublisher
+from services.intelligence_service import IntelligenceService
 from utils.context_utils import get_validated_context
 
 logger = logging.getLogger(__name__)
@@ -168,40 +171,81 @@ async def process_batch_audio(file: UploadFile, request: Request):
             detail="Transcript cleaning service failed. Please try again."
         )
     
-    # Step 3: Build and publish EnvelopeV1 event (resilient - don't fail request if this fails)
-    # Requirements: 2.4 - interaction_type="transcript"
-    try:
-        envelope = EnvelopeV1(
-            tenant_id=UUID(context.tenant_id),
-            user_id=context.user_id,
-            interaction_type="transcript",
-            content=ContentModel(text=cleaned_transcript, format="diarized"),
-            timestamp=datetime.now(timezone.utc),
-            source="upload",
-            extras={},
-            interaction_id=UUID(context.interaction_id),
-            trace_id=context.trace_id
-        )
-        
-        event_publisher = AWSEventPublisher()
-        logger.info(
-            f"Publishing envelope: processing_id={processing_id}, "
-            f"interaction_id={context.interaction_id}"
-        )
-        publish_results = await event_publisher.publish_envelope(envelope)
-        logger.info(
-            f"Envelope published: processing_id={processing_id}, "
-            f"interaction_id={context.interaction_id}, "
-            f"kinesis={'success' if publish_results['kinesis_sequence'] else 'failed'}, "
-            f"eventbridge={'success' if publish_results['eventbridge_id'] else 'failed'}"
-        )
-    except Exception as e:
-        # Log error but don't fail the request - event publishing is non-critical
-        logger.error(
-            f"Envelope publishing failed (non-critical): processing_id={processing_id}, "
-            f"interaction_id={context.interaction_id}, error={type(e).__name__}: {str(e)}",
-            exc_info=True
-        )
+    # Step 3: Async Fork - Execute Lane 1 (publishing) and Lane 2 (intelligence) concurrently
+    # Requirements: 2.4 - interaction_type="transcript" for envelope, "batch_upload" for intelligence
+    envelope = EnvelopeV1(
+        tenant_id=UUID(context.tenant_id),
+        user_id=context.user_id,
+        interaction_type="transcript",
+        content=ContentModel(text=cleaned_transcript, format="diarized"),
+        timestamp=datetime.now(timezone.utc),
+        source="upload",
+        extras={},
+        interaction_id=UUID(context.interaction_id),
+        trace_id=context.trace_id
+    )
+    
+    async def _lane1_publish() -> Optional[dict]:
+        """Lane 1: Publish envelope to Kinesis/EventBridge."""
+        try:
+            event_publisher = AWSEventPublisher()
+            return await event_publisher.publish_envelope(envelope)
+        except Exception as e:
+            logger.error(
+                f"Lane 1 (publishing) error: processing_id={processing_id}, "
+                f"interaction_id={context.interaction_id}, error={e}"
+            )
+            raise
+    
+    async def _lane2_intelligence() -> Optional[object]:
+        """Lane 2: Extract and persist intelligence."""
+        try:
+            intelligence_service = IntelligenceService()
+            return await intelligence_service.process_transcript(
+                cleaned_transcript=cleaned_transcript,
+                interaction_id=context.interaction_id,
+                tenant_id=context.tenant_id,
+                trace_id=context.trace_id,
+                interaction_type="batch_upload"
+            )
+        except Exception as e:
+            logger.error(
+                f"Lane 2 (intelligence) error: processing_id={processing_id}, "
+                f"interaction_id={context.interaction_id}, error={e}"
+            )
+            raise
+    
+    # Execute both lanes concurrently with error isolation
+    results = await asyncio.gather(
+        _lane1_publish(),
+        _lane2_intelligence(),
+        return_exceptions=True
+    )
+    
+    # Log results without failing the request
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            lane_name = "Lane 1 (publishing)" if i == 0 else "Lane 2 (intelligence)"
+            logger.error(
+                f"{lane_name} failed (non-critical): processing_id={processing_id}, "
+                f"interaction_id={context.interaction_id}, "
+                f"error={type(result).__name__}: {str(result)}",
+                exc_info=result
+            )
+        else:
+            lane_name = "Lane 1 (publishing)" if i == 0 else "Lane 2 (intelligence)"
+            if i == 0 and result:
+                logger.info(
+                    f"Envelope published: processing_id={processing_id}, "
+                    f"interaction_id={context.interaction_id}, "
+                    f"kinesis={'success' if result.get('kinesis_sequence') else 'failed'}, "
+                    f"eventbridge={'success' if result.get('eventbridge_id') else 'failed'}"
+                )
+            else:
+                logger.info(
+                    f"{lane_name} completed: processing_id={processing_id}, "
+                    f"interaction_id={context.interaction_id}"
+                )
     
     logger.info(
         f"Batch processing complete: processing_id={processing_id}, "

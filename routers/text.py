@@ -5,8 +5,10 @@ This router provides the POST /text/clean endpoint for processing raw text
 (notes, legacy documents, etc.) without audio processing.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, HTTPException, Request
 
@@ -14,6 +16,7 @@ from models.text_request import TextCleanRequest, TextCleanResponse
 from models.envelope import EnvelopeV1, ContentModel
 from services.batch_cleaner_service import BatchCleanerService
 from services.aws_event_publisher import AWSEventPublisher
+from services.intelligence_service import IntelligenceService
 from utils.context_utils import get_validated_context
 
 logger = logging.getLogger(__name__)
@@ -95,23 +98,61 @@ async def clean_text(body: TextCleanRequest, request: Request):
         trace_id=context.trace_id
     )
     
-    # Publish envelope (non-blocking on failure - Requirement 7.5)
-    try:
-        publisher = AWSEventPublisher()
-        publish_results = await publisher.publish_envelope(envelope)
-        logger.info(
-            f"Envelope published: interaction_id={context.interaction_id}, "
-            f"kinesis={'success' if publish_results['kinesis_sequence'] else 'failed'}, "
-            f"eventbridge={'success' if publish_results['eventbridge_id'] else 'failed'}"
-        )
-    except Exception as e:
-        # Log error but don't fail the request
-        logger.error(
-            f"Envelope publishing failed (non-critical): "
-            f"interaction_id={context.interaction_id}, "
-            f"error={type(e).__name__}: {str(e)}",
-            exc_info=True
-        )
+    # Async Fork - Execute Lane 1 (publishing) and Lane 2 (intelligence) concurrently
+    async def _lane1_publish() -> Optional[dict]:
+        """Lane 1: Publish envelope to Kinesis/EventBridge."""
+        try:
+            publisher = AWSEventPublisher()
+            return await publisher.publish_envelope(envelope)
+        except Exception as e:
+            logger.error(
+                f"Lane 1 (publishing) error: interaction_id={context.interaction_id}, error={e}"
+            )
+            raise
+    
+    async def _lane2_intelligence() -> Optional[object]:
+        """Lane 2: Extract and persist intelligence."""
+        try:
+            intelligence_service = IntelligenceService()
+            return await intelligence_service.process_transcript(
+                cleaned_transcript=cleaned_text,
+                interaction_id=context.interaction_id,
+                tenant_id=context.tenant_id,
+                trace_id=context.trace_id,
+                interaction_type="note"
+            )
+        except Exception as e:
+            logger.error(
+                f"Lane 2 (intelligence) error: interaction_id={context.interaction_id}, error={e}"
+            )
+            raise
+    
+    # Execute both lanes concurrently with error isolation
+    results = await asyncio.gather(
+        _lane1_publish(),
+        _lane2_intelligence(),
+        return_exceptions=True
+    )
+    
+    # Log results without failing the request
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            lane_name = "Lane 1 (publishing)" if i == 0 else "Lane 2 (intelligence)"
+            logger.error(
+                f"{lane_name} failed (non-critical): interaction_id={context.interaction_id}, "
+                f"error={type(result).__name__}: {str(result)}",
+                exc_info=result
+            )
+        else:
+            lane_name = "Lane 1 (publishing)" if i == 0 else "Lane 2 (intelligence)"
+            if i == 0 and result:
+                logger.info(
+                    f"Envelope published: interaction_id={context.interaction_id}, "
+                    f"kinesis={'success' if result.get('kinesis_sequence') else 'failed'}, "
+                    f"eventbridge={'success' if result.get('eventbridge_id') else 'failed'}"
+                )
+            else:
+                logger.info(f"{lane_name} completed: interaction_id={context.interaction_id}")
     
     logger.info(
         f"Text cleaning request complete: interaction_id={context.interaction_id}"
