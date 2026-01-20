@@ -300,25 +300,23 @@ class AWSEventPublisher:
         Publishing failures are logged but never raise exceptions - the user
         request should succeed regardless of publishing failures.
         
-        Feature Flag: ENABLE_EVENT_PUBLISHING (default: true)
-        Set to "false" to skip all event publishing (useful for testing).
+        Feature Flags:
+            ENABLE_KINESIS_PUBLISHING (default: true) - Controls Kinesis publishing
+            ENABLE_EVENTBRIDGE_PUBLISHING (default: true) - Controls EventBridge publishing
+                (EventBridge routes to SQS via AWS EventBridge Rule)
         
         Args:
             envelope: The EnvelopeV1 instance to publish
             
         Returns:
             Dict with 'kinesis_sequence' and 'eventbridge_id' keys
-            (None if publish failed for that destination)
+            (None if publish failed or disabled for that destination)
         
         Requirements: 5.1, 5.4, 5.5, 5.6, 5.7, 7.2, 7.3, 7.5
         """
-        # Feature flag to disable event publishing
-        if os.getenv("ENABLE_EVENT_PUBLISHING", "true").lower() == "false":
-            logger.warning(
-                f"Event publishing disabled via configuration. Skipping Kinesis/EventBridge. "
-                f"interaction_id={envelope.interaction_id}, tenant_id={envelope.tenant_id}"
-            )
-            return {"status": "skipped", "kinesis_sequence": None, "eventbridge_id": None}
+        # Check individual feature flags
+        kinesis_enabled = os.getenv("ENABLE_KINESIS_PUBLISHING", "true").lower() != "false"
+        eventbridge_enabled = os.getenv("ENABLE_EVENTBRIDGE_PUBLISHING", "true").lower() != "false"
         
         results: Dict[str, Optional[str]] = {
             "kinesis_sequence": None,
@@ -326,47 +324,71 @@ class AWSEventPublisher:
         }
         
         # 1. Attempt Kinesis publish first (Requirement 5.1)
-        try:
-            results["kinesis_sequence"] = await self._publish_to_kinesis(envelope)
-        except Exception as e:
-            # Should never happen since _publish_to_kinesis catches all exceptions,
-            # but handle defensively
-            logger.error(
-                f"Unexpected error in Kinesis publish: "
-                f"interaction_id={envelope.interaction_id}, "
-                f"tenant_id={envelope.tenant_id}, "
-                f"error={type(e).__name__}: {str(e)}",
-                exc_info=True
+        if kinesis_enabled:
+            try:
+                results["kinesis_sequence"] = await self._publish_to_kinesis(envelope)
+            except Exception as e:
+                # Should never happen since _publish_to_kinesis catches all exceptions,
+                # but handle defensively
+                logger.error(
+                    f"Unexpected error in Kinesis publish: "
+                    f"interaction_id={envelope.interaction_id}, "
+                    f"tenant_id={envelope.tenant_id}, "
+                    f"error={type(e).__name__}: {str(e)}",
+                    exc_info=True
+                )
+        else:
+            logger.info(
+                f"Kinesis publishing disabled via ENABLE_KINESIS_PUBLISHING. "
+                f"interaction_id={envelope.interaction_id}, tenant_id={envelope.tenant_id}"
             )
         
         # 2. Attempt EventBridge publish second (Requirement 5.4)
         # Continue even if Kinesis failed (Requirement 5.5)
-        try:
-            results["eventbridge_id"] = await self._publish_to_eventbridge(envelope)
-        except Exception as e:
-            # Should never happen since _publish_to_eventbridge catches all exceptions,
-            # but handle defensively
-            logger.error(
-                f"Unexpected error in EventBridge publish: "
-                f"interaction_id={envelope.interaction_id}, "
-                f"tenant_id={envelope.tenant_id}, "
-                f"error={type(e).__name__}: {str(e)}",
-                exc_info=True
+        if eventbridge_enabled:
+            try:
+                results["eventbridge_id"] = await self._publish_to_eventbridge(envelope)
+            except Exception as e:
+                # Should never happen since _publish_to_eventbridge catches all exceptions,
+                # but handle defensively
+                logger.error(
+                    f"Unexpected error in EventBridge publish: "
+                    f"interaction_id={envelope.interaction_id}, "
+                    f"tenant_id={envelope.tenant_id}, "
+                    f"error={type(e).__name__}: {str(e)}",
+                    exc_info=True
+                )
+        else:
+            logger.info(
+                f"EventBridge publishing disabled via ENABLE_EVENTBRIDGE_PUBLISHING. "
+                f"interaction_id={envelope.interaction_id}, tenant_id={envelope.tenant_id}"
             )
         
         # Log summary of publish results (Requirement 5.7)
+        kinesis_status = "disabled" if not kinesis_enabled else ("success" if results["kinesis_sequence"] else "failed")
+        eventbridge_status = "disabled" if not eventbridge_enabled else ("success" if results["eventbridge_id"] else "failed")
+        
         if results["kinesis_sequence"] or results["eventbridge_id"]:
             logger.info(
                 f"Envelope published: "
                 f"interaction_id={envelope.interaction_id}, "
                 f"tenant_id={envelope.tenant_id}, "
-                f"kinesis={'success' if results['kinesis_sequence'] else 'failed'}, "
-                f"eventbridge={'success' if results['eventbridge_id'] else 'failed'}"
+                f"kinesis={kinesis_status}, "
+                f"eventbridge={eventbridge_status}"
+            )
+        elif kinesis_enabled or eventbridge_enabled:
+            # At least one was enabled but both failed (Requirement 5.6) - log but don't raise
+            logger.warning(
+                f"All enabled publish destinations failed: "
+                f"interaction_id={envelope.interaction_id}, "
+                f"tenant_id={envelope.tenant_id}, "
+                f"kinesis={kinesis_status}, "
+                f"eventbridge={eventbridge_status}"
             )
         else:
-            # Both failed (Requirement 5.6) - log but don't raise
-            logger.warning(
-                f"All publish destinations failed: "
+            # Both disabled
+            logger.info(
+                f"All publishing disabled via configuration: "
                 f"interaction_id={envelope.interaction_id}, "
                 f"tenant_id={envelope.tenant_id}"
             )
