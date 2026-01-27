@@ -215,7 +215,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             source="websocket",
                             extras={},
                             interaction_id=uuid.UUID(session_id),
-                            trace_id=trace_id
+                            trace_id=trace_id,
+                            account_id=None  # WebSocket connections don't have account context
                         )
                         aws_publisher = AWSEventPublisher()
                         return await aws_publisher.publish_envelope(envelope)

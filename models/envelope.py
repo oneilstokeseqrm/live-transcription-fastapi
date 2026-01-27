@@ -89,6 +89,10 @@ class EnvelopeV1(BaseModel):
         None,
         description="Distributed tracing identifier"
     )
+    account_id: Optional[str] = Field(
+        None,
+        description="Optional account identifier for CRM/sales context"
+    )
     
     @field_serializer('timestamp')
     def serialize_timestamp(self, value: datetime) -> str:
