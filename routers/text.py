@@ -17,7 +17,7 @@ from models.envelope import EnvelopeV1, ContentModel
 from services.batch_cleaner_service import BatchCleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
-from utils.context_utils import get_validated_context
+from utils.context_utils import get_auth_context
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +44,9 @@ async def clean_text(body: TextCleanRequest, request: Request):
         
     Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6
     """
-    # Validate headers and extract context (raises HTTPException 400 on failure)
-    context = get_validated_context(request)
+    # Validate and extract context (raises HTTPException 401/400 on failure)
+    # Supports JWT from gateway (preferred) or legacy headers (when ALLOW_LEGACY_HEADER_AUTH=true)
+    context = get_auth_context(request)
     
     logger.info(
         f"Text cleaning started: interaction_id={context.interaction_id}, "
