@@ -1,3 +1,14 @@
+// =============================================================================
+// DOCUMENTATION SNAPSHOT ONLY — runtime uses SQLModel + SQL migrations
+// =============================================================================
+// This schema is for documentation and IDE support only.
+// The actual database is managed via:
+//   - SQLModel (Python ORM) for application code
+//   - SQL migrations in /migrations/ for schema changes
+//
+// DO NOT run `prisma migrate` or `prisma db push` against this schema.
+// =============================================================================
+
 // CI schema check trigger (safe, identical in canonical & writer)
 // datasource db defines the database connection details.
 datasource db {
@@ -170,6 +181,26 @@ enum RiskSeverity {
   medium
   high
   unknown // Fallback
+}
+
+// --- Lane B Upload Job Enums (live-transcription-fastapi) ---
+// Note: In PostgreSQL these are named 'jobstatus' and 'jobtype' (lowercase, no underscore)
+// to match SQLAlchemy's default enum naming convention.
+
+enum JobStatus {
+  queued
+  processing
+  succeeded
+  failed
+
+  @@map("jobstatus")
+}
+
+enum JobType {
+  audio_transcription
+  text_processing
+
+  @@map("jobtype")
 }
 
 // --- Tenant Model ---
@@ -1576,4 +1607,59 @@ model FieldValue {
   @@unique([tenantId, interactionId, personaId, fieldId], name: "tenantId_interactionId_personaId_fieldId")
   @@index([tenantId, interactionId])
   @@map("field_values")
+}
+
+// ========================================
+// LANE B: ASYNC UPLOAD JOB TRACKING
+// (live-transcription-fastapi only)
+// ========================================
+// This table tracks async upload jobs for the presigned S3 upload workflow.
+// Jobs are created when a client requests a presigned URL and tracks
+// processing through: queued -> processing -> succeeded | failed
+//
+// Runtime: SQLModel (Python), NOT Prisma
+// Migration: /migrations/001_create_upload_jobs.sql
+
+model UploadJob {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  // Tenant isolation (required for all queries)
+  tenantId String @map("tenant_id") @db.Uuid
+  userId   String @map("user_id") @db.Text
+
+  // Job type and status
+  jobType JobType   @default(audio_transcription) @map("job_type")
+  status  JobStatus @default(queued)
+
+  // File reference (S3 key)
+  fileKey  String  @map("file_key") @db.Text
+  fileName String? @map("file_name") @db.Text
+  mimeType String? @map("mime_type") @db.Text
+  fileSize BigInt? @map("file_size")
+
+  // Processing correlation
+  interactionId String  @map("interaction_id") @db.Uuid
+  traceId       String? @map("trace_id") @db.Text
+  accountId     String? @map("account_id") @db.Text
+
+  // Result/error storage
+  errorMessage  String? @map("error_message") @db.Text
+  errorCode     String? @map("error_code") @db.Text
+  resultSummary String? @map("result_summary") @db.Text
+
+  // Metadata for extensibility
+  metadataJson String? @map("metadata_json") @db.Text
+
+  // Timestamps (all TIMESTAMPTZ for timezone-aware storage)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt   DateTime  @default(now()) @map("updated_at") @db.Timestamptz()
+  startedAt   DateTime? @map("started_at") @db.Timestamptz()
+  completedAt DateTime? @map("completed_at") @db.Timestamptz()
+
+  // Indexes
+  @@unique([tenantId, fileKey], name: "ix_upload_jobs_tenant_file_key")
+  @@index([tenantId], name: "ix_upload_jobs_tenant_id")
+  @@index([status], name: "ix_upload_jobs_status")
+  @@index([tenantId, status], name: "ix_upload_jobs_tenant_status")
+  @@map("upload_jobs")
 }
