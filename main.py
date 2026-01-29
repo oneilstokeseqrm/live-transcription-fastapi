@@ -18,6 +18,8 @@ from services.intelligence_service import IntelligenceService
 from models.envelope import EnvelopeV1, ContentModel
 from routers import batch
 from routers import text
+from routers import upload
+from routers.upload import reap_stuck_jobs
 
 load_dotenv()
 
@@ -75,9 +77,19 @@ validate_aws_credentials()
 
 app = FastAPI()
 
+
+@app.on_event("startup")
+async def startup_event():
+    """Run startup tasks including stuck job cleanup."""
+    logger.info("Running startup tasks...")
+    await reap_stuck_jobs()
+    logger.info("Startup tasks completed")
+
+
 # Include routers
 app.include_router(batch.router)
 app.include_router(text.router, prefix="/text", tags=["text"])
+app.include_router(upload.router)
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
 event_publisher = EventPublisher()

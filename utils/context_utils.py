@@ -2,19 +2,27 @@
 Context Extraction Utilities
 
 This module provides utilities for extracting tenant, user, and account identity
-from request headers with fallback to environment variables.
+from request headers, internal JWTs, or environment variables.
 
-Two extraction modes are available:
+Three extraction modes are available:
 
 1. get_request_context() - Lenient extraction with fallbacks (backward compatible)
    - Falls back to environment variables and defaults
    - Never raises exceptions
-   
-2. get_validated_context() - Strict validation for production endpoints
+
+2. get_validated_context() - Strict validation for production endpoints (legacy)
    - Requires X-Tenant-ID (valid UUID)
    - Requires X-User-ID (non-empty string)
    - Optional X-Trace-Id (valid UUID if provided, generated if missing)
    - Raises HTTPException 400 on validation failure
+
+3. get_auth_context() - RECOMMENDED: Unified auth with JWT priority
+   - Tries JWT from Authorization header first (gateway requests)
+   - Falls back to header-based auth when ALLOW_LEGACY_HEADER_AUTH=true
+   - Raises HTTPException 401 for invalid JWT, 400 for invalid headers
+
+For new endpoints, use get_auth_context() to support both the frontend gateway
+and legacy testing scenarios.
 """
 
 import os
@@ -23,6 +31,12 @@ import logging
 from fastapi import Request, HTTPException
 from typing import Optional
 from models.request_context import RequestContext
+from middleware.jwt_auth import (
+    verify_internal_jwt,
+    extract_bearer_token,
+    JWTVerificationError,
+    is_jwt_auth_configured,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +143,125 @@ def get_validated_context(request: Request) -> RequestContext:
     return RequestContext(
         tenant_id=tenant_id,
         user_id=user_id,
+        account_id=account_id,
+        interaction_id=interaction_id,
+        trace_id=trace_id
+    )
+
+
+def get_auth_context(request: Request) -> RequestContext:
+    """
+    Extract and validate context using JWT or legacy headers.
+
+    This is the RECOMMENDED function for new endpoints. It implements a dual-mode
+    authentication strategy:
+
+    1. If Authorization header contains a Bearer token:
+       - Verify the internal JWT (signature, issuer, audience, expiration)
+       - Extract tenant_id and user_id from verified claims
+       - Raise 401 Unauthorized on any JWT validation failure
+
+    2. If no JWT present and ALLOW_LEGACY_HEADER_AUTH is true:
+       - Fall back to header-based auth (X-Tenant-ID, X-User-ID)
+       - Raise 400 Bad Request on missing/invalid headers
+
+    3. If no JWT present and ALLOW_LEGACY_HEADER_AUTH is false:
+       - Raise 401 Unauthorized (JWT required)
+
+    Environment Variables:
+    - ALLOW_LEGACY_HEADER_AUTH: Set to "true" to enable header fallback (default: false)
+    - INTERNAL_JWT_SECRET: Required for JWT verification
+    - INTERNAL_JWT_ISSUER: Expected JWT issuer (default: "eq-frontend")
+    - INTERNAL_JWT_AUDIENCE: Expected JWT audience (default: "eq-backend")
+
+    Args:
+        request: FastAPI Request object
+
+    Returns:
+        RequestContext with validated identity fields
+
+    Raises:
+        HTTPException: 401 for JWT failures, 400 for header validation failures
+    """
+    # Generate interaction_id for this request
+    interaction_id = str(uuid.uuid4())
+
+    # Check for JWT in Authorization header
+    auth_header = request.headers.get("Authorization")
+    token = extract_bearer_token(auth_header)
+
+    if token:
+        # JWT present - verify it
+        return _extract_context_from_jwt(request, token, interaction_id)
+
+    # No JWT - check if legacy header auth is allowed
+    allow_legacy = os.getenv("ALLOW_LEGACY_HEADER_AUTH", "false").lower() == "true"
+
+    if not allow_legacy:
+        # In production mode, JWT is required
+        logger.warning(
+            f"No JWT provided and legacy header auth is disabled. "
+            f"interaction_id={interaction_id}"
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization required: Bearer token expected"
+        )
+
+    # Legacy header auth is allowed - use strict validation
+    logger.info(
+        f"Using legacy header auth (ALLOW_LEGACY_HEADER_AUTH=true). "
+        f"interaction_id={interaction_id}"
+    )
+    return get_validated_context(request)
+
+
+def _extract_context_from_jwt(
+    request: Request,
+    token: str,
+    interaction_id: str
+) -> RequestContext:
+    """
+    Extract RequestContext from a verified JWT.
+
+    Args:
+        request: FastAPI Request object (for additional headers like trace_id)
+        token: The JWT string (without Bearer prefix)
+        interaction_id: Generated interaction ID for this request
+
+    Returns:
+        RequestContext with JWT-derived tenant_id and user_id
+
+    Raises:
+        HTTPException: 401 on any JWT verification failure
+    """
+    try:
+        claims = verify_internal_jwt(token)
+    except JWTVerificationError as e:
+        logger.warning(
+            f"JWT verification failed: {e.code}. "
+            f"interaction_id={interaction_id}"
+        )
+        raise HTTPException(
+            status_code=401,
+            detail=e.message
+        )
+
+    # Extract trace_id from header or generate
+    trace_id = _validate_trace_id(request, interaction_id)
+
+    # Extract optional account_id from header (not in JWT)
+    account_id = request.headers.get("X-Account-ID")
+
+    logger.info(
+        f"JWT auth context: interaction_id={interaction_id}, "
+        f"tenant_id={claims.tenant_id[:8]}..., user_id={claims.user_id[:20]}..., "
+        f"account_id={account_id or 'None'}, trace_id={trace_id}"
+    )
+
+    return RequestContext(
+        tenant_id=claims.tenant_id,
+        user_id=claims.user_id,
         account_id=account_id,
         interaction_id=interaction_id,
         trace_id=trace_id

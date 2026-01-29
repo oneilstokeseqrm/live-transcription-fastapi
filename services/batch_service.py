@@ -22,44 +22,89 @@ class BatchService:
     async def transcribe_audio(self, audio_bytes: bytes, mimetype: str) -> str:
         """
         Transcribe audio with diarization and return formatted transcript.
-        
+
         Args:
             audio_bytes: Raw audio file bytes
             mimetype: MIME type (audio/wav, audio/mpeg, etc.)
-            
+
         Returns:
             Formatted transcript with speaker labels (SPEAKER_X: text)
-            
+
         Raises:
             Exception: If Deepgram API call fails
         """
         try:
             logger.info(f"Starting Deepgram transcription, mimetype={mimetype}, size={len(audio_bytes)} bytes")
-            
+
             # Configure source and options for SDK v2
             source = {
                 'buffer': audio_bytes,
                 'mimetype': mimetype
             }
-            
+
             options = {
                 'smart_format': True,
                 'diarize': True,
                 'punctuate': True
             }
-            
+
             # Call Deepgram API (SDK v2 syntax)
             response = await self.client.transcription.prerecorded(source, options)
-            
+
             logger.info("Deepgram transcription completed successfully")
-            
+
             # Format response into SPEAKER_X: text format
             formatted_transcript = self._format_deepgram_response(response)
-            
+
             return formatted_transcript
-            
+
         except Exception as e:
             logger.error(f"Deepgram transcription failed: {e}", exc_info=True)
+            raise
+
+    async def transcribe_from_url(self, audio_url: str, mimetype: str = "audio/wav") -> str:
+        """
+        Transcribe audio from a URL (e.g., presigned S3 URL).
+
+        This method uses Deepgram's URL-based ingestion, which is more efficient
+        for large files as Deepgram fetches the file directly from the URL.
+
+        Args:
+            audio_url: Publicly accessible URL to the audio file (e.g., presigned S3 URL)
+            mimetype: MIME type hint (optional, Deepgram can auto-detect)
+
+        Returns:
+            Formatted transcript with speaker labels (SPEAKER_X: text)
+
+        Raises:
+            Exception: If Deepgram API call fails
+        """
+        try:
+            logger.info(f"Starting Deepgram URL transcription, mimetype={mimetype}")
+
+            # Configure source as URL for SDK v2
+            source = {
+                'url': audio_url
+            }
+
+            options = {
+                'smart_format': True,
+                'diarize': True,
+                'punctuate': True
+            }
+
+            # Call Deepgram API with URL source (SDK v2 syntax)
+            response = await self.client.transcription.prerecorded(source, options)
+
+            logger.info("Deepgram URL transcription completed successfully")
+
+            # Format response into SPEAKER_X: text format
+            formatted_transcript = self._format_deepgram_response(response)
+
+            return formatted_transcript
+
+        except Exception as e:
+            logger.error(f"Deepgram URL transcription failed: {e}", exc_info=True)
             raise
     
     def _format_deepgram_response(self, response: dict) -> str:

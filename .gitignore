@@ -155,3 +155,6 @@ cython_debug/
 # Test artifacts from live verification runs
 test_artifacts/*.md
 !test_artifacts/.gitkeep
+
+# macOS
+.DS_Store
