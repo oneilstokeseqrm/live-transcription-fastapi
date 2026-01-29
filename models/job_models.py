@@ -13,7 +13,7 @@ Design Decision: Postgres over Redis
     - Redis remains for transient session data (WebSocket transcripts)
 """
 from sqlmodel import SQLModel, Field
-from sqlalchemy import Column, Text, Index
+from sqlalchemy import Column, Text, Index, DateTime
 from typing import Optional
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -88,17 +88,23 @@ class UploadJob(SQLModel, table=True):
     # Metadata for extensibility
     metadata_json: Optional[str] = Field(default=None, sa_column=Column(Text, name="metadata_json"))
 
-    # Timestamps
+    # Timestamps (explicit timezone-aware columns for asyncpg compatibility)
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
-        sa_column_kwargs={"name": "created_at"}
+        sa_column=Column(DateTime(timezone=True), name="created_at", nullable=False)
     )
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
-        sa_column_kwargs={"name": "updated_at"}
+        sa_column=Column(DateTime(timezone=True), name="updated_at", nullable=False)
     )
-    started_at: Optional[datetime] = Field(default=None, sa_column_kwargs={"name": "started_at"})
-    completed_at: Optional[datetime] = Field(default=None, sa_column_kwargs={"name": "completed_at"})
+    started_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), name="started_at", nullable=True)
+    )
+    completed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), name="completed_at", nullable=True)
+    )
 
     # Composite indexes defined via __table_args__
     __table_args__ = (
