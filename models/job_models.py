@@ -144,11 +144,14 @@ class UploadInitResponse(BaseModel):
     """Response model for POST /upload/init
 
     Returns presigned URL for direct S3 upload.
+    The signed_content_type MUST be used as the Content-Type header
+    when PUTting to the presigned URL (it is embedded in the signature).
     """
     upload_url: str
     file_key: str
     job_id: str
     expires_at: datetime
+    signed_content_type: str
 
 
 class UploadCompleteRequest(BaseModel):

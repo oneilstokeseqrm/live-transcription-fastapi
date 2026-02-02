@@ -51,7 +51,8 @@ class BatchService:
             # Call Deepgram API (SDK v2 syntax)
             response = await self.client.transcription.prerecorded(source, options)
 
-            logger.info("Deepgram transcription completed successfully")
+            # Log Deepgram response metadata for diagnostics
+            self._log_deepgram_metadata(response, source_label="buffer")
 
             # Format response into SPEAKER_X: text format
             formatted_transcript = self._format_deepgram_response(response)
@@ -96,7 +97,8 @@ class BatchService:
             # Call Deepgram API with URL source (SDK v2 syntax)
             response = await self.client.transcription.prerecorded(source, options)
 
-            logger.info("Deepgram URL transcription completed successfully")
+            # Log Deepgram response metadata for diagnostics
+            self._log_deepgram_metadata(response, source_label="url")
 
             # Format response into SPEAKER_X: text format
             formatted_transcript = self._format_deepgram_response(response)
@@ -107,6 +109,33 @@ class BatchService:
             logger.error(f"Deepgram URL transcription failed: {e}", exc_info=True)
             raise
     
+    def _log_deepgram_metadata(self, response: dict, source_label: str = "unknown") -> None:
+        """Log Deepgram response metadata for diagnostics.
+
+        Extracts duration, channel count, and word count from the response
+        so empty-transcript issues can be diagnosed from logs alone.
+        """
+        try:
+            metadata = response.get("metadata", {})
+            duration = metadata.get("duration", "?")
+            channels = response.get("results", {}).get("channels", [])
+            num_channels = len(channels)
+            num_words = 0
+            transcript_preview = ""
+            if channels:
+                alt = channels[0].get("alternatives", [{}])[0]
+                words = alt.get("words", [])
+                num_words = len(words)
+                transcript_preview = alt.get("transcript", "")[:80]
+
+            logger.info(
+                f"Deepgram response ({source_label}): "
+                f"duration={duration}s, channels={num_channels}, "
+                f"words={num_words}, preview={transcript_preview!r}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to log Deepgram metadata: {e}")
+
     def _format_deepgram_response(self, response: dict) -> str:
         """
         Parse Deepgram response and format as SPEAKER_X: text.
