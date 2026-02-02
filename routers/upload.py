@@ -409,13 +409,16 @@ async def _process_upload_job(job_id: str, tenant_id: str):
         # Transcribe from URL
         batch_service = BatchService()
         logger.info(f"Transcribing from URL: job_id={job_id}, mime_type={mime_type}")
-        raw_transcript = await batch_service.transcribe_from_url(audio_url, mime_type)
+        tx_result = await batch_service.transcribe_from_url(audio_url, mime_type)
+        raw_transcript = tx_result.transcript
 
         # Fail explicitly if Deepgram returned nothing
         if not raw_transcript.strip():
             logger.warning(
                 f"Empty transcript from Deepgram: job_id={job_id}, "
-                f"mime_type={mime_type}, file_key={file_key[-60:]}"
+                f"mime_type={mime_type}, file_key={file_key[-60:]}, "
+                f"duration={tx_result.duration_seconds}s, "
+                f"channels={tx_result.channels}, words={tx_result.words}"
             )
             async with get_async_session() as session:
                 stmt = select(UploadJob).where(UploadJob.id == job_uuid)
@@ -427,11 +430,11 @@ async def _process_upload_job(job_id: str, tenant_id: str):
                     job.updated_at = datetime.now(timezone.utc)
                     job.error_code = "EMPTY_TRANSCRIPT"
                     job.error_message = (
-                        f"Deepgram returned empty transcript. "
+                        f"Audio decoded successfully (duration={tx_result.duration_seconds}s, "
+                        f"channels={tx_result.channels}) but Deepgram detected 0 words. "
+                        f"The file may contain silence, music, or unintelligible audio. "
                         f"mime_type={mime_type}, file_size={job.file_size or 'unknown'}, "
-                        f"file_name={job.file_name or 'unknown'}. "
-                        f"Verify the audio file contains audible speech and "
-                        f"the format is supported by Deepgram."
+                        f"file_name={job.file_name or 'unknown'}"
                     )
                     await session.commit()
             return
