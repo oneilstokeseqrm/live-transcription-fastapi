@@ -1,10 +1,20 @@
 """BatchService for Deepgram prerecorded API integration with speaker diarization."""
 import os
 import logging
+from dataclasses import dataclass
 from typing import Optional
 from deepgram import Deepgram
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TranscriptionResult:
+    """Result from Deepgram transcription with diagnostic metadata."""
+    transcript: str
+    duration_seconds: Optional[float] = None
+    channels: Optional[int] = None
+    words: int = 0
 
 
 class BatchService:
@@ -63,7 +73,7 @@ class BatchService:
             logger.error(f"Deepgram transcription failed: {e}", exc_info=True)
             raise
 
-    async def transcribe_from_url(self, audio_url: str, mimetype: str = "audio/wav") -> str:
+    async def transcribe_from_url(self, audio_url: str, mimetype: str = "audio/wav") -> TranscriptionResult:
         """
         Transcribe audio from a URL (e.g., presigned S3 URL).
 
@@ -75,7 +85,7 @@ class BatchService:
             mimetype: MIME type hint (optional, Deepgram can auto-detect)
 
         Returns:
-            Formatted transcript with speaker labels (SPEAKER_X: text)
+            TranscriptionResult with transcript text and Deepgram metadata
 
         Raises:
             Exception: If Deepgram API call fails
@@ -97,27 +107,36 @@ class BatchService:
             # Call Deepgram API with URL source (SDK v2 syntax)
             response = await self.client.transcription.prerecorded(source, options)
 
-            # Log Deepgram response metadata for diagnostics
-            self._log_deepgram_metadata(response, source_label="url")
+            # Log and extract Deepgram response metadata
+            meta = self._log_deepgram_metadata(response, source_label="url")
 
             # Format response into SPEAKER_X: text format
             formatted_transcript = self._format_deepgram_response(response)
 
-            return formatted_transcript
+            return TranscriptionResult(
+                transcript=formatted_transcript,
+                duration_seconds=meta.get("duration_seconds"),
+                channels=meta.get("channels"),
+                words=meta.get("words", 0),
+            )
 
         except Exception as e:
             logger.error(f"Deepgram URL transcription failed: {e}", exc_info=True)
             raise
     
-    def _log_deepgram_metadata(self, response: dict, source_label: str = "unknown") -> None:
-        """Log Deepgram response metadata for diagnostics.
+    def _log_deepgram_metadata(self, response: dict, source_label: str = "unknown") -> dict:
+        """Log Deepgram response metadata for diagnostics and return it.
 
         Extracts duration, channel count, and word count from the response
         so empty-transcript issues can be diagnosed from logs alone.
+
+        Returns:
+            Dict with keys: duration_seconds, channels, words
         """
+        meta = {"duration_seconds": None, "channels": None, "words": 0}
         try:
             metadata = response.get("metadata", {})
-            duration = metadata.get("duration", "?")
+            duration = metadata.get("duration")
             channels = response.get("results", {}).get("channels", [])
             num_channels = len(channels)
             num_words = 0
@@ -128,6 +147,12 @@ class BatchService:
                 num_words = len(words)
                 transcript_preview = alt.get("transcript", "")[:80]
 
+            meta = {
+                "duration_seconds": duration,
+                "channels": num_channels,
+                "words": num_words,
+            }
+
             logger.info(
                 f"Deepgram response ({source_label}): "
                 f"duration={duration}s, channels={num_channels}, "
@@ -135,6 +160,7 @@ class BatchService:
             )
         except Exception as e:
             logger.warning(f"Failed to log Deepgram metadata: {e}")
+        return meta
 
     def _format_deepgram_response(self, response: dict) -> str:
         """
