@@ -51,6 +51,36 @@ from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
+
+# --- MIME Type Normalization ---
+
+_MIME_ALIASES: dict[str, str] = {
+    "audio/x-m4a": "audio/mp4",
+    "audio/m4a": "audio/mp4",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/x-mpeg": "audio/mpeg",
+    "video/webm": "audio/webm",
+}
+
+
+def _normalize_audio_mime_type(mime_type: str) -> str:
+    """Normalize browser-reported MIME types to standard IANA types.
+
+    Browsers (especially on macOS) report non-standard MIME types for
+    some audio formats.  For example, .m4a files get ``audio/x-m4a``
+    instead of the standard ``audio/mp4``.  This matters because:
+
+    1. S3 stores the Content-Type from the presigned PUT
+    2. When Deepgram fetches via presigned GET, it uses Content-Type
+       for format detection
+    3. Non-standard types can cause Deepgram to return empty transcripts
+    """
+    normalized = _MIME_ALIASES.get(mime_type.lower().strip(), mime_type)
+    if normalized != mime_type:
+        logger.info(f"Normalized MIME type: {mime_type} → {normalized}")
+    return normalized
+
 router = APIRouter(prefix="/upload", tags=["upload"])
 
 
@@ -96,9 +126,12 @@ async def upload_init(body: UploadInitRequest, request: Request):
     job_id = str(uuid.uuid4())
     interaction_id = context.interaction_id
 
+    # Normalize MIME type (browsers report non-standard types like audio/x-m4a)
+    normalized_mime = _normalize_audio_mime_type(body.mime_type)
+
     logger.info(
         f"Upload init: job_id={job_id}, tenant_id={context.tenant_id[:8]}..., "
-        f"filename={body.filename}, mime_type={body.mime_type}"
+        f"filename={body.filename}, mime_type={normalized_mime}"
     )
 
     # Generate S3 key
@@ -113,7 +146,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
     try:
         upload_url, expires_at = s3_service.generate_presigned_put_url(
             file_key=file_key,
-            content_type=body.mime_type
+            content_type=normalized_mime
         )
     except S3ServiceError as e:
         logger.error(f"S3 error generating presigned URL: {e}")
@@ -128,7 +161,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
         status=JobStatus.queued,
         file_key=file_key,
         file_name=body.filename,
-        mime_type=body.mime_type,
+        mime_type=normalized_mime,
         file_size=body.file_size,
         interaction_id=uuid.UUID(interaction_id),
         trace_id=context.trace_id,
@@ -148,7 +181,8 @@ async def upload_init(body: UploadInitRequest, request: Request):
         upload_url=upload_url,
         file_key=file_key,
         job_id=job_id,
-        expires_at=expires_at
+        expires_at=expires_at,
+        signed_content_type=normalized_mime,
     )
 
 
@@ -230,7 +264,7 @@ async def upload_complete(body: UploadCompleteRequest, request: Request):
         if body.file_name:
             job.file_name = body.file_name
         if body.mime_type:
-            job.mime_type = body.mime_type
+            job.mime_type = _normalize_audio_mime_type(body.mime_type)
         if body.file_size:
             job.file_size = body.file_size
         job.updated_at = datetime.now(timezone.utc)
@@ -362,7 +396,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
 
             # Capture job data for processing
             file_key = job.file_key
-            mime_type = job.mime_type or "audio/wav"
+            mime_type = _normalize_audio_mime_type(job.mime_type or "audio/wav")
             interaction_id = str(job.interaction_id)
             user_id = job.user_id
             trace_id = job.trace_id
@@ -374,8 +408,33 @@ async def _process_upload_job(job_id: str, tenant_id: str):
 
         # Transcribe from URL
         batch_service = BatchService()
-        logger.info(f"Transcribing from URL: job_id={job_id}")
+        logger.info(f"Transcribing from URL: job_id={job_id}, mime_type={mime_type}")
         raw_transcript = await batch_service.transcribe_from_url(audio_url, mime_type)
+
+        # Fail explicitly if Deepgram returned nothing
+        if not raw_transcript.strip():
+            logger.warning(
+                f"Empty transcript from Deepgram: job_id={job_id}, "
+                f"mime_type={mime_type}, file_key={file_key[-60:]}"
+            )
+            async with get_async_session() as session:
+                stmt = select(UploadJob).where(UploadJob.id == job_uuid)
+                result = await session.execute(stmt)
+                job = result.scalar_one_or_none()
+                if job:
+                    job.status = JobStatus.failed
+                    job.completed_at = datetime.now(timezone.utc)
+                    job.updated_at = datetime.now(timezone.utc)
+                    job.error_code = "EMPTY_TRANSCRIPT"
+                    job.error_message = (
+                        f"Deepgram returned empty transcript. "
+                        f"mime_type={mime_type}, file_size={job.file_size or 'unknown'}, "
+                        f"file_name={job.file_name or 'unknown'}. "
+                        f"Verify the audio file contains audible speech and "
+                        f"the format is supported by Deepgram."
+                    )
+                    await session.commit()
+            return
 
         # Clean transcript
         cleaner_service = BatchCleanerService()
