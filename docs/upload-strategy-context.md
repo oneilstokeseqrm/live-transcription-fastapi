@@ -376,10 +376,14 @@ Only the raw file bytes bypass Vercel.
 
 2. **Modify BatchService:**
    ```python
-   async def transcribe_from_url(self, s3_url: str) -> str:
-       source = {'url': s3_url}
-       response = await self.client.transcription.prerecorded(source, self.options)
-       return self._format_deepgram_response(response)
+   # NOTE: Actual signature now returns TranscriptionResult (dataclass with
+   # transcript, duration_seconds, channels, words) — see batch_service.py
+   async def transcribe_from_url(self, audio_url: str, mimetype: str = "audio/wav") -> TranscriptionResult:
+       source = {'url': audio_url}
+       response = await self.client.transcription.prerecorded(source, options)
+       meta = self._log_deepgram_metadata(response, source_label="url")
+       formatted = self._format_deepgram_response(response)
+       return TranscriptionResult(transcript=formatted, **meta)
    ```
 
 3. **S3 client utility:**
