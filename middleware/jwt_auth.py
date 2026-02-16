@@ -7,6 +7,7 @@ It follows the contract defined in eq-frontend/docs/backend-internal-jwt-contrac
 JWT Claims Contract:
 - tenant_id: UUID v4 (required) - Internal Postgres tenant identifier
 - user_id: string (required) - Auth0 subject (sub)
+- pg_user_id: string (optional) - Postgres User UUID from identity bridge
 - iss: string (required) - Issuer, must match INTERNAL_JWT_ISSUER
 - aud: string (required) - Audience, must match INTERNAL_JWT_AUDIENCE
 - iat: number (required) - Issued-at timestamp
@@ -45,6 +46,7 @@ class JWTClaims:
     Attributes:
         tenant_id: UUID v4 string identifying the tenant/organization
         user_id: Auth0 subject string (e.g., 'auth0|507f1f77bcf86cd799439011')
+        pg_user_id: Optional Postgres User UUID from identity bridge
         issued_at: Unix timestamp when the token was issued
         expires_at: Unix timestamp when the token expires
     """
@@ -52,6 +54,7 @@ class JWTClaims:
     user_id: str
     issued_at: int
     expires_at: int
+    pg_user_id: str | None = None
 
 
 class JWTVerificationError(Exception):
@@ -167,11 +170,15 @@ def verify_internal_jwt(token: str) -> JWTClaims:
                 code="JWT_INVALID_TENANT"
             )
 
+        # Extract optional identity bridge claim (no error if absent)
+        pg_user_id = payload.get("pg_user_id")
+
         logger.info(f"JWT verified successfully for tenant={tenant_id[:8]}...")
 
         return JWTClaims(
             tenant_id=tenant_id,
             user_id=user_id,
+            pg_user_id=pg_user_id,
             issued_at=payload.get("iat", 0),
             expires_at=payload.get("exp", 0),
         )

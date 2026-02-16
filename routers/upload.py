@@ -157,6 +157,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
         id=uuid.UUID(job_id),
         tenant_id=uuid.UUID(context.tenant_id),
         user_id=context.user_id,
+        pg_user_id=context.pg_user_id,
         job_type=JobType.audio_transcription,
         status=JobStatus.queued,
         file_key=file_key,
@@ -399,6 +400,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             mime_type = _normalize_audio_mime_type(job.mime_type or "audio/wav")
             interaction_id = str(job.interaction_id)
             user_id = job.user_id
+            pg_user_id = job.pg_user_id
             trace_id = job.trace_id
             account_id = job.account_id
 
@@ -455,7 +457,8 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             extras={},
             interaction_id=uuid.UUID(interaction_id),
             trace_id=trace_id,
-            account_id=account_id
+            account_id=account_id,
+            pg_user_id=pg_user_id,
         )
 
         # Execute Lane 1 (publish) and Lane 2 (intelligence) concurrently

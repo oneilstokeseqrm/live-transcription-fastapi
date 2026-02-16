@@ -55,6 +55,10 @@ class BatchProcessingCompletedEvent(BaseModel):
         None,
         description="Optional account identifier for additional context"
     )
+    pg_user_id: Optional[str] = Field(
+        None,
+        description="Postgres User UUID from identity bridge"
+    )
     timestamp: str = Field(
         ...,
         description="ISO 8601 timestamp of when the event was created"

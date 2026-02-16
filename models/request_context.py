@@ -20,6 +20,7 @@ class RequestContext:
     Attributes:
         tenant_id: UUID v4 identifying the tenant/organization
         user_id: String identifying the user who initiated the request
+        pg_user_id: Optional Postgres User UUID from identity bridge
         account_id: Optional string for additional account-level context
         interaction_id: UUID v4 uniquely identifying this specific request
         trace_id: UUID v4 for distributed tracing (from X-Trace-Id header or generated)
@@ -29,3 +30,4 @@ class RequestContext:
     account_id: Optional[str]
     interaction_id: str
     trace_id: str
+    pg_user_id: Optional[str] = None

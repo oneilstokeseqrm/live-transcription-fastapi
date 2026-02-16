@@ -184,7 +184,8 @@ async def process_batch_audio(file: UploadFile, request: Request):
         extras={},
         interaction_id=UUID(context.interaction_id),
         trace_id=context.trace_id,
-        account_id=context.account_id
+        account_id=context.account_id,
+        pg_user_id=context.pg_user_id,
     )
     
     async def _lane1_publish() -> Optional[dict]:
