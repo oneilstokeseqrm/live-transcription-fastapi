@@ -402,7 +402,8 @@ class AWSEventPublisher:
         user_id: str,
         account_id: Optional[str],
         raw_transcript: str,
-        cleaned_transcript: str
+        cleaned_transcript: str,
+        pg_user_id: Optional[str] = None,
     ) -> str:
         """
         Publish a BatchProcessingCompleted event to EventBridge.
@@ -440,6 +441,7 @@ class AWSEventPublisher:
             "tenant_id": tenant_id,
             "user_id": user_id,
             "account_id": account_id,
+            "pg_user_id": pg_user_id,
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "status": "completed",
             "data": {

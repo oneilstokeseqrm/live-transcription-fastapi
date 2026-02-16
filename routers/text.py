@@ -97,7 +97,8 @@ async def clean_text(body: TextCleanRequest, request: Request):
         extras=body.metadata or {},
         interaction_id=UUID(context.interaction_id),
         trace_id=context.trace_id,
-        account_id=context.account_id
+        account_id=context.account_id,
+        pg_user_id=context.pg_user_id,
     )
     
     # Async Fork - Execute Lane 1 (publishing) and Lane 2 (intelligence) concurrently

@@ -93,6 +93,10 @@ class EnvelopeV1(BaseModel):
         None,
         description="Optional account identifier for CRM/sales context"
     )
+    pg_user_id: Optional[str] = Field(
+        None,
+        description="Postgres User UUID from identity bridge"
+    )
     
     @field_serializer('timestamp')
     def serialize_timestamp(self, value: datetime) -> str:

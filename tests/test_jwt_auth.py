@@ -19,6 +19,7 @@ os.environ["INTERNAL_JWT_AUDIENCE"] = "eq-backend"
 def generate_test_jwt(
     tenant_id: str = None,
     user_id: str = None,
+    pg_user_id: str = None,
     issuer: str = None,
     audience: str = None,
     exp_offset: int = 300,
@@ -34,6 +35,8 @@ def generate_test_jwt(
         "iat": now,
         "exp": now + exp_offset,
     }
+    if pg_user_id is not None:
+        payload["pg_user_id"] = pg_user_id
     secret = secret or os.environ["INTERNAL_JWT_SECRET"]
     return pyjwt.encode(payload, secret, algorithm="HS256")
 
@@ -156,6 +159,33 @@ class TestJWTVerification:
             verify_internal_jwt(token)
 
         assert exc_info.value.code == "JWT_INVALID_TENANT"
+
+    def test_pg_user_id_extracted_when_present(self):
+        """JWT with pg_user_id should populate JWTClaims.pg_user_id."""
+        from middleware.jwt_auth import verify_internal_jwt
+
+        tenant_id = str(uuid.uuid4())
+        pg_user_id = str(uuid.uuid4())
+        token = generate_test_jwt(
+            tenant_id=tenant_id,
+            user_id="auth0|user-xyz",
+            pg_user_id=pg_user_id,
+        )
+
+        claims = verify_internal_jwt(token)
+
+        assert claims.pg_user_id == pg_user_id
+        assert claims.tenant_id == tenant_id
+
+    def test_pg_user_id_none_when_absent(self):
+        """JWT without pg_user_id should have JWTClaims.pg_user_id as None."""
+        from middleware.jwt_auth import verify_internal_jwt
+
+        token = generate_test_jwt(tenant_id=str(uuid.uuid4()))
+
+        claims = verify_internal_jwt(token)
+
+        assert claims.pg_user_id is None
 
 
 class TestUnifiedAuthContext:
