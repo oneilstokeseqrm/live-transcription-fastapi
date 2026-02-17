@@ -158,6 +158,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
         tenant_id=uuid.UUID(context.tenant_id),
         user_id=context.user_id,
         pg_user_id=context.pg_user_id,
+        user_name=context.user_name,
         job_type=JobType.audio_transcription,
         status=JobStatus.queued,
         file_key=file_key,
@@ -401,6 +402,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             interaction_id = str(job.interaction_id)
             user_id = job.user_id
             pg_user_id = job.pg_user_id
+            user_name = job.user_name
             trace_id = job.trace_id
             account_id = job.account_id
 
@@ -446,6 +448,11 @@ async def _process_upload_job(job_id: str, tenant_id: str):
         logger.info(f"Cleaning transcript: job_id={job_id}")
         cleaned_transcript = await cleaner_service.clean_transcript(raw_transcript)
 
+        # Build extras dict with optional user_name for downstream speaker attribution
+        extras = {}
+        if user_name:
+            extras["user_name"] = user_name
+
         # Build envelope
         envelope = EnvelopeV1(
             tenant_id=uuid.UUID(tenant_id),
@@ -454,7 +461,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             content=ContentModel(text=cleaned_transcript, format="diarized"),
             timestamp=datetime.now(timezone.utc),
             source="upload",
-            extras={},
+            extras=extras,
             interaction_id=uuid.UUID(interaction_id),
             trace_id=trace_id,
             account_id=account_id,

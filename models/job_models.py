@@ -63,6 +63,7 @@ class UploadJob(SQLModel, table=True):
     tenant_id: UUID = Field(index=True, sa_column_kwargs={"name": "tenant_id"})
     user_id: str = Field(sa_column_kwargs={"name": "user_id"})
     pg_user_id: Optional[str] = Field(default=None, sa_column=Column(Text, name="pg_user_id"))
+    user_name: Optional[str] = Field(default=None, sa_column=Column(Text, name="user_name"))
 
     # Job type and status
     job_type: JobType = Field(default=JobType.audio_transcription, sa_column_kwargs={"name": "job_type"})
