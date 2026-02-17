@@ -86,6 +86,11 @@ async def clean_text(body: TextCleanRequest, request: Request):
         )
         cleaned_text = body.text
     
+    # Build extras dict: merge request metadata with optional user_name
+    extras = dict(body.metadata) if body.metadata else {}
+    if context.user_name:
+        extras["user_name"] = context.user_name
+
     # Build EnvelopeV1 with interaction_type="note" (Requirement 3.5)
     envelope = EnvelopeV1(
         tenant_id=UUID(context.tenant_id),
@@ -94,7 +99,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
         content=ContentModel(text=cleaned_text, format="plain"),
         timestamp=datetime.now(timezone.utc),
         source=body.source,
-        extras=body.metadata or {},
+        extras=extras,
         interaction_id=UUID(context.interaction_id),
         trace_id=context.trace_id,
         account_id=context.account_id,

@@ -55,6 +55,7 @@ class JWTClaims:
     issued_at: int
     expires_at: int
     pg_user_id: str | None = None
+    user_name: str | None = None
 
 
 class JWTVerificationError(Exception):
@@ -173,12 +174,16 @@ def verify_internal_jwt(token: str) -> JWTClaims:
         # Extract optional identity bridge claim (no error if absent)
         pg_user_id = payload.get("pg_user_id")
 
+        # Extract optional display name for downstream speaker attribution
+        user_name = payload.get("user_name")
+
         logger.info(f"JWT verified successfully for tenant={tenant_id[:8]}...")
 
         return JWTClaims(
             tenant_id=tenant_id,
             user_id=user_id,
             pg_user_id=pg_user_id,
+            user_name=user_name,
             issued_at=payload.get("iat", 0),
             expires_at=payload.get("exp", 0),
         )

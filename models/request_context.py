@@ -31,3 +31,4 @@ class RequestContext:
     interaction_id: str
     trace_id: str
     pg_user_id: Optional[str] = None
+    user_name: Optional[str] = None

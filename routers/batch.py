@@ -174,6 +174,11 @@ async def process_batch_audio(file: UploadFile, request: Request):
     
     # Step 3: Async Fork - Execute Lane 1 (publishing) and Lane 2 (intelligence) concurrently
     # Requirements: 2.4 - interaction_type="transcript" for envelope, "batch_upload" for intelligence
+    # Build extras dict with optional user_name for downstream speaker attribution
+    extras = {}
+    if context.user_name:
+        extras["user_name"] = context.user_name
+
     envelope = EnvelopeV1(
         tenant_id=UUID(context.tenant_id),
         user_id=context.user_id,
@@ -181,7 +186,7 @@ async def process_batch_audio(file: UploadFile, request: Request):
         content=ContentModel(text=cleaned_transcript, format="diarized"),
         timestamp=datetime.now(timezone.utc),
         source="upload",
-        extras={},
+        extras=extras,
         interaction_id=UUID(context.interaction_id),
         trace_id=context.trace_id,
         account_id=context.account_id,

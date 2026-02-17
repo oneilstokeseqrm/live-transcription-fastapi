@@ -266,6 +266,7 @@ def _extract_context_from_jwt(
         interaction_id=interaction_id,
         trace_id=trace_id,
         pg_user_id=claims.pg_user_id,
+        user_name=claims.user_name,
     )
 
 
