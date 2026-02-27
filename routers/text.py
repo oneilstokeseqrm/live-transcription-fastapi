@@ -127,7 +127,8 @@ async def clean_text(body: TextCleanRequest, request: Request):
                 interaction_id=context.interaction_id,
                 tenant_id=context.tenant_id,
                 trace_id=context.trace_id,
-                interaction_type=body.interaction_type
+                interaction_type=body.interaction_type,
+                account_id=context.account_id,
             )
         except Exception as e:
             logger.error(
