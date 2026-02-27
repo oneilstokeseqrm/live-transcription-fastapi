@@ -30,6 +30,10 @@ class TextCleanRequest(BaseModel):
         default="api",
         description="Content source identifier"
     )
+    interaction_type: str = Field(
+        default="note",
+        description="Interaction type for envelope and intelligence"
+    )
     
     @field_validator('text')
     @classmethod

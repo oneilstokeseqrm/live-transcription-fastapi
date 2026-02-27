@@ -95,7 +95,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
     envelope = EnvelopeV1(
         tenant_id=UUID(context.tenant_id),
         user_id=context.user_id,
-        interaction_type="note",
+        interaction_type=body.interaction_type,
         content=ContentModel(text=cleaned_text, format="plain"),
         timestamp=datetime.now(timezone.utc),
         source=body.source,
@@ -127,7 +127,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
                 interaction_id=context.interaction_id,
                 tenant_id=context.tenant_id,
                 trace_id=context.trace_id,
-                interaction_type="note"
+                interaction_type=body.interaction_type
             )
         except Exception as e:
             logger.error(
