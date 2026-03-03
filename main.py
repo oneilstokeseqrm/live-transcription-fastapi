@@ -88,6 +88,11 @@ async def startup_event():
     logger.info("Startup tasks completed")
 
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+
 # Include routers
 app.include_router(batch.router)
 app.include_router(text.router, prefix="/text", tags=["text"])
