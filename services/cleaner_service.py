@@ -122,6 +122,7 @@ class CleanerService:
 3. Add proper punctuation and capitalization
 4. Remove false starts and repetitions
 5. Organize into clear paragraphs
+6. Preserve speaker labels (e.g., "[Pete]:", "[Others]:") and timestamps (e.g., "[00:01]") exactly as they appear
 
 **Output Requirements:**
 1. **Summary**: Write a concise 2-3 sentence summary of the main points
@@ -133,4 +134,5 @@ class CleanerService:
 - Do NOT change the meaning or intent
 - Do NOT remove important context or details
 - DO preserve technical terms and specific names exactly as spoken
+- DO preserve speaker labels and timestamps — these are structural markers, not content
 - DO maintain the conversational tone where appropriate"""
