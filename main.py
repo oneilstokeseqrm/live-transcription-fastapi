@@ -315,7 +315,7 @@ async def websocket_endpoint(websocket: WebSocket):
         # Close Deepgram connection
         if deepgram_socket:
             try:
-                deepgram_socket.finish()
+                await deepgram_socket.finish()
                 logger.info(f"Deepgram connection closed: session_id={session_id}")
             except Exception as e:
                 logger.warning(f"Error closing Deepgram socket: {e}")
