@@ -183,7 +183,6 @@ async def process_audio(
             'encoding': audio_cfg.get('encoding', 'linear16'),
             'endpointing': 300,          # 300ms silence before finalizing (prevents word splitting at pauses)
             'filler_words': True,        # Include um, uh, mhm (otherwise perceived as skipped words)
-            'utterance_end_ms': 1000,    # Detect utterance boundaries after 1s silence
         })
 
     deepgram_socket = await connect_to_deepgram(get_transcript, dg_options)
