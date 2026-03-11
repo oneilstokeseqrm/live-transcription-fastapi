@@ -330,6 +330,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     f"length={len(raw_transcript)} chars"
                 )
 
+                # Send raw transcript to client immediately (Phase 1)
+                # This arrives in ~2s. Client can save + display while GPT-4o works.
+                try:
+                    await websocket.send_json({
+                        "type": "session_transcript_ready",
+                        "raw_transcript": raw_transcript,
+                        "session_id": session_id,
+                    })
+                    logger.info(f"session_transcript_ready sent: session_id={session_id}")
+                except Exception as e:
+                    logger.warning(
+                        f"Could not send session_transcript_ready: "
+                        f"session_id={session_id}, error={e}"
+                    )
+
                 # Step 2: Clean and structure the transcript
                 logger.info(f"Starting transcript cleaning: session_id={session_id}")
                 meeting_output = await cleaner_service.clean_transcript(
