@@ -18,6 +18,7 @@ from services.batch_service import BatchService
 from services.batch_cleaner_service import BatchCleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
+from services.transcript_enrichment import TranscriptEnrichmentService
 from utils.context_utils import get_auth_context
 
 logger = logging.getLogger(__name__)
@@ -148,14 +149,30 @@ async def process_batch_audio(file: UploadFile, request: Request):
             detail="Transcription service failed. Please try again."
         )
     
-    # Step 2: Clean transcript
+    # Step 2: Enrich transcript with calendar event contacts
+    enrichment_service = TranscriptEnrichmentService()
+    transcript_ts = datetime.now(timezone.utc)
+    enrichment = await enrichment_service.enrich(
+        tenant_id=context.tenant_id,
+        transcript_timestamp=transcript_ts,
+        raw_transcript=raw_transcript,
+        user_name=context.user_name,
+        account_id=context.account_id,
+    )
+
+    # Prepend front-matter before cleaning
+    text_for_cleaning = raw_transcript
+    if enrichment.front_matter:
+        text_for_cleaning = enrichment.front_matter + "\n\n" + raw_transcript
+
+    # Step 3: Clean transcript
     try:
         cleaner_service = BatchCleanerService()
         logger.info(
             f"Starting cleaning: processing_id={processing_id}, "
             f"interaction_id={context.interaction_id}"
         )
-        cleaned_transcript = await cleaner_service.clean_transcript(raw_transcript)
+        cleaned_transcript = await cleaner_service.clean_transcript(text_for_cleaning)
         logger.info(
             f"Cleaning complete: processing_id={processing_id}, "
             f"interaction_id={context.interaction_id}, "
@@ -171,20 +188,27 @@ async def process_batch_audio(file: UploadFile, request: Request):
             status_code=500,
             detail="Transcript cleaning service failed. Please try again."
         )
-    
-    # Step 3: Async Fork - Execute Lane 1 (publishing) and Lane 2 (intelligence) concurrently
-    # Requirements: 2.4 - interaction_type="transcript" for envelope, "batch_upload" for intelligence
+
+    # Step 4: Async Fork - Execute Lane 1 (publishing) and Lane 2 (intelligence) concurrently
     # Build extras dict with optional user_name for downstream speaker attribution
     extras = {}
     if context.user_name:
         extras["user_name"] = context.user_name
 
+    # Add enrichment metadata to extras
+    extras.update(enrichment.to_extras_dict())
+
+    # Include front-matter in content.text for downstream LLMs
+    content_text = cleaned_transcript
+    if enrichment.front_matter:
+        content_text = enrichment.front_matter + "\n\n" + cleaned_transcript
+
     envelope = EnvelopeV1(
         tenant_id=UUID(context.tenant_id),
         user_id=context.user_id,
         interaction_type="transcript",
-        content=ContentModel(text=cleaned_transcript, format="diarized"),
-        timestamp=datetime.now(timezone.utc),
+        content=ContentModel(text=content_text, format="diarized"),
+        timestamp=transcript_ts,
         source="upload",
         extras=extras,
         interaction_id=UUID(context.interaction_id),
@@ -214,7 +238,11 @@ async def process_batch_audio(file: UploadFile, request: Request):
                 interaction_id=context.interaction_id,
                 tenant_id=context.tenant_id,
                 trace_id=context.trace_id,
-                interaction_type="batch_upload"
+                interaction_type="batch_upload",
+                contact_ids=enrichment.contact_ids or None,
+                calendar_event_id=enrichment.calendar_event_id,
+                enrichment_confidence=enrichment.match_confidence,
+                enrichment_match_method=enrichment.match_method,
             )
         except Exception as e:
             logger.error(
