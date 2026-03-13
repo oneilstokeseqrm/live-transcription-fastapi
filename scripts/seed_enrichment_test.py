@@ -31,8 +31,9 @@ if not NEON_DSN:
 
 TENANT_ID = "11111111-1111-4111-8111-111111111111"
 
-# Fixed UUIDs for deterministic seeding (idempotent)
-PROVIDER_CONNECTION_ID = "22222222-2222-4222-8222-222222222222"
+# Use a real provider_connection for FK constraint
+# This is looked up at runtime; fallback to a fixed UUID if no connections exist
+PROVIDER_CONNECTION_ID = None  # resolved in seed()
 CALENDAR_EVENT_1_ID = "33333333-3333-4333-8333-333333333333"
 CALENDAR_EVENT_2_ID = "33333333-3333-4333-8333-333333333334"
 EXISTING_CONTACT_1_ID = "44444444-4444-4444-8444-444444444441"
@@ -109,17 +110,26 @@ def seed(conn):
     cur = conn.cursor()
     now = datetime.now(timezone.utc)
 
+    # Resolve a real provider_connection for FK constraint
+    cur.execute("SELECT id FROM provider_connections LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        print("ERROR: No provider_connections found — cannot seed calendar events (FK constraint)")
+        sys.exit(1)
+    connection_id = str(row[0])
+    print(f"Using connection_id: {connection_id[:8]}...")
+
     print("Seeding calendar events...")
 
     # Event 1: Current time (for happy-path matching)
     cur.execute(
         """
         INSERT INTO calendar_events (
-            id, tenant_id, provider_connection_id, provider_event_id,
+            id, tenant_id, connection_id, provider, provider_event_id,
             title, start_time, end_time, status,
-            organizer_email, conference_join_url, conference_type,
+            organizer_email, conference_join_url, conference_provider,
             created_at, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
         ON CONFLICT (id) DO UPDATE SET
             title = EXCLUDED.title,
             start_time = EXCLUDED.start_time,
@@ -127,7 +137,8 @@ def seed(conn):
             updated_at = NOW()
         """,
         (
-            CALENDAR_EVENT_1_ID, TENANT_ID, PROVIDER_CONNECTION_ID,
+            CALENDAR_EVENT_1_ID, TENANT_ID, connection_id,
+            "google",
             "enrichment-test-event-1",
             EVENT_1_TITLE,
             now - timedelta(minutes=5),   # Started 5 min ago
@@ -143,11 +154,11 @@ def seed(conn):
     cur.execute(
         """
         INSERT INTO calendar_events (
-            id, tenant_id, provider_connection_id, provider_event_id,
+            id, tenant_id, connection_id, provider, provider_event_id,
             title, start_time, end_time, status,
             organizer_email,
             created_at, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
         ON CONFLICT (id) DO UPDATE SET
             title = EXCLUDED.title,
             start_time = EXCLUDED.start_time,
@@ -155,7 +166,8 @@ def seed(conn):
             updated_at = NOW()
         """,
         (
-            CALENDAR_EVENT_2_ID, TENANT_ID, PROVIDER_CONNECTION_ID,
+            CALENDAR_EVENT_2_ID, TENANT_ID, connection_id,
+            "google",
             "enrichment-test-event-2",
             EVENT_2_TITLE,
             now - timedelta(hours=2, minutes=30),
@@ -181,13 +193,13 @@ def seed(conn):
         cur.execute(
             """
             INSERT INTO calendar_event_attendees (
-                id, calendar_event_id, email, display_name,
-                is_organizer, response_status, is_resource, is_optional,
-                created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                id, calendar_event_id, tenant_id, email, display_name,
+                is_organizer, response_status, is_resource, is_optional
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (calendar_event_id, email) DO NOTHING
             """,
             (
-                str(uuid.uuid4()), CALENDAR_EVENT_1_ID,
+                str(uuid.uuid4()), CALENDAR_EVENT_1_ID, TENANT_ID,
                 att["email"], att["display_name"] or None,
                 att["is_organizer"], att["response_status"],
                 att["is_resource"], att["is_optional"],
@@ -198,13 +210,13 @@ def seed(conn):
         cur.execute(
             """
             INSERT INTO calendar_event_attendees (
-                id, calendar_event_id, email, display_name,
-                is_organizer, response_status, is_resource, is_optional,
-                created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                id, calendar_event_id, tenant_id, email, display_name,
+                is_organizer, response_status, is_resource, is_optional
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (calendar_event_id, email) DO NOTHING
             """,
             (
-                str(uuid.uuid4()), CALENDAR_EVENT_2_ID,
+                str(uuid.uuid4()), CALENDAR_EVENT_2_ID, TENANT_ID,
                 att["email"], att["display_name"] or None,
                 att["is_organizer"], att["response_status"],
                 att["is_resource"], att["is_optional"],
@@ -222,7 +234,7 @@ def seed(conn):
             id, tenant_id, email, first_name, last_name,
             source, validation_status, created_at, updated_at
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (tenant_id, email) DO NOTHING
         """,
         (
             EXISTING_CONTACT_1_ID, TENANT_ID,
@@ -238,7 +250,7 @@ def seed(conn):
             id, tenant_id, email, first_name, last_name,
             source, validation_status, created_at, updated_at
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (tenant_id, email) DO NOTHING
         """,
         (
             EXISTING_CONTACT_2_ID, TENANT_ID,
