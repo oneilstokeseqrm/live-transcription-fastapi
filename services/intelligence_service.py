@@ -9,9 +9,10 @@ import hashlib
 import logging
 from datetime import datetime
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import instructor
+from sqlalchemy import text as sa_text
 from sqlmodel import select
 
 from models.extraction_models import InteractionAnalysis
@@ -57,10 +58,14 @@ class IntelligenceService:
         interaction_type: str = "meeting",
         account_id: Optional[str] = None,
         interaction_timestamp: Optional[datetime] = None,
-        persona_code: str = "gtm"
+        persona_code: str = "gtm",
+        contact_ids: Optional[list[str]] = None,
+        calendar_event_id: Optional[str] = None,
+        enrichment_confidence: Optional[str] = None,
+        enrichment_match_method: Optional[str] = None,
     ) -> Optional[InteractionAnalysis]:
         """Extract intelligence and persist to database.
-        
+
         Args:
             cleaned_transcript: The cleaned transcript text to analyze.
             interaction_id: Unique identifier for this interaction.
@@ -70,7 +75,11 @@ class IntelligenceService:
             account_id: Optional account identifier.
             interaction_timestamp: When the interaction occurred.
             persona_code: Persona code for extraction context (default: gtm).
-            
+            contact_ids: Optional list of resolved contact UUIDs from enrichment.
+            calendar_event_id: Optional calendar event UUID from enrichment.
+            enrichment_confidence: Match confidence from enrichment ("high"|"medium").
+            enrichment_match_method: How the calendar event was matched ("conference_url"|"time_window").
+
         Returns:
             InteractionAnalysis if successful, None on any failure.
         """
@@ -106,7 +115,18 @@ class IntelligenceService:
                 f"summaries=5, action_items={len(analysis.action_items)}, "
                 f"decisions={len(analysis.decisions)}, risks={len(analysis.risks)}"
             )
-            
+
+            # Persist contact links (post-Lane-2: interaction_summaries now exists)
+            if contact_ids:
+                await self._persist_contact_links(
+                    interaction_id=interaction_id,
+                    tenant_id=tenant_id,
+                    contact_ids=contact_ids,
+                    calendar_event_id=calendar_event_id,
+                    match_confidence=enrichment_confidence or "medium",
+                    match_method=enrichment_match_method or "time_window",
+                )
+
             return analysis
             
         except Exception as e:
@@ -401,3 +421,80 @@ Do not invent or assume information not stated."""
                     exc_info=True
                 )
                 raise
+
+    async def _persist_contact_links(
+        self,
+        interaction_id: str,
+        tenant_id: str,
+        contact_ids: list[str],
+        calendar_event_id: Optional[str] = None,
+        match_confidence: str = "medium",
+        match_method: str = "time_window",
+    ) -> None:
+        """Persist interaction↔contact and calendar↔interaction links.
+
+        Written AFTER _persist_intelligence so that interaction_summaries rows
+        exist (FK dependency). Uses ON CONFLICT DO NOTHING for idempotency.
+        """
+        interaction_uuid = UUID(interaction_id)
+        tenant_uuid = UUID(tenant_id)
+
+        async with get_async_session() as session:
+            try:
+                # Write interaction_contact_links (summary → contact)
+                for cid_str in contact_ids:
+                    contact_uuid = UUID(cid_str)
+                    await session.execute(
+                        sa_text("""
+                            INSERT INTO interaction_contact_links (
+                                link_id, interaction_id, contact_id
+                            ) VALUES (
+                                :link_id, :interaction_id, :contact_id
+                            )
+                            ON CONFLICT DO NOTHING
+                        """),
+                        {
+                            "link_id": uuid4(),
+                            "interaction_id": interaction_uuid,
+                            "contact_id": contact_uuid,
+                        },
+                    )
+
+                # Write calendar_event_interaction_links (if we matched a calendar event)
+                if calendar_event_id:
+                    cal_event_uuid = UUID(calendar_event_id)
+                    await session.execute(
+                        sa_text("""
+                            INSERT INTO calendar_event_interaction_links (
+                                id, calendar_event_id, interaction_id, tenant_id,
+                                match_confidence, match_method, created_at
+                            ) VALUES (
+                                :id, :calendar_event_id, :interaction_id, :tenant_id,
+                                :confidence, :method, NOW()
+                            )
+                            ON CONFLICT (calendar_event_id, interaction_id) DO NOTHING
+                        """),
+                        {
+                            "id": uuid4(),
+                            "calendar_event_id": cal_event_uuid,
+                            "interaction_id": interaction_uuid,
+                            "tenant_id": tenant_uuid,
+                            "confidence": match_confidence,
+                            "method": match_method,
+                        },
+                    )
+
+                await session.commit()
+                logger.info(
+                    f"Contact links persisted: interaction_id={interaction_id}, "
+                    f"contacts={len(contact_ids)}, "
+                    f"calendar_event={'yes' if calendar_event_id else 'no'}"
+                )
+
+            except Exception as e:
+                await session.rollback()
+                logger.error(
+                    f"Contact link persistence failed (non-fatal): "
+                    f"interaction_id={interaction_id}, error={e}",
+                    exc_info=True,
+                )

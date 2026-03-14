@@ -17,6 +17,7 @@ from models.envelope import EnvelopeV1, ContentModel
 from services.batch_cleaner_service import BatchCleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
+from services.transcript_enrichment import TranscriptEnrichmentService
 from utils.context_utils import get_auth_context
 
 logger = logging.getLogger(__name__)
@@ -65,13 +66,29 @@ async def clean_text(body: TextCleanRequest, request: Request):
             detail="text field cannot contain only whitespace"
         )
     
+    # Enrich transcript with calendar event contacts + front-matter
+    enrichment_service = TranscriptEnrichmentService()
+    transcript_ts = datetime.now(timezone.utc)
+    enrichment = await enrichment_service.enrich(
+        tenant_id=context.tenant_id,
+        transcript_timestamp=transcript_ts,
+        raw_transcript=body.text,
+        user_name=context.user_name,
+        account_id=context.account_id,
+    )
+
+    # Prepend front-matter to text before cleaning (LLM sees attendee context)
+    text_for_cleaning = body.text
+    if enrichment.front_matter:
+        text_for_cleaning = enrichment.front_matter + "\n\n" + body.text
+
     # Clean text using BatchCleanerService
     try:
         cleaner_service = BatchCleanerService()
         logger.info(
             f"Starting text cleaning: interaction_id={context.interaction_id}"
         )
-        cleaned_text = await cleaner_service.clean_transcript(body.text)
+        cleaned_text = await cleaner_service.clean_transcript(text_for_cleaning)
         logger.info(
             f"Text cleaning complete: interaction_id={context.interaction_id}, "
             f"cleaned_length={len(cleaned_text)}"
@@ -85,19 +102,27 @@ async def clean_text(body: TextCleanRequest, request: Request):
             exc_info=True
         )
         cleaned_text = body.text
-    
+
     # Build extras dict: merge request metadata with optional user_name
     extras = dict(body.metadata) if body.metadata else {}
     if context.user_name:
         extras["user_name"] = context.user_name
+
+    # Add enrichment metadata to extras
+    extras.update(enrichment.to_extras_dict())
+
+    # Include front-matter in content.text for downstream LLMs
+    content_text = cleaned_text
+    if enrichment.front_matter:
+        content_text = enrichment.front_matter + "\n\n" + cleaned_text
 
     # Build EnvelopeV1 with interaction_type="note" (Requirement 3.5)
     envelope = EnvelopeV1(
         tenant_id=UUID(context.tenant_id),
         user_id=context.user_id,
         interaction_type=body.interaction_type,
-        content=ContentModel(text=cleaned_text, format="plain"),
-        timestamp=datetime.now(timezone.utc),
+        content=ContentModel(text=content_text, format="plain"),
+        timestamp=transcript_ts,
         source=body.source,
         extras=extras,
         interaction_id=UUID(context.interaction_id),
@@ -129,6 +154,10 @@ async def clean_text(body: TextCleanRequest, request: Request):
                 trace_id=context.trace_id,
                 interaction_type=body.interaction_type,
                 account_id=context.account_id,
+                contact_ids=enrichment.contact_ids or None,
+                calendar_event_id=enrichment.calendar_event_id,
+                enrichment_confidence=enrichment.match_confidence,
+                enrichment_match_method=enrichment.match_method,
             )
         except Exception as e:
             logger.error(

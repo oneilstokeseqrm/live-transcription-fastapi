@@ -443,23 +443,48 @@ async def _process_upload_job(job_id: str, tenant_id: str):
                     await session.commit()
             return
 
+        # Enrich transcript with calendar event contacts
+        from services.transcript_enrichment import TranscriptEnrichmentService
+        enrichment_service = TranscriptEnrichmentService()
+        transcript_ts = datetime.now(timezone.utc)
+        enrichment = await enrichment_service.enrich(
+            tenant_id=tenant_id,
+            transcript_timestamp=transcript_ts,
+            raw_transcript=raw_transcript,
+            user_name=user_name,
+            account_id=account_id,
+        )
+
+        # Prepend front-matter before cleaning
+        text_for_cleaning = raw_transcript
+        if enrichment.front_matter:
+            text_for_cleaning = enrichment.front_matter + "\n\n" + raw_transcript
+
         # Clean transcript
         cleaner_service = BatchCleanerService()
         logger.info(f"Cleaning transcript: job_id={job_id}")
-        cleaned_transcript = await cleaner_service.clean_transcript(raw_transcript)
+        cleaned_transcript = await cleaner_service.clean_transcript(text_for_cleaning)
 
         # Build extras dict with optional user_name for downstream speaker attribution
         extras = {}
         if user_name:
             extras["user_name"] = user_name
 
+        # Add enrichment metadata to extras
+        extras.update(enrichment.to_extras_dict())
+
+        # Include front-matter in content.text for downstream LLMs
+        content_text = cleaned_transcript
+        if enrichment.front_matter:
+            content_text = enrichment.front_matter + "\n\n" + cleaned_transcript
+
         # Build envelope
         envelope = EnvelopeV1(
             tenant_id=uuid.UUID(tenant_id),
             user_id=user_id,
             interaction_type="transcript",
-            content=ContentModel(text=cleaned_transcript, format="diarized"),
-            timestamp=datetime.now(timezone.utc),
+            content=ContentModel(text=content_text, format="diarized"),
+            timestamp=transcript_ts,
             source="upload",
             extras=extras,
             interaction_id=uuid.UUID(interaction_id),
@@ -485,7 +510,11 @@ async def _process_upload_job(job_id: str, tenant_id: str):
                     interaction_id=interaction_id,
                     tenant_id=tenant_id,
                     trace_id=trace_id,
-                    interaction_type="batch_upload"
+                    interaction_type="batch_upload",
+                    contact_ids=enrichment.contact_ids or None,
+                    calendar_event_id=enrichment.calendar_event_id,
+                    enrichment_confidence=enrichment.match_confidence,
+                    enrichment_match_method=enrichment.match_method,
                 )
             except Exception as e:
                 logger.error(f"Lane 2 error: job_id={job_id}, error={e}")

@@ -15,6 +15,7 @@ from services.event_publisher import EventPublisher
 from services.cleaner_service import CleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
+from services.transcript_enrichment import TranscriptEnrichmentService
 from models.envelope import EnvelopeV1, ContentModel
 from models.request_context import RequestContext
 from middleware.jwt_auth import verify_internal_jwt, extract_bearer_token, JWTVerificationError
@@ -345,10 +346,28 @@ async def websocket_endpoint(websocket: WebSocket):
                         f"session_id={session_id}, error={e}"
                     )
 
-                # Step 2: Clean and structure the transcript
+                # Step 2: Enrich transcript with calendar event contacts
+                enrichment_service = TranscriptEnrichmentService()
+                transcript_ts = datetime.now(timezone.utc)
+                conference_url_val = desktop_config.get("conference_url") if desktop_config else None
+                enrichment = await enrichment_service.enrich(
+                    tenant_id=context.tenant_id if context else os.getenv('MOCK_TENANT_ID', 'default_org'),
+                    transcript_timestamp=transcript_ts,
+                    raw_transcript=raw_transcript,
+                    conference_url=conference_url_val,
+                    user_name=context.user_name if context else None,
+                    account_id=context.account_id if context else None,
+                )
+
+                # Prepend front-matter before cleaning
+                text_for_cleaning = raw_transcript
+                if enrichment.front_matter:
+                    text_for_cleaning = enrichment.front_matter + "\n\n" + raw_transcript
+
+                # Step 3: Clean and structure the transcript
                 logger.info(f"Starting transcript cleaning: session_id={session_id}")
                 meeting_output = await cleaner_service.clean_transcript(
-                    raw_transcript,
+                    text_for_cleaning,
                     session_id
                 )
                 logger.info(f"Transcript cleaning complete: session_id={session_id}")
@@ -372,31 +391,39 @@ async def websocket_endpoint(websocket: WebSocket):
                         f"session_id={session_id}, error={e}"
                     )
 
-                # Step 4: Async Fork — Lane 1 (publish) + Lane 2 (intelligence)
-                tenant_id = context.tenant_id if context else os.getenv('MOCK_TENANT_ID', 'default_org')
-                user_id = context.user_id if context else "websocket_user"
-                pg_user_id = context.pg_user_id if context else None
-                user_name = context.user_name if context else None
-                trace_id = context.trace_id if context else str(uuid.uuid4())
+                # Step 5: Async Fork — Lane 1 (publish) + Lane 2 (intelligence)
+                ws_tenant_id = context.tenant_id if context else os.getenv('MOCK_TENANT_ID', 'default_org')
+                ws_user_id = context.user_id if context else "websocket_user"
+                ws_trace_id = context.trace_id if context else str(uuid.uuid4())
                 source = "desktop-companion" if desktop_config else "websocket"
                 extras: Dict[str, Any] = {}
                 if desktop_config:
                     extras["platform"] = desktop_config.get("platform", "unknown")
                     extras["device_id"] = desktop_config.get("device_id", "unknown")
+                if context and context.user_name:
+                    extras["user_name"] = context.user_name
+
+                # Add enrichment metadata to extras
+                extras.update(enrichment.to_extras_dict())
+
+                # Include front-matter in content.text for downstream LLMs
+                content_text = meeting_output.cleaned_transcript
+                if enrichment.front_matter:
+                    content_text = enrichment.front_matter + "\n\n" + meeting_output.cleaned_transcript
 
                 async def _lane1_publish() -> Optional[dict]:
                     """Lane 1: Publish envelope to Kinesis/EventBridge."""
                     try:
                         envelope = EnvelopeV1(
-                            tenant_id=uuid.UUID(tenant_id) if len(tenant_id) == 36 else uuid.uuid4(),
-                            user_id=user_id,
+                            tenant_id=uuid.UUID(ws_tenant_id) if len(ws_tenant_id) == 36 else uuid.uuid4(),
+                            user_id=ws_user_id,
                             interaction_type="meeting",
-                            content=ContentModel(text=meeting_output.cleaned_transcript, format="diarized"),
-                            timestamp=datetime.now(timezone.utc),
+                            content=ContentModel(text=content_text, format="diarized"),
+                            timestamp=transcript_ts,
                             source=source,
                             extras=extras,
                             interaction_id=uuid.UUID(session_id),
-                            trace_id=trace_id,
+                            trace_id=ws_trace_id,
                             account_id=None,
                         )
                         aws_publisher = AWSEventPublisher()
@@ -412,9 +439,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         return await intelligence_service.process_transcript(
                             cleaned_transcript=meeting_output.cleaned_transcript,
                             interaction_id=session_id,
-                            tenant_id=tenant_id,
-                            trace_id=trace_id,
-                            interaction_type="meeting"
+                            tenant_id=ws_tenant_id,
+                            trace_id=ws_trace_id,
+                            interaction_type="meeting",
+                            contact_ids=enrichment.contact_ids or None,
+                            calendar_event_id=enrichment.calendar_event_id,
+                            enrichment_confidence=enrichment.match_confidence,
+                            enrichment_match_method=enrichment.match_method,
                         )
                     except Exception as e:
                         logger.error(f"Lane 2 (intelligence) error: session_id={session_id}, error={e}")
