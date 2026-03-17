@@ -449,9 +449,30 @@ Do not invent or assume information not stated."""
 
         async with get_async_session() as session:
             try:
-                # Create a placeholder interaction_summaries row so the FK is
-                # satisfied. summary_id is a new UUID (PK), interaction_id links
-                # back to the actual interaction.
+                # FK chain: raw_interactions → interaction_summaries → interaction_contact_links
+                # We must ensure both parent rows exist before writing contact links.
+
+                # Step 1: Ensure raw_interactions row exists (summaries-writer may
+                # have already created it; ON CONFLICT DO NOTHING is safe).
+                await session.execute(
+                    sa_text("""
+                        INSERT INTO raw_interactions (
+                            interaction_id, tenant_id, interaction_type, updated_at
+                        ) VALUES (
+                            :interaction_id, :tenant_id, :interaction_type, NOW()
+                        )
+                        ON CONFLICT (interaction_id) DO NOTHING
+                    """),
+                    {
+                        "interaction_id": interaction_uuid,
+                        "tenant_id": tenant_uuid,
+                        "interaction_type": interaction_type,
+                    },
+                )
+
+                # Step 2: Create interaction_summaries placeholder row.
+                # summary_id is a new UUID (PK), interaction_id links back
+                # to raw_interactions.
                 summary_uuid = uuid4()
                 await session.execute(
                     sa_text("""
