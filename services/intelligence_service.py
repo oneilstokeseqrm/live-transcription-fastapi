@@ -122,6 +122,7 @@ class IntelligenceService:
                     interaction_id=interaction_id,
                     tenant_id=tenant_id,
                     contact_ids=contact_ids,
+                    interaction_type=interaction_type,
                     calendar_event_id=calendar_event_id,
                     match_confidence=enrichment_confidence or "medium",
                     match_method=enrichment_match_method or "time_window",
@@ -427,6 +428,7 @@ Do not invent or assume information not stated."""
         interaction_id: str,
         tenant_id: str,
         contact_ids: list[str],
+        interaction_type: str = "meeting",
         calendar_event_id: Optional[str] = None,
         match_confidence: str = "medium",
         match_method: str = "time_window",
@@ -455,16 +457,17 @@ Do not invent or assume information not stated."""
                     sa_text("""
                         INSERT INTO interaction_summaries (
                             summary_id, tenant_id, interaction_id,
-                            created_at, updated_at
+                            summary_type, created_at, updated_at
                         ) VALUES (
                             :summary_id, :tenant_id, :interaction_id,
-                            NOW(), NOW()
+                            :summary_type, NOW(), NOW()
                         )
                     """),
                     {
                         "summary_id": summary_uuid,
                         "tenant_id": tenant_uuid,
                         "interaction_id": interaction_uuid,
+                        "summary_type": interaction_type,
                     },
                 )
 
