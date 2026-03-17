@@ -433,15 +433,43 @@ Do not invent or assume information not stated."""
     ) -> None:
         """Persist interaction↔contact and calendar↔interaction links.
 
-        Written AFTER _persist_intelligence so that interaction_summaries rows
-        exist (FK dependency). Uses ON CONFLICT DO NOTHING for idempotency.
+        Both interaction_contact_links.interaction_id and
+        calendar_event_interaction_links.interaction_id FK to
+        interaction_summaries.summary_id (not to the raw interaction_id).
+
+        The interaction_summaries row is normally created by the summaries-writer
+        service asynchronously, so it may not exist yet. We create a minimal
+        placeholder row so the FK is satisfied. The summaries-writer will create
+        its own separate row later (no unique constraint on interaction_id).
         """
         interaction_uuid = UUID(interaction_id)
         tenant_uuid = UUID(tenant_id)
 
         async with get_async_session() as session:
             try:
+                # Create a placeholder interaction_summaries row so the FK is
+                # satisfied. summary_id is a new UUID (PK), interaction_id links
+                # back to the actual interaction.
+                summary_uuid = uuid4()
+                await session.execute(
+                    sa_text("""
+                        INSERT INTO interaction_summaries (
+                            summary_id, tenant_id, interaction_id,
+                            created_at, updated_at
+                        ) VALUES (
+                            :summary_id, :tenant_id, :interaction_id,
+                            NOW(), NOW()
+                        )
+                    """),
+                    {
+                        "summary_id": summary_uuid,
+                        "tenant_id": tenant_uuid,
+                        "interaction_id": interaction_uuid,
+                    },
+                )
+
                 # Write interaction_contact_links (summary → contact)
+                # interaction_id column actually holds summary_id per FK
                 for cid_str in contact_ids:
                     contact_uuid = UUID(cid_str)
                     await session.execute(
@@ -449,18 +477,19 @@ Do not invent or assume information not stated."""
                             INSERT INTO interaction_contact_links (
                                 link_id, interaction_id, contact_id
                             ) VALUES (
-                                :link_id, :interaction_id, :contact_id
+                                :link_id, :summary_id, :contact_id
                             )
                             ON CONFLICT DO NOTHING
                         """),
                         {
                             "link_id": uuid4(),
-                            "interaction_id": interaction_uuid,
+                            "summary_id": summary_uuid,
                             "contact_id": contact_uuid,
                         },
                     )
 
                 # Write calendar_event_interaction_links (if we matched a calendar event)
+                # interaction_id column also holds summary_id per FK
                 if calendar_event_id:
                     cal_event_uuid = UUID(calendar_event_id)
                     await session.execute(
@@ -469,7 +498,7 @@ Do not invent or assume information not stated."""
                                 id, calendar_event_id, interaction_id, tenant_id,
                                 match_confidence, match_method, created_at
                             ) VALUES (
-                                :id, :calendar_event_id, :interaction_id, :tenant_id,
+                                :id, :calendar_event_id, :summary_id, :tenant_id,
                                 :confidence, :method, NOW()
                             )
                             ON CONFLICT (calendar_event_id, interaction_id) DO NOTHING
@@ -477,7 +506,7 @@ Do not invent or assume information not stated."""
                         {
                             "id": uuid4(),
                             "calendar_event_id": cal_event_uuid,
-                            "interaction_id": interaction_uuid,
+                            "summary_id": summary_uuid,
                             "tenant_id": tenant_uuid,
                             "confidence": match_confidence,
                             "method": match_method,
@@ -487,6 +516,7 @@ Do not invent or assume information not stated."""
                 await session.commit()
                 logger.info(
                     f"Contact links persisted: interaction_id={interaction_id}, "
+                    f"summary_id={summary_uuid}, "
                     f"contacts={len(contact_ids)}, "
                     f"calendar_event={'yes' if calendar_event_id else 'no'}"
                 )
