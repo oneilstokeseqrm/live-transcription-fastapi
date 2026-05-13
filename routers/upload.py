@@ -89,6 +89,7 @@ router = APIRouter(prefix="/upload", tags=["upload"])
 class UploadInitRequest(BaseModel):
     """Request model for POST /upload/init"""
     filename: str = Field(..., min_length=1, max_length=255)
+    account_id: str = Field(..., min_length=1, description="Account anchor; required.")
     mime_type: str = Field(default="audio/wav")
     file_size: Optional[int] = Field(default=None, ge=1, le=500_000_000)  # Max 500MB
 
