@@ -55,12 +55,31 @@ def mock_services():
         yield
 
 
-def test_text_clean_rejects_missing_account_id(client: TestClient):
-    """Auth succeeds, but missing X-Account-ID must produce 400 from the auth-context layer."""
+def test_text_clean_rejects_missing_body_account_id(client: TestClient):
+    """Pydantic layer rejects bodies without account_id with 422 (Phase 1 / T1.5)."""
     token = _make_jwt()
     response = client.post(
         "/text/clean",
         json={"text": "hello world"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": "acct-1",  # present so we test the body layer, not the header layer
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert "account_id" in response.text.lower()
+
+
+def test_text_clean_rejects_missing_account_id_header(client: TestClient):
+    """Auth-context layer rejects missing X-Account-ID header with 400 (Phase 1 / T1.4).
+
+    Body contains a valid account_id so Pydantic validation passes; the 400
+    must come from get_auth_context()'s header check.
+    """
+    token = _make_jwt()
+    response = client.post(
+        "/text/clean",
+        json={"text": "hello world", "account_id": "acct-1"},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 400, response.text
