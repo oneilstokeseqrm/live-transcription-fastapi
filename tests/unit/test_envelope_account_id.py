@@ -1,13 +1,15 @@
 """Verify EnvelopeV1 requires account_id at construction time."""
 
 import uuid
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 from datetime import datetime, timezone
 from models.envelope import EnvelopeV1, ContentModel
 
 
-def _base_kwargs():
+def _base_kwargs() -> dict[str, Any]:
     return dict(
         tenant_id=uuid.uuid4(),
         user_id="user-1",
