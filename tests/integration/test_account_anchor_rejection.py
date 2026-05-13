@@ -67,9 +67,8 @@ def test_text_clean_rejects_missing_account_id(client: TestClient):
     assert "x-account-id" in response.text.lower()
 
 
-def test_text_clean_does_not_400_when_account_id_present(
-    client: TestClient, mock_services
-):
+@pytest.mark.usefixtures("mock_services")
+def test_text_clean_does_not_400_when_account_id_present(client: TestClient):
     """With X-Account-ID header present, the auth-context 400 must NOT fire.
 
     Downstream validation (e.g. request-body shape, Task 1.5+) may still return
