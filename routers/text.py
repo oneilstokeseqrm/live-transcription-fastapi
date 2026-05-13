@@ -127,7 +127,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
         extras=extras,
         interaction_id=UUID(context.interaction_id),
         trace_id=context.trace_id,
-        account_id=context.account_id,
+        account_id=body.account_id,
         pg_user_id=context.pg_user_id,
     )
     
@@ -153,7 +153,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
                 tenant_id=context.tenant_id,
                 trace_id=context.trace_id,
                 interaction_type=body.interaction_type,
-                account_id=context.account_id,
+                account_id=body.account_id,
                 contact_ids=enrichment.contact_ids or None,
                 calendar_event_id=enrichment.calendar_event_id,
                 enrichment_confidence=enrichment.match_confidence,
