@@ -78,7 +78,7 @@ class UploadJob(SQLModel, table=True):
     # Processing correlation
     interaction_id: UUID = Field(sa_column_kwargs={"name": "interaction_id"})
     trace_id: Optional[str] = Field(default=None, sa_column=Column(Text, name="trace_id"))
-    account_id: Optional[str] = Field(default=None, sa_column=Column(Text, name="account_id"))
+    account_id: str = Field(sa_column=Column(Text, name="account_id"))
 
     # Result/error storage
     error_message: Optional[str] = Field(default=None, sa_column=Column(Text, name="error_message"))

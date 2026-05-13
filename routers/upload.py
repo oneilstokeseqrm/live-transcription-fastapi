@@ -159,6 +159,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
         tenant_id=uuid.UUID(context.tenant_id),
         user_id=context.user_id,
         pg_user_id=context.pg_user_id,
+        account_id=body.account_id,
         user_name=context.user_name,
         job_type=JobType.audio_transcription,
         status=JobStatus.queued,
@@ -168,7 +169,6 @@ async def upload_init(body: UploadInitRequest, request: Request):
         file_size=body.file_size,
         interaction_id=uuid.UUID(interaction_id),
         trace_id=context.trace_id,
-        account_id=context.account_id,
     )
 
     try:
