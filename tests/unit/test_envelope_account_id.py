@@ -34,4 +34,4 @@ def test_envelope_accepts_string_account_id():
 
 def test_envelope_rejects_none_account_id():
     with pytest.raises(ValidationError):
-        EnvelopeV1(**_base_kwargs(), account_id=None)
+        EnvelopeV1(**_base_kwargs(), account_id=None)  # type: ignore[arg-type]
