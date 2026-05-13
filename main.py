@@ -457,6 +457,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 ws_tenant_id = context.tenant_id if context else os.getenv('MOCK_TENANT_ID', 'default_org')
                 ws_user_id = context.user_id if context else "websocket_user"
                 ws_trace_id = context.trace_id if context else str(uuid.uuid4())
+                ws_account_id = (
+                    context.account_id if context
+                    else os.getenv('MOCK_ACCOUNT_ID', 'default_account')
+                )
                 source = "desktop-companion" if desktop_config else "websocket"
                 extras: Dict[str, Any] = {}
                 if desktop_config:
@@ -486,7 +490,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             extras=extras,
                             interaction_id=uuid.UUID(session_id),
                             trace_id=ws_trace_id,
-                            account_id=None,
+                            account_id=ws_account_id,  # was None — required since Task 1.3
                         )
                         aws_publisher = AWSEventPublisher()
                         return await aws_publisher.publish_envelope(envelope)
