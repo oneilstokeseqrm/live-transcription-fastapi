@@ -506,6 +506,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             cleaned_transcript=meeting_output.cleaned_transcript,
                             interaction_id=session_id,
                             tenant_id=ws_tenant_id,
+                            account_id=ws_account_id,
                             trace_id=ws_trace_id,
                             interaction_type="meeting",
                             contact_ids=enrichment.contact_ids or None,
