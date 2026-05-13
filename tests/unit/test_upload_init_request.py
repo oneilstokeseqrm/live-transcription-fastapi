@@ -3,6 +3,7 @@
 import pytest
 from pydantic import ValidationError
 from routers.upload import UploadInitRequest
+from models.participant_spec import ParticipantSpec
 
 
 def test_rejects_missing_account_id():
@@ -42,3 +43,13 @@ def test_upload_job_requires_account_id():
             "interaction_id": uuid.uuid4(),
             "created_at": datetime.now(timezone.utc),
         })
+
+
+def test_upload_init_accepts_participants():
+    req = UploadInitRequest(
+        filename="x.wav",
+        account_id="acct-1",
+        participants=[ParticipantSpec(email="a@b.com")],
+    )
+    assert req.participants is not None
+    assert len(req.participants) == 1

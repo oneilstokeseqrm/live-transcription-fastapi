@@ -43,6 +43,7 @@ from models.job_models import (
     UploadCompleteRequest,
     UploadCompleteResponse,
 )
+from models.participant_spec import ParticipantSpec
 from services.s3_service import S3Service, S3ServiceError
 from services.database import get_async_session
 from utils.context_utils import get_auth_context
@@ -92,6 +93,10 @@ class UploadInitRequest(BaseModel):
     account_id: str = Field(..., min_length=1, description="Account anchor; required.")
     mime_type: str = Field(default="audio/wav")
     file_size: Optional[int] = Field(default=None, ge=1, le=500_000_000)  # Max 500MB
+    participants: Optional[list[ParticipantSpec]] = Field(
+        default=None,
+        description="Caller-provided participants; flows through UploadJob to worker.",
+    )
 
 
 # --- Endpoints ---
