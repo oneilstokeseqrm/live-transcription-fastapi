@@ -2,7 +2,7 @@
 
 **Project:** Contact Quality and Account-Anchoring Initiative
 **Last session:** 2026-05-13 (Phase 1 implementation)
-**Status:** Phase 1 IMPLEMENTED and self-verified. Cross-repo eq-email-pipeline PR pending merge. Phase 1 PR in this repo to be opened/merged once eq-email-pipeline lands. Phase 1.5 (worker + outbox + queue UI) is the next major scope.
+**Status:** Phase 1 IMPLEMENTED across both repos. **Both PRs open and ready for review/merge:** live-transcription-fastapi PR #10 + eq-email-pipeline PR #6. eq-frontend PR #349 already merged. Phase 1 ships once both PRs are merged. Phase 1.5 (worker + outbox + queue UI) is the next major scope.
 
 ---
 
@@ -10,9 +10,9 @@
 
 1. **You're starting from a working Phase 1 implementation.** Branch `feat/contact-quality-phase-1` has 24 commits ahead of `main` implementing the model-layer tightening, ingestion-path rejection, three-state branching, queue insertion machinery, and self-review docs. Don't re-implement what's already there.
 
-2. **Two cross-repo PRs live outside this repo:**
+2. **Two cross-repo PRs live outside this repo, both READY:**
    - **eq-frontend PR #349** — MERGED. Adds 8 columns to `pending_account_mappings`, creates `pending_account_mapping_signals` table, adds nullable `raw_interactions.account_id`. Schema is live on Neon eq-dev.
-   - **eq-email-pipeline PR** — PENDING merge as of last session end. Implements three-state branching in `src/pipeline/calendar_sync.py` and `src/pipeline/orchestrator.py`. The cross-repo agent finished its dispatch; verify the PR is merged before opening the Phase 1 PR here.
+   - **eq-email-pipeline PR #6** — OPEN, ready for review. 43 directly-relevant tests pass; 379 total tests pass. Implements three-state branching in `src/pipeline/calendar_sync.py` and `src/pipeline/orchestrator.py`. Mirrors the primitives locally (asyncpg-translated SQL, same semantics as live-transcription-fastapi). No upstream caller changes needed in that repo.
 
 3. **The user is a non-developer founder.** Make confident technical calls on subagent dispatch, error recovery, and review judgments. Surface only product/strategic decisions. The user explicitly said: "Make the reasonable call and continue; they'll redirect if needed."
 
@@ -22,29 +22,29 @@
 
 ## What this session does
 
-The exact next move depends on the eq-email-pipeline cross-repo PR state. Branch:
+Both Phase 1 PRs are already open and ready for review. Three steps to ship Phase 1:
 
-### If eq-email-pipeline PR has NOT yet merged
-
-Step 1 — verify status of the cross-repo PR. The dispatching agent's report (in last session's transcript) should have the PR URL. Open it; check CI status; ping the user if review is blocked.
-
-Step 2 — once it's merged, proceed to open the Phase 1 PR in this repo (T1.28 below).
-
-### If eq-email-pipeline PR has merged
-
-Step 1 — open the Phase 1 PR in this repo. The plan's T1.28 has the exact `gh pr create` command and body template. Push the branch first:
+### Step 1 — Review and merge PR #6 (eq-email-pipeline)
 
 ```bash
-cd /Users/peteroneil/EQ-CORE/live-transcription-fastapi
-git checkout feat/contact-quality-phase-1
-git push -u origin feat/contact-quality-phase-1
+gh pr view 6 --repo oneilstokeseqrm/eq-email-pipeline
+# Review the diff; check CI status
+gh pr merge 6 --repo oneilstokeseqrm/eq-email-pipeline --squash --delete-branch
 ```
 
-Then open the PR using the body template at `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` (Task 1.28 Step 2).
+### Step 2 — Review and merge PR #10 (live-transcription-fastapi)
 
-Step 2 — wait for CI + review, merge with `gh pr merge --squash --delete-branch`, confirm Railway auto-deploys via the `/canary` skill or Railway dashboard.
+```bash
+gh pr view 10 --repo oneilstokeseqrm/live-transcription-fastapi
+# Optional: run `/codex review` interactively on the diff for adversarial check
+gh pr merge 10 --repo oneilstokeseqrm/live-transcription-fastapi --squash --delete-branch
+```
 
-Step 3 — Phase 1 is officially shipped. Auto-memory project status updates to `PHASE_1_SHIPPED_PHASE_1_5_PENDING`.
+### Step 3 — Confirm Railway auto-deploy
+
+Railway auto-deploys live-transcription-fastapi on main merge. Verify via the `/canary` skill or the Railway dashboard. Once green, Phase 1 is officially shipped.
+
+After Phase 1 ships, update auto-memory project status to `PHASE_1_SHIPPED_PHASE_1_5_PENDING` and proceed to Phase 1.5 in a separate session if context is fresh.
 
 ### After Phase 1 ships — Phase 1.5
 
