@@ -54,9 +54,9 @@ class IntelligenceService:
         cleaned_transcript: str,
         interaction_id: str,
         tenant_id: str,
+        account_id: str,
         trace_id: str,
         interaction_type: str = "meeting",
-        account_id: Optional[str] = None,
         interaction_timestamp: Optional[datetime] = None,
         persona_code: str = "gtm",
         contact_ids: Optional[list[str]] = None,
@@ -70,9 +70,9 @@ class IntelligenceService:
             cleaned_transcript: The cleaned transcript text to analyze.
             interaction_id: Unique identifier for this interaction.
             tenant_id: Tenant identifier for multi-tenancy.
+            account_id: Required account identifier (co-required identity with tenant_id).
             trace_id: Trace ID for observability.
             interaction_type: Type of interaction (meeting, note, etc.).
-            account_id: Optional account identifier.
             interaction_timestamp: When the interaction occurred.
             persona_code: Persona code for extraction context (default: gtm).
             contact_ids: Optional list of resolved contact UUIDs from enrichment.

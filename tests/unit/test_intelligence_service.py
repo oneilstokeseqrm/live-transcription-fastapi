@@ -218,34 +218,38 @@ class TestProcessTranscript:
         """Test that process_transcript returns None when extraction fails."""
         # Mock extraction to return None
         service._extract_intelligence = AsyncMock(return_value=None)
-        
+
         result = await service.process_transcript(
             cleaned_transcript="Test transcript",
             interaction_id="550e8400-e29b-41d4-a716-446655440000",
             tenant_id="550e8400-e29b-41d4-a716-446655440001",
+            # T1.8: account_id is now required (no default); pass a placeholder UUID.
+            account_id="550e8400-e29b-41d4-a716-446655440003",
             trace_id="550e8400-e29b-41d4-a716-446655440002",
             interaction_type="meeting"
         )
-        
+
         assert result is None
-    
+
     @pytest.mark.asyncio
     async def test_process_transcript_returns_none_on_persistence_failure(self, service, mock_analysis):
         """Test that process_transcript returns None when persistence fails."""
         # Mock extraction to succeed
         service._extract_intelligence = AsyncMock(return_value=mock_analysis)
-        
+
         # Mock persistence to fail
         service._persist_intelligence = AsyncMock(side_effect=Exception("DB Error"))
-        
+
         result = await service.process_transcript(
             cleaned_transcript="Test transcript",
             interaction_id="550e8400-e29b-41d4-a716-446655440000",
             tenant_id="550e8400-e29b-41d4-a716-446655440001",
+            # T1.8: account_id is now required (no default); pass a placeholder UUID.
+            account_id="550e8400-e29b-41d4-a716-446655440003",
             trace_id="550e8400-e29b-41d4-a716-446655440002",
             interaction_type="meeting"
         )
-        
+
         assert result is None
 
 
@@ -264,7 +268,25 @@ class TestServiceInitialization:
     def test_service_uses_env_model(self, mock_instructor):
         """Test that service uses OPENAI_MODEL from environment."""
         from services.intelligence_service import IntelligenceService
-        
+
         with patch.dict('os.environ', {'OPENAI_MODEL': 'gpt-4-turbo'}):
             service = IntelligenceService()
             assert service.model == "gpt-4-turbo"
+
+
+import inspect
+from services.intelligence_service import IntelligenceService
+
+
+def test_process_transcript_requires_account_id():
+    sig = inspect.signature(IntelligenceService.process_transcript)
+    param = sig.parameters["account_id"]
+    # Required = no default
+    assert param.default is inspect.Parameter.empty, (
+        "process_transcript(account_id) must be required (no default), "
+        f"got default={param.default!r}"
+    )
+    # And the annotation should not be Optional
+    assert "Optional" not in str(param.annotation), (
+        f"account_id annotation should not be Optional, got {param.annotation}"
+    )
