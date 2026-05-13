@@ -89,9 +89,9 @@ class EnvelopeV1(BaseModel):
         None,
         description="Distributed tracing identifier"
     )
-    account_id: Optional[str] = Field(
-        None,
-        description="Optional account identifier for CRM/sales context"
+    account_id: str = Field(
+        ...,
+        description="Account anchor for the interaction. Required for all ingestion paths; backend rejects requests where it cannot be resolved."
     )
     pg_user_id: Optional[str] = Field(
         None,
