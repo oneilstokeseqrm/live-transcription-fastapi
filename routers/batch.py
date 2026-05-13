@@ -237,6 +237,7 @@ async def process_batch_audio(file: UploadFile, request: Request):
                 cleaned_transcript=cleaned_transcript,
                 interaction_id=context.interaction_id,
                 tenant_id=context.tenant_id,
+                account_id=context.account_id,
                 trace_id=context.trace_id,
                 interaction_type="batch_upload",
                 contact_ids=enrichment.contact_ids or None,
