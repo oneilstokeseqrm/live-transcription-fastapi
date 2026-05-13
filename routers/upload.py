@@ -515,6 +515,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
                     cleaned_transcript=cleaned_transcript,
                     interaction_id=interaction_id,
                     tenant_id=tenant_id,
+                    account_id=account_id,
                     trace_id=trace_id,
                     interaction_type="batch_upload",
                     contact_ids=enrichment.contact_ids or None,
