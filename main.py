@@ -268,12 +268,22 @@ async def websocket_endpoint(websocket: WebSocket):
     if token:
         try:
             claims = verify_internal_jwt(token)
+            # Account anchor must be supplied via header; backend rejects when absent.
+            # WebSocket headers are lowercased by Starlette.
+            account_id = websocket.headers.get("x-account-id")
+            if not account_id:
+                logger.warning(
+                    f"WebSocket /listen rejected: missing X-Account-ID, "
+                    f"session_id={session_id}"
+                )
+                await websocket.close(code=1008, reason="X-Account-ID required")
+                return
             context = RequestContext(
                 tenant_id=claims.tenant_id,
                 user_id=claims.user_id,
                 pg_user_id=claims.pg_user_id,
                 user_name=claims.user_name,
-                account_id=None,
+                account_id=account_id,
                 interaction_id=session_id,
                 trace_id=str(uuid.uuid4()),
             )
