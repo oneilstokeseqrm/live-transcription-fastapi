@@ -180,6 +180,36 @@ Contacts are created in Postgres by exactly **two services**. No other service c
 
 Downstream services (eq-structured-graph-core, action-item-graph, opportunity-forecasting) **never create contacts in Postgres**. They receive already-resolved contact_ids via EventBridge envelopes and use them to create/update graph relationships in Neo4j.
 
+### 3.4 Three-State Per-Attendee Branching (Phase 1, since 2026-05-13)
+
+Phase 1 of the Contact Quality Initiative tightened the contact-creation contract end-to-end. Every contact-creation path (transcript pipeline + email pipeline) now applies three-state branching on the attendee/correspondent's email domain:
+
+| Domain class | Behavior | Where the data lives |
+|---|---|---|
+| **PERSONAL** (gmail.com, outlook.com, etc.) | Skip entirely. No contact, no signal, no interaction link. | Nowhere — these are filtered out at ingestion. |
+| **INTERNAL** (matches tenant's connected `provider_connections`, excluding public domains) | Skip queue path. Phase 2 wires internal-user contacts; Phase 1 treats as no-op. | Nowhere (today) — Phase 2 territory. |
+| **BUSINESS + known account** | Find-or-create contact with `account_id=<looked-up>`; create `interaction_contact_links` row. | `contacts` + `interaction_contact_links` |
+| **BUSINESS + unknown account** | NO contact, NO link. Insert/upsert into `pending_account_mappings` + insert into `pending_account_mapping_signals` capturing email/display_name/role. | `pending_account_mappings` + `pending_account_mapping_signals` (queue tables) |
+
+**NEVER falls back to anchor account** when domain lookup misses. This was the bug Codex flagged in the 2026-05-12 design review (fallback-to-anchor preserved misattribution).
+
+**Backend rejection of missing account_id** at every ingestion path:
+- WebSocket `/listen`: closes upgrade with code 1008 if `X-Account-ID` header is absent.
+- `/text/clean`, `/batch/process`, `/upload/init`: return 400 (auth-context layer) if header is absent, or 422 (Pydantic layer) if body field is missing — depending on which validation fires first.
+
+**Owner determination** (locked 2026-05-13):
+- Transcript signals: the recording user (authenticated `pg_user_id` on the request).
+- Email signals: the user whose `provider_connection` sent/received the email.
+- Calendar signals: the user whose `provider_connection` surfaced the calendar event.
+- First-owner-wins under concurrency: subsequent UPSERTs on `(tenant_id, domain)` never reassign owner.
+
+**Queue lifecycle Phase 1.5** (deferred):
+- Worker processes `status='approved'` entries via `eq-agent-action-core POST /api/enrich`.
+- Outbox-backed durability (`account_provisioning_outbox`) prevents Postgres/Neo4j divergence.
+- Queue UI exposes Approve / Map / Ignore actions to the owner.
+
+**Reference:** `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` (canonical design doc).
+
 ---
 
 ## 4. Contact Flow Through the Pipeline
