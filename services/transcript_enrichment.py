@@ -511,12 +511,33 @@ class TranscriptEnrichmentService:
                     "tavily_lookups": tavily_lookups,
                 }
 
-            # Create new contact
+            # Create new contact.
+            #
+            # Under Option A (T1.21+T1.22), `_resolve_contact` is ONLY
+            # reached for BUSINESS-domain attendees whose domain resolves
+            # to a known account_id; the caller passes that resolved
+            # account_id here. The orphan path that previously inherited
+            # the anchor account for unknown-domain attendees is GONE —
+            # those attendees now route to pending_account_mappings via
+            # the per-attendee branching in enrich(), with NO contact
+            # created.
+            #
+            # `validation_status="pending"` remains as the default for
+            # newly created contacts because the Prisma enum only permits
+            # pending|verified|discarded. Phase 2 design Section 7.4 covers
+            # the schema-debt cleanup for a richer state model. The
+            # name-unresolvable flag below is independent of the (now
+            # removed) account-orphan concept.
+            if not account_id:
+                # Defense-in-depth: post-T1.21, only known-account paths
+                # call into this helper. Loud failure makes regressions
+                # impossible to ship silently.
+                raise ValueError(
+                    "transcript_enrichment: _resolve_contact called without "
+                    "account_id; Option A forbids orphan contact creation."
+                )
             new_id = uuid.uuid4()
-            aid = uuid.UUID(account_id) if account_id else None
-            # Always "pending" — Prisma enum only allows pending|verified|discarded.
-            # Name-unresolvable contacts are flagged via pending_validations table below.
-            validation_status = "pending"
+            aid = uuid.UUID(account_id)
 
             await session.execute(
                 text("""
@@ -525,7 +546,7 @@ class TranscriptEnrichmentService:
                         source, validation_status, created_at, updated_at
                     ) VALUES (
                         :id, :tenant_id, :email, :first_name, :last_name, :account_id,
-                        :source, :validation_status, NOW(), NOW()
+                        :source, 'pending', NOW(), NOW()
                     )
                 """),
                 {
@@ -536,11 +557,11 @@ class TranscriptEnrichmentService:
                     "last_name": last_name or None,
                     "account_id": aid,
                     "source": "transcript_enrichment",
-                    "validation_status": validation_status,
                 },
             )
 
-            # Flag for review if name unresolvable
+            # Flag for review if name unresolvable (independent of account
+            # resolution; this is Phase 2 schema-debt territory).
             if not first_name:
                 await self._flag_pending_validation(
                     session, tid, new_id, "name_unresolvable"
