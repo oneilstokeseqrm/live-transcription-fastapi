@@ -22,6 +22,11 @@ class TextCleanRequest(BaseModel):
         ...,
         description="Raw text to clean"
     )
+    account_id: str = Field(
+        ...,
+        min_length=1,
+        description="Account anchor for the interaction. Required.",
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional metadata to include in extras"
