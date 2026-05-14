@@ -182,6 +182,17 @@ APPROVE_SQL = text("""
 # handler re-SELECTs to return 409 for mapped/creating or fall through to
 # the idempotent 200 for already-ignored.
 #
+# Codex Round 4 P2 #2: `AND archived_at IS NULL` filter prevents /ignore
+# from overwriting rows archived by other flows. The expiry sweeper
+# (Task 1.5.12) sets archived_at without necessarily changing status to
+# 'ignored'. Pre-fix, a sweeper-archived pending row would fall through to
+# IGNORE_SQL because the early /ignore short-circuit only fires on
+# status='ignored', and IGNORE_SQL had no archived_at filter — so the
+# UPDATE clobbered the sweeper's archive_reason with 'owner_ignored' and
+# overwrote ignored_at + ignored_by. Post-fix: any non-NULL archived_at
+# (regardless of who archived it) makes IGNORE_SQL noop (0 rows) and the
+# handler returns 200 idempotently without further mutation.
+#
 # RETURNING id::text is required so the handler can detect 0-row noops via
 # .one_or_none() without depending on result.rowcount (which has varying
 # semantics across async drivers).
@@ -194,6 +205,7 @@ IGNORE_SQL = text("""
         archive_reason = 'owner_ignored',
         updated_at = NOW()
     WHERE id = :queue_id
+      AND archived_at IS NULL
       AND status NOT IN ('mapped', 'creating', 'ignored')
     RETURNING id::text
 """)
@@ -487,28 +499,40 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
                 if current is None:
                     raise HTTPException(status_code=404, detail="Queue entry not found")
 
-                # Replay-success: the row is already mapped to the SAME
-                # account we were asked to map to. Treat as 200, caller's
-                # intent is satisfied. Materialize is NOT re-called.
+                # Codex Round 4 P2 #3: replay-success requires ALL THREE
+                # of (status='mapped', resolved_account_id matches request,
+                # AND approval_attempt_id matches request). Pre-fix the
+                # attempt_id was not checked, so Bob retrying Alice's
+                # earlier-failed /map with Bob's own attempt_id but the
+                # same account_id falsely received 200 — as if Bob's call
+                # drove the map. Per the idempotency contract, only the
+                # SAME attempt_id should get 200; a different attempt_id
+                # on an already-mapped row is a different intent → 409.
                 if (current.status == "mapped"
-                        and current.resolved_account_id == body.account_id):
+                        and current.resolved_account_id == body.account_id
+                        and current.approval_attempt_id == body.approval_attempt_id):
                     return {
                         "status": "mapped",
                         "queue_id": queue_id,
                         "account_id": body.account_id,
                     }
 
-                # Codex Round 3 P1 #1: explicit conflict messaging — /map
-                # only operates on pending entries. Approved entries are
+                # Codex Round 3 P1 #1 + Round 4 P2 #3: explicit conflict
+                # messaging. /map only operates on pending entries with a
+                # matching attempt_id for replay. Approved entries are
                 # owned by the worker (advisory-lock isolation); mapped
-                # entries are terminal. The message names the conflicting
-                # status so operators can diagnose without re-querying.
+                # entries with a different attempt_id signal a different
+                # caller intent. The message names the conflicting status
+                # so operators can diagnose without re-querying.
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        f"Map conflict: queue entry is in status='{current.status}'. "
-                        f"/map only operates on pending entries. Approved entries are "
-                        f"owned by the worker; mapped entries are terminal."
+                        f"Map conflict: queue entry is in status='{current.status}' "
+                        f"with a different approval_attempt_id or resolved_account_id "
+                        f"recorded. /map only operates on pending entries; mapped "
+                        f"entries replay successfully ONLY when the same "
+                        f"approval_attempt_id + account_id are presented. Reload and "
+                        f"retry."
                     ),
                 )
 
@@ -579,21 +603,21 @@ async def ignore_entry(queue_id: str, request: Request):
                 )
                 return {"status": "ignored", "queue_id": queue_id}
 
-            # Codex Round 3 P2 #2: IGNORE_SQL now filters
+            # Codex Round 3 P2 #2: IGNORE_SQL filters
             # `status NOT IN ('mapped', 'creating', 'ignored')` and uses
-            # RETURNING. If the UPDATE matches 0 rows, the entry is in a
-            # terminal/in-flight state we must NOT silently overwrite:
-            # materialization has succeeded ('mapped') or is in progress
-            # ('creating'). Re-SELECT to discriminate the cases.
+            # RETURNING. Codex Round 4 P2 #2: IGNORE_SQL also filters
+            # `archived_at IS NULL` so rows archived by other flows
+            # (e.g. the expiry sweeper) are never overwritten. If the
+            # UPDATE matches 0 rows, the entry is in one of:
+            #   (a) terminal mapped/creating — 409
+            #   (b) already-archived (by ANY flow) — 200 idempotent
+            #   (c) vanished — 404
             ignore_result = await session.execute(
                 IGNORE_SQL,
                 {"queue_id": queue_id, "user_id": effective_id},
             )
             if ignore_result.one_or_none() is None:
-                # 0 rows — either status is mapped/creating/ignored, or the
-                # row vanished mid-flight. The idempotent short-circuit
-                # above already handles status='ignored', so getting here
-                # with status='ignored' is a benign race — return 200.
+                # 0 rows — re-SELECT to discriminate the cases.
                 current = (await session.execute(
                     SELECT_QUEUE_SQL, {"queue_id": queue_id},
                 )).one_or_none()
@@ -601,6 +625,24 @@ async def ignore_entry(queue_id: str, request: Request):
                     raise HTTPException(
                         status_code=404, detail="Queue entry not found",
                     )
+
+                # Codex Round 4 P2 #2: ANY archived row (regardless of who
+                # archived it — owner_ignored, expiry sweeper, etc.) is
+                # idempotently a 200. /ignore on an already-archived row is
+                # a no-op; do NOT mutate. The early /ignore short-circuit at
+                # the top of this handler only fires on status='ignored',
+                # so a sweeper-archived pending row reaches here. We MUST
+                # NOT return 409 (operators didn't do anything wrong) and
+                # MUST NOT re-run IGNORE_SQL (would overwrite archive_reason).
+                if current.archived_at is not None:
+                    logger.info(
+                        "Ignore noop on already-archived entry: "
+                        "queue_id=%s, status=%s, archive_reason=%s",
+                        queue_id, current.status,
+                        current._mapping.get("archive_reason"),
+                    )
+                    return {"status": "ignored", "queue_id": queue_id}
+
                 if current.status in ("mapped", "creating"):
                     logger.info(
                         "Ignore blocked on terminal/in-flight entry: "
@@ -614,8 +656,16 @@ async def ignore_entry(queue_id: str, request: Request):
                             f"materialization already succeeded or is in progress."
                         ),
                     )
-                # status='ignored' — race with the idempotent short-circuit
-                # above; treat as 200 (defensive).
+
+                # Defensive: status that doesn't match terminal AND
+                # archived_at IS NULL but IGNORE_SQL still 0-rowed. This
+                # shouldn't happen with the current schema; surface as
+                # 200 so callers can move on. If we hit this in
+                # production, the log line below will be the breadcrumb.
+                logger.warning(
+                    "Ignore noop with unexpected state: queue_id=%s, status=%s",
+                    queue_id, current.status,
+                )
                 return {"status": "ignored", "queue_id": queue_id}
 
     return {"status": "ignored", "queue_id": queue_id}

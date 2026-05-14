@@ -1470,3 +1470,258 @@ def test_ignore_on_pending_row_still_succeeds(client: TestClient):
 # Existing test_ignore_on_already_archived_returns_200_idempotent at line 629
 # already covers /ignore on status='ignored' → 200 idempotent (the
 # short-circuit fires before IGNORE_SQL runs).
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 4 fixes
+# ---------------------------------------------------------------------------
+
+# P2 #2 — /ignore must NOT overwrite rows archived by other flows.
+#
+# Pre-fix IGNORE_SQL had no `AND archived_at IS NULL` clause, so a row
+# archived by the (forthcoming) expiry sweeper — `archived_at != NULL` but
+# status still 'pending' — would silently get overwritten by /ignore:
+# archive_reason flipped from the sweeper's reason to 'owner_ignored',
+# ignored_at/ignored_by stamped over the sweeper's archive_at. The contract
+# is that /ignore is a no-op on any already-archived row regardless of who
+# archived it; only pending non-archived rows should mutate.
+
+
+def test_ignore_sql_filters_already_archived():
+    """Codex Round 4 P2 #2: IGNORE_SQL must filter `archived_at IS NULL` so
+    /ignore cannot overwrite a row that another flow (e.g. expiry sweeper,
+    a prior /ignore) has already archived.
+    """
+    from routers.queue_actions import IGNORE_SQL
+    sql_text = str(IGNORE_SQL)
+    assert "archived_at IS NULL" in sql_text
+    # Existing Round 3 filter remains.
+    assert "status NOT IN ('mapped', 'creating', 'ignored')" in sql_text
+
+
+def test_ignore_on_sweeper_archived_pending_returns_200_no_overwrite(client: TestClient):
+    """Round 4 P2 #2: a row in status='pending' with archived_at non-NULL
+    (archived by the sweeper, not by /ignore) → IGNORE_SQL noops, handler
+    returns 200 idempotent without re-archiving.
+
+    Pre-fix IGNORE_SQL had no archived_at filter, so it would mutate the
+    sweeper-archived row, overwriting its archive_reason with 'owner_ignored'.
+    Post-fix IGNORE_SQL returns 0 rows; the handler's 0-row branch sees
+    archived_at != NULL and returns 200 without further mutation.
+    """
+    queue_id = str(uuid.uuid4())
+    archived_at = _dt.datetime(2026, 5, 14, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+    session = _SessionStub(execute_results=[
+        # SELECT_QUEUE: row is pending but already archived by the sweeper.
+        # The /ignore short-circuit only fires when status='ignored', so
+        # this falls through to IGNORE_SQL.
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="pending",
+            archived_at=archived_at,
+        )),
+        # IGNORE_SQL: 0 rows (the new `AND archived_at IS NULL` filter
+        # blocks the mutation).
+        _execute_result(one_or_none=None),
+        # Re-SELECT: row is still pending+archived; the handler must see
+        # archived_at != None and return 200 without 409.
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="pending",
+            archived_at=archived_at,
+        )),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ignored"
+    assert body["queue_id"] == queue_id
+
+    # CRITICAL: IGNORE_SQL ran (it's the 2nd execute call) but returned 0
+    # rows — the row WAS NOT mutated. Assert IGNORE_SQL was attempted (we
+    # have to know the filter actually fired, not that the route
+    # short-circuited earlier) and that no further write SQL ran.
+    from routers.queue_actions import IGNORE_SQL, SELECT_QUEUE_SQL
+    executed = [stmt for stmt, _ in session.calls]
+    assert SELECT_QUEUE_SQL in executed
+    assert IGNORE_SQL in executed
+    # Exactly three execute calls: SELECT (auth), IGNORE_SQL (0 rows),
+    # SELECT (discrimination). No second IGNORE_SQL, no other UPDATE.
+    assert len(session.calls) == 3
+    assert executed.count(IGNORE_SQL) == 1
+
+
+def test_ignore_on_pending_non_archived_still_succeeds(client: TestClient):
+    """Round 4 P2 #2 regression: the new `archived_at IS NULL` filter must
+    NOT break the happy-path /ignore on a normal pending row (status='pending',
+    archived_at=NULL → IGNORE_SQL matches → archives normally).
+    """
+    queue_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="pending",
+            archived_at=None,
+        )),
+        # IGNORE_SQL: 1 row (filter matches because archived_at IS NULL
+        # AND status NOT IN terminal).
+        _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ignored"
+    # Only 2 calls: SELECT (auth) + IGNORE_SQL (success). No re-SELECT
+    # needed because IGNORE_SQL returned a row.
+    assert len(session.calls) == 2
+
+
+# P2 #3 — /map replay-success must require matching approval_attempt_id.
+#
+# Pre-fix the replay-success branch was:
+#   if current.status == "mapped" and current.resolved_account_id == body.account_id:
+#       return 200
+# This let Bob retry Alice's earlier-failed /map request with a different
+# attempt_id but the same account_id and incorrectly get 200. Per the
+# contract, only the SAME attempt_id should get 200; a different attempt_id
+# on an already-mapped row is a different intent → 409.
+
+
+def test_map_replay_with_same_account_different_attempt_id_returns_409(client: TestClient):
+    """Round 4 P2 #3: /map on an already-mapped row with the SAME
+    resolved_account_id but a DIFFERENT approval_attempt_id → 409.
+
+    Scenario: Alice maps queue_id Q with attempt_id=a1 and account=X.
+    Materialization commits, queue row becomes status='mapped',
+    resolved_account_id=X, approval_attempt_id=a1.
+
+    Bob (no knowledge of Alice's a1) retries the earlier failed /map with
+    his own attempt_id=b2 and account=X. The replay-success branch must
+    detect that the recorded attempt_id (a1) differs from Bob's request
+    (b2) and 409 — NOT silently return 200 as if Bob's call drove the
+    map.
+
+    Without this, callers can falsely believe their attempt_id won the
+    race when in fact someone else's attempt_id is the audit record.
+    """
+    queue_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    alice_attempt = str(uuid.uuid4())
+    bob_attempt = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        # SELECT_QUEUE: row is mapped to account_id with Alice's attempt_id.
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=alice_attempt,
+            resolved_account_id=account_id,
+        )),
+        # SELECT_ACCOUNT: account in tenant.
+        _execute_result(one_or_none=_fake_account_row(account_id)),
+        # MAP_RESERVE: 0 rows (status='mapped' excluded by filter).
+        _execute_result(one_or_none=None),
+        # Re-SELECT: same row, same account, but Alice's attempt_id (not Bob's).
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=alice_attempt,  # NOT Bob's attempt
+            resolved_account_id=account_id,
+        )),
+    ])
+
+    materialize_mock = AsyncMock()
+    with _patch_session(session), \
+         patch("routers.queue_actions.materialize_account_approval", new=materialize_mock):
+        response = client.post(
+            f"/queue/{queue_id}/map",
+            json={
+                "account_id": account_id,
+                "approval_attempt_id": bob_attempt,  # Bob's, NOT Alice's
+            },
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    materialize_mock.assert_not_awaited()
+    # The error message should signal a different attempt_id was recorded.
+    detail = response.json()["detail"].lower()
+    assert "attempt" in detail or "conflict" in detail
+
+
+def test_map_replay_with_same_account_same_attempt_id_returns_200(client: TestClient):
+    """Round 4 P2 #3 regression: the new attempt_id check must NOT break
+    the legitimate same-attempt-same-account replay-success case.
+
+    Scenario: Alice's /map call materialized but the response was lost
+    in flight. Alice retries with the SAME attempt_id + SAME account.
+    The row reads status='mapped' with Alice's attempt_id → 200, no
+    re-materialization.
+    """
+    queue_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=attempt_id,
+            resolved_account_id=account_id,
+        )),
+        _execute_result(one_or_none=_fake_account_row(account_id)),
+        # MAP_RESERVE: 0 rows (status='mapped' excluded).
+        _execute_result(one_or_none=None),
+        # Re-SELECT: same row, same account, SAME attempt_id → replay-success.
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=attempt_id,
+            resolved_account_id=account_id,
+        )),
+    ])
+
+    materialize_mock = AsyncMock()
+    with _patch_session(session), \
+         patch("routers.queue_actions.materialize_account_approval", new=materialize_mock):
+        response = client.post(
+            f"/queue/{queue_id}/map",
+            json={"account_id": account_id, "approval_attempt_id": attempt_id},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "mapped"
+    assert body["account_id"] == account_id
+    materialize_mock.assert_not_awaited()

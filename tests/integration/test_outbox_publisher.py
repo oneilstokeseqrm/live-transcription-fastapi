@@ -31,7 +31,7 @@ import pytest
 from workers.outbox_publisher import (
     MARK_FAILED_SQL,
     MARK_PUBLISHED_SQL,
-    SELECT_SINGLE_SQL,
+    SELECT_FOR_UPDATE_SQL,
     SELECT_UNPUBLISHED_SQL,
     _build_event,
     publish_one,
@@ -47,10 +47,19 @@ def _row(**kwargs):
     return row
 
 
-def _fake_result(one_value=None, all_rows=None):
+_MISSING = object()
+
+
+def _fake_result(one_value=None, one_or_none_value=_MISSING, all_rows=None):
     result = MagicMock()
     if one_value is not None:
         result.one = MagicMock(return_value=one_value)
+    # Default: .one_or_none() mirrors the one_value sentinel so tests that
+    # only pass one_value=... continue to work without code changes.
+    if one_or_none_value is _MISSING:
+        result.one_or_none = MagicMock(return_value=one_value)
+    else:
+        result.one_or_none = MagicMock(return_value=one_or_none_value)
     if all_rows is not None:
         result.all = MagicMock(return_value=all_rows)
     return result
@@ -175,10 +184,18 @@ def _make_recording_session_factory(execute_results_per_session):
 
 @pytest.mark.asyncio
 async def test_publish_one_success_marks_published():
-    """FailedEntryCount=0 → MARK_PUBLISHED_SQL commits in its own fresh session.
+    """Codex Round 4 P1 #1: success path uses a SINGLE lock-holding session.
 
-    Two sessions are opened: one for the SELECT, one for the MARK_PUBLISHED.
-    The MARK_FAILED SQL is never executed.
+    The session opens with SELECT_FOR_UPDATE_SQL (which takes a row-level
+    advisory lock via FOR UPDATE SKIP LOCKED), puts the event, and then
+    MARK_PUBLISHED commits IN THE SAME SESSION so the row lock is held for
+    the entire publish lifetime. Sibling publishers polling concurrently
+    skip this row (SKIP LOCKED) and pick up something else.
+
+    Pre-Round-4 the success path opened TWO sessions (read + publish) and
+    held no row lock — during a deploy window two publisher containers
+    could read the same row and both call put_events before either committed
+    MARK_PUBLISHED, producing duplicate downstream events.
     """
     outbox_id = str(uuid.uuid4())
     row = _row(
@@ -188,11 +205,12 @@ async def test_publish_one_success_marks_published():
         event_type="account_created",
         account_id=str(uuid.uuid4()),
         payload_json={"contact_ids": []},
+        published_at=None,
     )
 
     factory = _make_recording_session_factory([
-        [_fake_result(one_value=row)],  # session 1: SELECT_SINGLE_SQL
-        [_fake_result()],                # session 2: MARK_PUBLISHED_SQL
+        # ONE session: SELECT_FOR_UPDATE_SQL → put_events → MARK_PUBLISHED.
+        [_fake_result(one_or_none_value=row), _fake_result()],
     ])
 
     eb = MagicMock()
@@ -200,21 +218,19 @@ async def test_publish_one_success_marks_published():
 
     await publish_one(session_factory=factory, eventbridge_client=eb, outbox_row_id=outbox_id)
 
-    # Two distinct sessions: SELECT_SINGLE on the first, MARK_PUBLISHED on the
-    # second. MARK_FAILED is never executed anywhere.
-    assert len(factory.sessions) == 2  # type: ignore[attr-defined]
-    read_session, publish_session = factory.sessions  # type: ignore[attr-defined]
+    # ONE session total (was 2 pre-Round-4). The lock spans the put_events
+    # call so concurrent publishers cannot read this row.
+    assert len(factory.sessions) == 1  # type: ignore[attr-defined]
+    lock_session = factory.sessions[0]  # type: ignore[attr-defined]
 
-    read_stmts = [call.args[0] for call in read_session.execute.await_args_list]
-    assert read_stmts == [SELECT_SINGLE_SQL]
+    stmts = [call.args[0] for call in lock_session.execute.await_args_list]
+    assert stmts == [SELECT_FOR_UPDATE_SQL, MARK_PUBLISHED_SQL]
 
-    publish_stmts = [call.args[0] for call in publish_session.execute.await_args_list]
-    assert publish_stmts == [MARK_PUBLISHED_SQL]
-    assert publish_session.execute.await_args_list[0].args[1] == {"id": outbox_id}
+    # MARK_PUBLISHED bound to the same outbox_row_id.
+    assert lock_session.execute.await_args_list[1].args[1] == {"id": outbox_id}
 
-    # MARK_FAILED never executed across any session.
-    all_stmts = read_stmts + publish_stmts
-    assert MARK_FAILED_SQL not in all_stmts
+    # MARK_FAILED never executed.
+    assert MARK_FAILED_SQL not in stmts
 
     eb.put_events.assert_awaited_once()
 
@@ -225,10 +241,15 @@ async def test_publish_one_failure_marks_failed_and_raises():
 
     Regression check for the rollback bug: the MARK_FAILED write must commit
     on a DIFFERENT session than the one that raised. We assert that the
-    session_factory was invoked TWICE (read session + fail session) — if the
+    session_factory was invoked TWICE (lock session + fail session) — if the
     bug returns and the MARK_FAILED is written on the same session that the
     raise rolls back, factory.sessions will have length 1 (or MARK_FAILED
     will never appear in execute history).
+
+    Codex Round 4 P1 #1: lock session SELECT now uses SELECT_FOR_UPDATE_SQL
+    (FOR UPDATE SKIP LOCKED). The failure path opens a SECOND fresh session
+    for MARK_FAILED so the failure-state UPDATE commits independently of
+    the rollback that the raise unwinds.
     """
     outbox_id = str(uuid.uuid4())
     row = _row(
@@ -238,11 +259,12 @@ async def test_publish_one_failure_marks_failed_and_raises():
         event_type="account_created",
         account_id=str(uuid.uuid4()),
         payload_json={},
+        published_at=None,
     )
 
     factory = _make_recording_session_factory([
-        [_fake_result(one_value=row)],  # session 1: SELECT_SINGLE_SQL
-        [_fake_result()],                # session 2: MARK_FAILED_SQL
+        [_fake_result(one_or_none_value=row)],  # session 1: SELECT_FOR_UPDATE_SQL
+        [_fake_result()],                        # session 2: MARK_FAILED_SQL
     ])
 
     eb = MagicMock()
@@ -255,16 +277,16 @@ async def test_publish_one_failure_marks_failed_and_raises():
         await publish_one(session_factory=factory, eventbridge_client=eb, outbox_row_id=outbox_id)
 
     # CRITICAL regression assertion: the MARK_FAILED must have happened on a
-    # SECOND session, distinct from the read session that originated the
-    # failure. If publish_one ever writes MARK_FAILED back to the read
-    # session (or to a caller-supplied session inside a transaction that the
-    # raise rolls back), factory.sessions will be length 1 and this fails.
+    # SECOND session, distinct from the lock session that raised. If
+    # publish_one ever writes MARK_FAILED back to the lock session (or to a
+    # caller-supplied session inside a transaction that the raise rolls
+    # back), factory.sessions will be length 1 and this fails.
     assert len(factory.sessions) == 2  # type: ignore[attr-defined]
-    read_session, fail_session = factory.sessions  # type: ignore[attr-defined]
-    assert read_session is not fail_session
+    lock_session, fail_session = factory.sessions  # type: ignore[attr-defined]
+    assert lock_session is not fail_session
 
-    read_stmts = [call.args[0] for call in read_session.execute.await_args_list]
-    assert read_stmts == [SELECT_SINGLE_SQL]
+    lock_stmts = [call.args[0] for call in lock_session.execute.await_args_list]
+    assert lock_stmts == [SELECT_FOR_UPDATE_SQL]
 
     fail_stmts = [call.args[0] for call in fail_session.execute.await_args_list]
     assert fail_stmts == [MARK_FAILED_SQL]
@@ -274,7 +296,7 @@ async def test_publish_one_failure_marks_failed_and_raises():
     assert "ThrottlingException" in mark_failed_params["error"]
 
     # MARK_PUBLISHED never executed across any session.
-    all_stmts = read_stmts + fail_stmts
+    all_stmts = lock_stmts + fail_stmts
     assert MARK_PUBLISHED_SQL not in all_stmts
 
 
@@ -289,12 +311,13 @@ async def test_publish_one_failure_truncates_long_error_messages():
         event_type="account_created",
         account_id=str(uuid.uuid4()),
         payload_json={},
+        published_at=None,
     )
 
     long_msg = "x" * 5000
     factory = _make_recording_session_factory([
-        [_fake_result(one_value=row)],  # session 1: SELECT_SINGLE_SQL
-        [_fake_result()],                # session 2: MARK_FAILED_SQL
+        [_fake_result(one_or_none_value=row)],  # session 1: SELECT_FOR_UPDATE_SQL
+        [_fake_result()],                        # session 2: MARK_FAILED_SQL
     ])
     eb = MagicMock()
     eb.put_events = AsyncMock(return_value={
@@ -327,11 +350,12 @@ async def test_publish_one_marks_failed_when_put_events_raises():
         event_type="account_created",
         account_id=str(uuid.uuid4()),
         payload_json={},
+        published_at=None,
     )
 
     factory = _make_recording_session_factory([
-        [_fake_result(one_value=row)],   # session 1: SELECT_SINGLE
-        [_fake_result()],                # session 2: MARK_FAILED (exception path)
+        [_fake_result(one_or_none_value=row)],   # session 1: SELECT_FOR_UPDATE
+        [_fake_result()],                         # session 2: MARK_FAILED (exception path)
     ])
 
     class _BotoConnectionError(Exception):
@@ -347,12 +371,12 @@ async def test_publish_one_marks_failed_when_put_events_raises():
             outbox_row_id=outbox_id,
         )
 
-    # Two sessions: read + fail. The fail session committed MARK_FAILED
+    # Two sessions: lock + fail. The fail session committed MARK_FAILED
     # BEFORE the raise propagated. If the fix isn't applied, factory.sessions
     # has length 1 (no fail session opened) and this assert fails.
     assert len(factory.sessions) == 2  # type: ignore[attr-defined]
-    read_session, fail_session = factory.sessions  # type: ignore[attr-defined]
-    assert read_session is not fail_session
+    lock_session, fail_session = factory.sessions  # type: ignore[attr-defined]
+    assert lock_session is not fail_session
 
     fail_stmts = [c.args[0] for c in fail_session.execute.await_args_list]
     assert fail_stmts == [MARK_FAILED_SQL]
@@ -365,8 +389,8 @@ async def test_publish_one_marks_failed_when_put_events_raises():
     assert len(mark_failed_params["error"]) <= 1000
 
     # MARK_PUBLISHED never executed.
-    read_stmts = [c.args[0] for c in read_session.execute.await_args_list]
-    assert MARK_PUBLISHED_SQL not in (read_stmts + fail_stmts)
+    lock_stmts = [c.args[0] for c in lock_session.execute.await_args_list]
+    assert MARK_PUBLISHED_SQL not in (lock_stmts + fail_stmts)
 
 
 @pytest.mark.asyncio
@@ -381,11 +405,12 @@ async def test_publish_one_marks_failed_with_truncated_long_exception_message():
         event_type="account_created",
         account_id=str(uuid.uuid4()),
         payload_json={},
+        published_at=None,
     )
 
     long_msg = "y" * 5000
     factory = _make_recording_session_factory([
-        [_fake_result(one_value=row)],
+        [_fake_result(one_or_none_value=row)],
         [_fake_result()],
     ])
 
@@ -430,11 +455,12 @@ async def test_publish_one_failure_uses_distinct_session_for_mark_failed():
         event_type="account_created",
         account_id=str(uuid.uuid4()),
         payload_json={},
+        published_at=None,
     )
 
     factory = _make_recording_session_factory([
-        [_fake_result(one_value=row)],   # read session
-        [_fake_result()],                 # fail session — MUST be distinct
+        [_fake_result(one_or_none_value=row)],   # lock session
+        [_fake_result()],                         # fail session — MUST be distinct
     ])
 
     eb = MagicMock()
@@ -451,11 +477,11 @@ async def test_publish_one_failure_uses_distinct_session_for_mark_failed():
     assert len(factory.sessions) >= 2  # type: ignore[attr-defined]
 
     # And MARK_FAILED appears in execute history on a session that is NOT
-    # the read session.
-    read_session = factory.sessions[0]  # type: ignore[attr-defined]
-    read_stmts = [call.args[0] for call in read_session.execute.await_args_list]
-    assert MARK_FAILED_SQL not in read_stmts, (
-        "MARK_FAILED was written to the SELECT session — this is the "
+    # the lock session.
+    lock_session = factory.sessions[0]  # type: ignore[attr-defined]
+    lock_stmts = [call.args[0] for call in lock_session.execute.await_args_list]
+    assert MARK_FAILED_SQL not in lock_stmts, (
+        "MARK_FAILED was written to the lock session — this is the "
         "rollback bug: the caller's transaction will discard the write."
     )
 
@@ -464,6 +490,132 @@ async def test_publish_one_failure_uses_distinct_session_for_mark_failed():
         for s in factory.sessions[1:]  # type: ignore[attr-defined]
     )
     assert mark_failed_seen_on_other_session
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 4 P1 #1 — sibling-lock + already-published race regression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_publish_one_skips_when_sibling_holds_lock():
+    """SELECT_FOR_UPDATE_SQL with FOR UPDATE SKIP LOCKED can return None when
+    a sibling publisher already holds the row lock. In that case publish_one
+    must noop: NO put_events call, NO MARK_PUBLISHED, NO MARK_FAILED, NO raise.
+
+    The sibling publisher will publish the row and commit MARK_PUBLISHED on
+    its own session. Our publisher will see the row as `published_at IS NOT
+    NULL` (or no longer in the unpublished SELECT) on the next poll and
+    correctly skip it.
+
+    Without this branch a multi-replica deploy would crash on .one() when
+    the SKIP-LOCKED SELECT returns zero rows, or worse, would re-execute
+    put_events on a stale read of a row that is mid-publish in the sibling
+    container — producing duplicate downstream events.
+    """
+    outbox_id = str(uuid.uuid4())
+
+    factory = _make_recording_session_factory([
+        # Lock session: SELECT_FOR_UPDATE returns None (sibling has the lock).
+        [_fake_result(one_or_none_value=None)],
+    ])
+
+    eb = MagicMock()
+    eb.put_events = AsyncMock()
+
+    # Must NOT raise.
+    await publish_one(
+        session_factory=factory,
+        eventbridge_client=eb,
+        outbox_row_id=outbox_id,
+    )
+
+    # Exactly one session opened — the SELECT_FOR_UPDATE session — and only
+    # the SELECT_FOR_UPDATE_SQL ran.
+    assert len(factory.sessions) == 1  # type: ignore[attr-defined]
+    lock_session = factory.sessions[0]  # type: ignore[attr-defined]
+    stmts = [call.args[0] for call in lock_session.execute.await_args_list]
+    assert stmts == [SELECT_FOR_UPDATE_SQL]
+
+    # put_events must NOT have been called.
+    eb.put_events.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_publish_one_skips_when_row_already_published():
+    """If the SELECT_FOR_UPDATE row's published_at is non-NULL, another
+    publisher just published the row between our poll-SELECT and our
+    per-row lock acquisition. publish_one must noop without re-publishing.
+
+    Without this guard a deploy-window race could re-publish the same
+    outbox row twice: replica A reads the unpublished row in its poll
+    batch, then replica B publishes + commits MARK_PUBLISHED, then replica
+    A acquires the FOR UPDATE lock on the now-published row and proceeds
+    to put_events again.
+    """
+    outbox_id = str(uuid.uuid4())
+    already_published_row = _row(
+        id=outbox_id,
+        tenant_id=str(uuid.uuid4()),
+        queue_id=str(uuid.uuid4()),
+        event_type="account_created",
+        account_id=str(uuid.uuid4()),
+        payload_json={},
+        # CRITICAL: published_at is non-NULL → sibling already published.
+        published_at="2026-05-14T12:00:00Z",
+    )
+
+    factory = _make_recording_session_factory([
+        [_fake_result(one_or_none_value=already_published_row)],
+    ])
+
+    eb = MagicMock()
+    eb.put_events = AsyncMock()
+
+    # Must NOT raise.
+    await publish_one(
+        session_factory=factory,
+        eventbridge_client=eb,
+        outbox_row_id=outbox_id,
+    )
+
+    # One session opened (lock session); only SELECT_FOR_UPDATE_SQL ran.
+    assert len(factory.sessions) == 1  # type: ignore[attr-defined]
+    lock_session = factory.sessions[0]  # type: ignore[attr-defined]
+    stmts = [call.args[0] for call in lock_session.execute.await_args_list]
+    assert stmts == [SELECT_FOR_UPDATE_SQL]
+
+    # put_events must NOT have been called.
+    eb.put_events.assert_not_called()
+
+
+def test_select_for_update_uses_skip_locked():
+    """SELECT_FOR_UPDATE_SQL must use FOR UPDATE SKIP LOCKED so concurrent
+    publishers (deploy window: old + new container both live) do NOT pick
+    up the same row.
+
+    Per docs/superpowers/specs/2026-05-14-dispatch-patterns-research.md
+    Section 2.4: "FOR UPDATE SKIP LOCKED on the outbox query — allows safe
+    parallel publishers when we go multi-replica."
+    """
+    sql = str(SELECT_FOR_UPDATE_SQL)
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    # The single-row lock SELECT must include published_at so the handler
+    # can short-circuit when a sibling already published mid-flight.
+    assert "published_at" in sql
+
+
+def test_select_unpublished_uses_skip_locked():
+    """SELECT_UNPUBLISHED_SQL (the poll) must also use FOR UPDATE SKIP LOCKED.
+
+    Without this, two publisher replicas polling concurrently would each
+    return the same batch of unpublished rows. Per-row FOR UPDATE SKIP
+    LOCKED still serializes the publish itself, but having the poll skip
+    locked rows means each replica's batch is disjoint to begin with —
+    less wasted work and clearer operational behavior.
+    """
+    sql = str(SELECT_UNPUBLISHED_SQL)
+    assert "FOR UPDATE SKIP LOCKED" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -506,14 +658,14 @@ class _SessionRecorder:
 async def test_run_publisher_loop_uses_fresh_session_per_row():
     """Per-row transactional isolation: each row gets its own publish_one call.
 
-    `publish_one` now opens its OWN sessions (one for the SELECT, one for
-    the MARK_PUBLISHED on success, or one for MARK_FAILED on failure).
-    The loop only opens the poll-SELECT session itself; everything else is
-    owned by publish_one. This carry-forward invariant from PR #12 prevents
-    one row's MARK_FAILED from rolling back a sibling row's MARK_PUBLISHED.
+    Codex Round 4 P1 #1: publish_one now uses ONE lock-holding session per
+    row for the success path (SELECT_FOR_UPDATE_SQL + put_events +
+    MARK_PUBLISHED all on the same session) so the row lock spans the
+    entire publish lifetime. The loop opens the poll-SELECT session;
+    publish_one opens its own lock session per row.
 
     Session count for two successful rows:
-      1 poll + (1 read + 1 publish) for row A + (1 read + 1 publish) for row B = 5
+      1 poll + 1 lock for row A + 1 lock for row B = 3
     """
     row_a_id = str(uuid.uuid4())
     row_b_id = str(uuid.uuid4())
@@ -542,32 +694,32 @@ async def test_run_publisher_loop_uses_fresh_session_per_row():
             ),
         ]),
     ])
-    # 2) Row A — read session: SELECT_SINGLE.
+    # 2) Row A — lock session: SELECT_FOR_UPDATE + MARK_PUBLISHED.
     recorder.next_side_effects.append([
-        _fake_result(one_value=_row(
+        _fake_result(one_or_none_value=_row(
             id=row_a_id,
             tenant_id=str(uuid.uuid4()),
             queue_id=str(uuid.uuid4()),
             event_type="account_created",
             account_id=str(uuid.uuid4()),
             payload_json={},
+            published_at=None,
         )),
+        _fake_result(),
     ])
-    # 3) Row A — publish session: MARK_PUBLISHED.
-    recorder.next_side_effects.append([_fake_result()])
-    # 4) Row B — read session: SELECT_SINGLE.
+    # 3) Row B — lock session: SELECT_FOR_UPDATE + MARK_PUBLISHED.
     recorder.next_side_effects.append([
-        _fake_result(one_value=_row(
+        _fake_result(one_or_none_value=_row(
             id=row_b_id,
             tenant_id=str(uuid.uuid4()),
             queue_id=str(uuid.uuid4()),
             event_type="account_created",
             account_id=str(uuid.uuid4()),
             payload_json={},
+            published_at=None,
         )),
+        _fake_result(),
     ])
-    # 5) Row B — publish session: MARK_PUBLISHED.
-    recorder.next_side_effects.append([_fake_result()])
 
     eb = MagicMock()
     eb.put_events = AsyncMock(return_value={"FailedEntryCount": 0, "Entries": [{"EventId": "x"}]})
@@ -595,8 +747,8 @@ async def test_run_publisher_loop_uses_fresh_session_per_row():
     finally:
         op_mod.asyncio.sleep = original_sleep
 
-    # 5 sessions total: 1 poll + 2 (read+publish) per success row.
-    assert len(recorder.sessions) == 5
+    # 3 sessions total: 1 poll + 1 lock per success row.
+    assert len(recorder.sessions) == 3
     assert eb.put_events.await_count == 2
 
 
@@ -608,8 +760,9 @@ async def test_run_publisher_loop_one_row_failure_does_not_skip_others():
     fresh-session pattern means row A's MARK_FAILED commit is independent
     of row B's MARK_PUBLISHED commit.
 
-    Session count: 1 poll + (1 read + 1 fail) for row A + (1 read + 1
-    publish) for row B = 5.
+    Codex Round 4 P1 #1 session count (1 lock session for success, 2 for
+    failure — lock + fail):
+      1 poll + (1 lock + 1 fail) for row A + (1 lock) for row B = 4.
     """
     row_a_id = str(uuid.uuid4())
     row_b_id = str(uuid.uuid4())
@@ -638,32 +791,33 @@ async def test_run_publisher_loop_one_row_failure_does_not_skip_others():
             ),
         ]),
     ])
-    # 2) Row A — read session: SELECT_SINGLE.
+    # 2) Row A — lock session: SELECT_FOR_UPDATE.
     recorder.next_side_effects.append([
-        _fake_result(one_value=_row(
+        _fake_result(one_or_none_value=_row(
             id=row_a_id,
             tenant_id=str(uuid.uuid4()),
             queue_id=str(uuid.uuid4()),
             event_type="account_created",
             account_id=str(uuid.uuid4()),
             payload_json={},
+            published_at=None,
         )),
     ])
     # 3) Row A — fail session: MARK_FAILED.
     recorder.next_side_effects.append([_fake_result()])
-    # 4) Row B — read session: SELECT_SINGLE.
+    # 4) Row B — lock session: SELECT_FOR_UPDATE + MARK_PUBLISHED.
     recorder.next_side_effects.append([
-        _fake_result(one_value=_row(
+        _fake_result(one_or_none_value=_row(
             id=row_b_id,
             tenant_id=str(uuid.uuid4()),
             queue_id=str(uuid.uuid4()),
             event_type="account_created",
             account_id=str(uuid.uuid4()),
             payload_json={},
+            published_at=None,
         )),
+        _fake_result(),
     ])
-    # 5) Row B — publish session: MARK_PUBLISHED.
-    recorder.next_side_effects.append([_fake_result()])
 
     eb = MagicMock()
     # Row A: fail. Row B: succeed.
@@ -692,16 +846,16 @@ async def test_run_publisher_loop_one_row_failure_does_not_skip_others():
 
     # Both rows attempted independently.
     assert eb.put_events.await_count == 2
-    # 1 poll + 2 (read+commit) per row = 5.
-    assert len(recorder.sessions) == 5
+    # 1 poll + 2 (lock+fail) for failing row A + 1 lock for success row B = 4.
+    assert len(recorder.sessions) == 4
 
     # Row A's MARK_FAILED landed on a distinct session from its SELECT
     # (this is the rollback-bug regression check at the loop level).
-    row_a_read, row_a_fail = recorder.sessions[1], recorder.sessions[2]
-    assert row_a_read is not row_a_fail
-    row_a_read_stmts = [c.args[0] for c in row_a_read.execute.await_args_list]
+    row_a_lock, row_a_fail = recorder.sessions[1], recorder.sessions[2]
+    assert row_a_lock is not row_a_fail
+    row_a_lock_stmts = [c.args[0] for c in row_a_lock.execute.await_args_list]
     row_a_fail_stmts = [c.args[0] for c in row_a_fail.execute.await_args_list]
-    assert row_a_read_stmts == [SELECT_SINGLE_SQL]
+    assert row_a_lock_stmts == [SELECT_FOR_UPDATE_SQL]
     assert row_a_fail_stmts == [MARK_FAILED_SQL]
 
 
@@ -754,6 +908,9 @@ def test_select_unpublished_filters_by_null_published_at():
     # tiebreaker for rows at the same attempts count.
     assert "ORDER BY publish_attempts ASC, created_at ASC" in sql
     assert ":limit" in sql
+    # Codex Round 4 P1 #1: FOR UPDATE SKIP LOCKED ensures concurrent
+    # publisher replicas pull disjoint batches.
+    assert "FOR UPDATE SKIP LOCKED" in sql
 
 
 def test_mark_published_increments_attempts_and_clears_error():
