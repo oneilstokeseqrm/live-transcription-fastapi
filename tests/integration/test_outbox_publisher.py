@@ -106,7 +106,9 @@ class TestBuildEvent:
         assert detail["payload"] == payload
 
     def test_event_bus_name_falls_back_to_default(self, monkeypatch):
-        monkeypatch.delenv("EVENT_BUS_NAME", raising=False)
+        # Codex Round 2 P2 #5: publisher reads EVENTBRIDGE_BUS_NAME, matching
+        # the repo-wide convention (main.py:62, .env.example:55).
+        monkeypatch.delenv("EVENTBRIDGE_BUS_NAME", raising=False)
         row = _row(
             id=str(uuid.uuid4()),
             tenant_id=str(uuid.uuid4()),
@@ -118,7 +120,7 @@ class TestBuildEvent:
         assert _build_event(row)["EventBusName"] == "default"
 
     def test_event_bus_name_respects_env_override(self, monkeypatch):
-        monkeypatch.setenv("EVENT_BUS_NAME", "eq-events-dev")
+        monkeypatch.setenv("EVENTBRIDGE_BUS_NAME", "eq-events-dev")
         row = _row(
             id=str(uuid.uuid4()),
             tenant_id=str(uuid.uuid4()),

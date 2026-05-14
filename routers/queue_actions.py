@@ -143,12 +143,31 @@ SELECT_QUEUE_SQL = text("""
 # Idempotency: WHERE matches when NO attempt_id has been recorded yet OR
 # the SAME attempt_id is recorded. Different attempt_id → noop (RETURNING
 # returns zero rows; the handler re-SELECTs to decide 200 vs 409).
+#
+# Codex Round 2 P1 #3: status filter pins the transition source. Without
+# the filter, /approve replays with the same attempt_id on a row that has
+# since moved to status='mapped' (worker materialized it) would flip the
+# row back to 'approved' — re-queueing it for the worker → duplicate
+# materialization + duplicate outbox event. The `status IN ('pending',
+# 'approved')` clause allows first-approve AND same-attempt_id idempotent
+# replay on a still-pending row, but stops mutating mapped/creating/
+# ignored rows. The 0-row branch in approve_entry already re-SELECTs and
+# returns 200 if the row is in ('approved', 'creating', 'mapped'), so this
+# is purely defensive: the SQL stops mutating; the handler decides what
+# 0-row means.
+#
+# `archived_at IS NULL` is the same defensive belt-and-suspenders: the
+# auth helper already blocks archived rows with 409, but a future code
+# path that bypasses _load_and_authorize must NOT be able to resurrect an
+# archived entry.
 APPROVE_SQL = text("""
     UPDATE pending_account_mappings
     SET status = 'approved',
         approval_attempt_id = :attempt_id::uuid,
         updated_at = NOW()
     WHERE id = :queue_id
+      AND archived_at IS NULL
+      AND status IN ('pending', 'approved')
       AND (approval_attempt_id IS NULL OR approval_attempt_id = :attempt_id::uuid)
     RETURNING id::text
 """)
@@ -180,12 +199,23 @@ SELECT_ACCOUNT_FOR_TENANT_SQL = text("""
 # scoped to non-archived rows and binding the attempt_id. Caller checks
 # the RETURNING result: 1 row → proceed to materialize, 0 rows → re-SELECT
 # to discriminate replay (200) vs different intent (409).
+#
+# Codex Round 2 P1 #4: status filter prevents replays from re-materializing.
+# After /map commits, the row is status='mapped', resolved_account_id=<X>,
+# approval_attempt_id=<id>. A retry with the SAME attempt_id would
+# otherwise re-match WHERE → return 1 row → handler calls
+# materialize_account_approval AGAIN → duplicate outbox + duplicate
+# interaction_contact_links. Excluding ('mapped', 'creating', 'ignored')
+# routes the replay through the 0-row branch in map_entry, which
+# re-SELECTs and returns 200 without re-materializing when status='mapped'
+# and resolved_account_id matches.
 MAP_RESERVE_SQL = text("""
     UPDATE pending_account_mappings
     SET approval_attempt_id = :attempt_id::uuid,
         updated_at = NOW()
     WHERE id = :queue_id
       AND archived_at IS NULL
+      AND status NOT IN ('mapped', 'creating', 'ignored')
       AND (approval_attempt_id IS NULL OR approval_attempt_id = :attempt_id::uuid)
     RETURNING id::text
 """)
@@ -279,6 +309,31 @@ def _validate_uuid_path_param(value: str, field_name: str) -> str:
     return value
 
 
+def _effective_user_id(ctx) -> str:
+    """Return pg_user_id when present, falling back to the JWT subject.
+
+    Codex Round 2 P1 #1: Queue rows are inserted with
+    `owner_user_id = context.pg_user_id or context.user_id` (see
+    routers/text.py:101 and routers/batch.py:164). The owner_user_id
+    column is UUID NOT NULL in eq-dev. When pg_user_id is present (the
+    standard production case), the column stores a UUID — NOT the Auth0
+    subject string like "auth0|<sub>".
+
+    Pre-fix: the auth helper compared ctx.user_id (Auth0 subject) against
+    row.owner_user_id (UUID) → never matched → 403 for the legitimate
+    owner. Post-fix: the auth helper compares the EFFECTIVE user id —
+    mirroring the insert pattern. First-owner-wins on owner_user_id stays
+    intact; we just match the insert format on read.
+
+    This also satisfies P1 #2: IGNORE_SQL binds `:user_id::uuid`. When
+    pg_user_id is present, _effective_user_id returns the UUID and the
+    cast succeeds. When pg_user_id is absent AND user_id is non-UUID,
+    /ignore early-rejects with 400 before opening the DB transaction so
+    the cast error never surfaces.
+    """
+    return ctx.pg_user_id or ctx.user_id
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -299,7 +354,9 @@ async def approve_entry(queue_id: str, body: ApproveRequest, request: Request):
     async with get_async_session() as session:
         async with session.begin():
             await _load_and_authorize(
-                session, queue_id, tenant_id=ctx.tenant_id, user_id=ctx.user_id,
+                session, queue_id,
+                tenant_id=ctx.tenant_id,
+                user_id=_effective_user_id(ctx),
             )
 
             update_result = await session.execute(
@@ -370,7 +427,9 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
     async with get_async_session() as session:
         async with session.begin():
             await _load_and_authorize(
-                session, queue_id, tenant_id=ctx.tenant_id, user_id=ctx.user_id,
+                session, queue_id,
+                tenant_id=ctx.tenant_id,
+                user_id=_effective_user_id(ctx),
             )
 
             # P1 #1: tenant-scoped account lookup. Returning 404 (not 403)
@@ -454,12 +513,31 @@ async def ignore_entry(queue_id: str, request: Request):
     ctx = get_auth_context_polling(request)
     _validate_uuid_path_param(queue_id, "queue_id")
 
+    # Codex Round 2 P1 #2: IGNORE_SQL binds `ignored_by = :user_id::uuid`.
+    # The queue row's owner_user_id is itself a UUID (inserted from
+    # `pg_user_id or user_id`). If the caller has neither a pg_user_id nor
+    # a UUID-shaped user_id, the cast in Postgres would raise → 500. Reject
+    # cleanly with 400 here: a JWT without a UUID-shaped identifier could
+    # not have created this queue row in the first place, so this branch
+    # is itself anomalous. Surfacing as 400 rather than 500 lets callers
+    # diagnose the JWT shape mismatch.
+    effective_id = _effective_user_id(ctx)
+    try:
+        uuid.UUID(effective_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="ignore requires a UUID-shaped user identifier (pg_user_id)",
+        )
+
     async with get_async_session() as session:
         async with session.begin():
             # Pass actionable_only=False so we can short-circuit on
             # already-archived rows (idempotency) instead of raising 409.
             row = await _load_and_authorize(
-                session, queue_id, tenant_id=ctx.tenant_id, user_id=ctx.user_id,
+                session, queue_id,
+                tenant_id=ctx.tenant_id,
+                user_id=effective_id,
                 actionable_only=False,
             )
 
@@ -474,7 +552,7 @@ async def ignore_entry(queue_id: str, request: Request):
 
             await session.execute(
                 IGNORE_SQL,
-                {"queue_id": queue_id, "user_id": ctx.user_id},
+                {"queue_id": queue_id, "user_id": effective_id},
             )
 
     return {"status": "ignored", "queue_id": queue_id}

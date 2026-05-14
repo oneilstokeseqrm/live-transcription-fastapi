@@ -44,7 +44,19 @@ OWNER_USER_ID = "auth0|owner-queue-1"
 OTHER_USER_ID = "auth0|other-user-2"
 
 
-def _make_jwt(user_id: str = OWNER_USER_ID, tenant_id: str = TENANT_ID) -> str:
+def _make_jwt(
+    user_id: str = OWNER_USER_ID,
+    tenant_id: str = TENANT_ID,
+    pg_user_id: str | None = None,
+) -> str:
+    """Build a signed internal JWT.
+
+    Codex Round 2 P1 #1: production JWTs carry a `pg_user_id` UUID claim
+    when the identity bridge has resolved the Auth0 subject to a Postgres
+    User UUID. Queue rows are inserted with
+    `owner_user_id = context.pg_user_id or context.user_id`, so the auth
+    boundary on the route side must compare against the SAME effective id.
+    """
     now = int(time.time())
     payload = {
         "tenant_id": tenant_id,
@@ -54,6 +66,8 @@ def _make_jwt(user_id: str = OWNER_USER_ID, tenant_id: str = TENANT_ID) -> str:
         "iat": now,
         "exp": now + 300,
     }
+    if pg_user_id is not None:
+        payload["pg_user_id"] = pg_user_id
     return pyjwt.encode(payload, os.environ["INTERNAL_JWT_SECRET"], algorithm="HS256")
 
 
@@ -618,6 +632,8 @@ def test_ignore_on_already_archived_returns_200_idempotent(client: TestClient):
     Idempotent replay: status=='ignored' and archived_at IS NOT NULL → noop
     early-return with the same response shape. Re-running IGNORE_SQL would
     re-stamp ignored_at, which is wrong.
+
+    Codex Round 2 P1 #2: caller must carry a UUID-shaped user id.
     """
     queue_id = str(uuid.uuid4())
     archived_at = _dt.datetime(2026, 5, 14, 12, 0, 0, tzinfo=_dt.timezone.utc)
@@ -625,6 +641,7 @@ def test_ignore_on_already_archived_returns_200_idempotent(client: TestClient):
     session = _SessionStub(execute_results=[
         _execute_result(one_or_none=_fake_queue_row(
             queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
             status="ignored",
             archived_at=archived_at,
         )),
@@ -634,7 +651,9 @@ def test_ignore_on_already_archived_returns_200_idempotent(client: TestClient):
         response = client.post(
             f"/queue/{queue_id}/ignore",
             json={},
-            headers={"Authorization": f"Bearer {_make_jwt()}"},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
         )
 
     assert response.status_code == 200, response.text
@@ -836,11 +855,19 @@ def test_map_invalid_uuid_attempt_id_returns_422(client: TestClient):
 
 
 def test_ignore_happy_path(client: TestClient):
-    """Owner ignores → 200, UPDATE sets archived_at + ignored_by."""
+    """Owner ignores → 200, UPDATE sets archived_at + ignored_by.
+
+    Codex Round 2 P1 #2 — /ignore now requires a UUID-shaped user
+    identifier (pg_user_id), reflecting the production insert pattern
+    where owner_user_id stores a UUID. This test uses the production
+    shape: JWT carries pg_user_id; queue row owner_user_id is that UUID.
+    """
     queue_id = str(uuid.uuid4())
 
     session = _SessionStub(execute_results=[
-        _execute_result(one_or_none=_fake_queue_row(queue_id=queue_id)),
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id, owner_user_id=PG_USER_UUID,
+        )),
         _execute_result(rowcount=1),  # UPDATE succeeded
     ])
 
@@ -848,7 +875,9 @@ def test_ignore_happy_path(client: TestClient):
         response = client.post(
             f"/queue/{queue_id}/ignore",
             json={},
-            headers={"Authorization": f"Bearer {_make_jwt()}"},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
         )
 
     assert response.status_code == 200, response.text
@@ -856,17 +885,22 @@ def test_ignore_happy_path(client: TestClient):
     assert body["status"] == "ignored"
     assert body["queue_id"] == queue_id
 
-    # UPDATE bound params include user_id (for ignored_by)
+    # UPDATE bound params include user_id (for ignored_by) as the UUID
     update_params = session.calls[1][1]
     assert update_params["queue_id"] == queue_id
-    assert update_params["user_id"] == OWNER_USER_ID
+    assert update_params["user_id"] == PG_USER_UUID
 
 
 def test_ignore_non_owner_returns_403(client: TestClient):
+    """Non-owner with valid pg_user_id → 403.
+
+    Both the caller and the queue row carry UUID-shaped owner_user_ids
+    (production pattern). They simply don't match → 403.
+    """
     queue_id = str(uuid.uuid4())
     session = _SessionStub(execute_results=[
         _execute_result(one_or_none=_fake_queue_row(
-            queue_id=queue_id, owner_user_id=OWNER_USER_ID,
+            queue_id=queue_id, owner_user_id=PG_USER_UUID,
         )),
     ])
 
@@ -874,13 +908,16 @@ def test_ignore_non_owner_returns_403(client: TestClient):
         response = client.post(
             f"/queue/{queue_id}/ignore",
             json={},
-            headers={"Authorization": f"Bearer {_make_jwt(user_id=OTHER_USER_ID)}"},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=OTHER_PG_USER_UUID)}",
+            },
         )
 
     assert response.status_code == 403, response.text
 
 
 def test_ignore_nonexistent_returns_404(client: TestClient):
+    """Non-existent queue_id → 404 (still requires UUID-shaped user id)."""
     queue_id = str(uuid.uuid4())
     session = _SessionStub(execute_results=[
         _execute_result(one_or_none=None),
@@ -890,7 +927,311 @@ def test_ignore_nonexistent_returns_404(client: TestClient):
         response = client.post(
             f"/queue/{queue_id}/ignore",
             json={},
-            headers={"Authorization": f"Bearer {_make_jwt()}"},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
         )
 
     assert response.status_code == 404, response.text
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 2 fixes
+# ---------------------------------------------------------------------------
+
+# Production-shape user identity:
+# Routers/text.py:101 + routers/batch.py:164 insert queue rows with
+# `owner_user_id = context.pg_user_id or context.user_id`. The owner_user_id
+# column is UUID NOT NULL in eq-dev. When pg_user_id is present (the
+# standard case), the column stores the UUID, NOT the Auth0 subject string.
+PG_USER_UUID = "33333333-3333-4333-8333-333333333333"
+OTHER_PG_USER_UUID = "44444444-4444-4444-8444-444444444444"
+
+
+# P1 #1 — Auth check must use _effective_user_id (pg_user_id or user_id)
+
+def test_approve_owner_with_pg_user_id_returns_200(client: TestClient):
+    """JWT carries pg_user_id (UUID); queue row owner_user_id is that UUID.
+
+    Pre-fix: route compared ctx.user_id (Auth0 subject string) against
+    row.owner_user_id (UUID) → never matched → 403. Post-fix:
+    `_effective_user_id(ctx)` returns ctx.pg_user_id (UUID) → matches.
+    """
+    queue_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+
+    # owner_user_id matches the pg_user_id on the JWT (production pattern).
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+        )),
+        _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/approve",
+            json={"approval_attempt_id": attempt_id},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+
+
+def test_map_owner_with_pg_user_id_returns_200(client: TestClient):
+    """Same as approve test but for /map — owner is the pg_user_id UUID."""
+    queue_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+        )),
+        _execute_result(one_or_none=_fake_account_row(account_id)),
+        _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+    ])
+
+    materialize_mock = AsyncMock(return_value=None)
+    with _patch_session(session), \
+         patch("routers.queue_actions.materialize_account_approval", new=materialize_mock):
+        response = client.post(
+            f"/queue/{queue_id}/map",
+            json={"account_id": account_id, "approval_attempt_id": attempt_id},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    materialize_mock.assert_awaited_once()
+
+
+def test_ignore_owner_with_pg_user_id_returns_200(client: TestClient):
+    """Same as approve test but for /ignore — owner is the pg_user_id UUID.
+
+    Combined with P1 #2: the IGNORE_SQL `:user_id::uuid` cast must receive
+    a UUID. Post-fix, the route passes _effective_user_id(ctx) which is
+    the pg_user_id UUID here → cast succeeds.
+    """
+    queue_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+        )),
+        _execute_result(rowcount=1),  # UPDATE succeeded
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    # IGNORE_SQL bound :user_id to the pg_user_id UUID, not the Auth0 subject.
+    update_params = session.calls[1][1]
+    assert update_params["user_id"] == PG_USER_UUID
+
+
+def test_approve_pg_user_id_mismatch_returns_403(client: TestClient):
+    """JWT carries pg_user_id different from owner_user_id → still 403.
+
+    This guards against the bug going in the opposite direction: making
+    the auth boundary too permissive. Effective-user-id = pg_user_id; if
+    that doesn't match owner_user_id, deny.
+    """
+    queue_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+        )),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/approve",
+            json={"approval_attempt_id": str(uuid.uuid4())},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=OTHER_PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 403, response.text
+
+
+# P1 #2 — /ignore must reject non-UUID user identifiers cleanly (400 not 500)
+
+def test_ignore_without_pg_user_id_and_non_uuid_user_id_returns_400(client: TestClient):
+    """JWT lacks pg_user_id AND user_id is Auth0 subject (non-UUID) → 400.
+
+    Pre-fix: the route would pass an Auth0 subject string to
+    `:user_id::uuid` → Postgres cast error → 500.
+
+    The defensive 400 also signals "this caller could not have created
+    this queue row in the first place" (queue inserts use
+    `pg_user_id or user_id` and the column is UUID NOT NULL — so an
+    Auth0-subject-only caller would never have an owner_user_id row
+    they could legitimately ignore).
+    """
+    queue_id = str(uuid.uuid4())
+
+    # JWT has only the Auth0 subject "auth0|owner-queue-1" — non-UUID.
+    # We don't even need to set up a session because the 400 check fires
+    # before the DB transaction opens. But to be robust to ordering, we
+    # provide a session that would otherwise succeed.
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(queue_id=queue_id)),
+        _execute_result(rowcount=1),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={"Authorization": f"Bearer {_make_jwt()}"},
+        )
+
+    assert response.status_code == 400, response.text
+    assert "UUID" in response.json()["detail"]
+
+
+# P1 #3 — /approve must NOT mutate an already-mapped row
+
+def test_approve_does_not_mutate_mapped_row(client: TestClient):
+    """Row is status='mapped' with same approval_attempt_id → 200 replay-success,
+    but UPDATE returns 0 rows (status filter in WHERE excludes 'mapped').
+
+    Without the fix, the row would be flipped back to 'approved', clearing
+    its mapped status and inviting the worker to re-materialize → duplicate
+    materialization + duplicate outbox event.
+    """
+    queue_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        # SELECT shows row is already mapped
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=attempt_id,
+            resolved_account_id=str(uuid.uuid4()),
+        )),
+        # APPROVE_SQL must NOT match (status='mapped' excluded by filter)
+        _execute_result(one_or_none=None, rowcount=0),
+        # Re-SELECT to discriminate — sees mapped → handler returns 200
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=attempt_id,
+        )),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/approve",
+            json={"approval_attempt_id": attempt_id},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "approved"
+    # All three calls were made: SELECT, UPDATE (noop), re-SELECT.
+    assert len(session.calls) == 3
+
+
+def test_approve_sql_filters_archived_and_terminal_status():
+    """APPROVE_SQL's WHERE clause must include archived_at IS NULL AND
+    status IN ('pending', 'approved').
+
+    A direct contract test on the SQL text so future edits can't silently
+    weaken the filter.
+    """
+    from routers.queue_actions import APPROVE_SQL
+    sql_text = str(APPROVE_SQL)
+    assert "archived_at IS NULL" in sql_text
+    assert "status IN ('pending', 'approved')" in sql_text
+
+
+# P1 #4 — /map replays must NOT re-materialize
+
+def test_map_sql_filters_mapped_creating_ignored():
+    """MAP_RESERVE_SQL must exclude rows in terminal/in-flight states.
+
+    Pre-fix: a same-attempt_id replay on a 'mapped' row would re-reserve
+    → handler would call materialize_account_approval again → duplicate
+    outbox + duplicate interaction_contact_links.
+    """
+    from routers.queue_actions import MAP_RESERVE_SQL
+    sql_text = str(MAP_RESERVE_SQL)
+    assert "archived_at IS NULL" in sql_text
+    assert "status NOT IN ('mapped', 'creating', 'ignored')" in sql_text
+
+
+def test_map_replay_with_same_attempt_id_skips_materialization(client: TestClient):
+    """Same-attempt_id replay on already-mapped row → 200, materialize NOT called.
+
+    Stronger version of test_map_idempotent_replay_returns_200_without_re_materializing
+    that specifically exercises the case where attempt_id matches AND
+    resolved_account_id matches AND status='mapped' — the MAP_RESERVE
+    filter must return 0 rows so the handler falls into the replay-success
+    branch.
+    """
+    queue_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=attempt_id,
+            resolved_account_id=account_id,
+        )),
+        _execute_result(one_or_none=_fake_account_row(account_id)),
+        # MAP_RESERVE returns 0 — status filter excludes 'mapped'
+        _execute_result(one_or_none=None),
+        # Re-SELECT shows mapped with same account → replay-success
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=attempt_id,
+            resolved_account_id=account_id,
+        )),
+    ])
+
+    materialize_mock = AsyncMock()
+    with _patch_session(session), \
+         patch("routers.queue_actions.materialize_account_approval", new=materialize_mock):
+        response = client.post(
+            f"/queue/{queue_id}/map",
+            json={"account_id": account_id, "approval_attempt_id": attempt_id},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "mapped"
+    assert body["account_id"] == account_id
+    # CRITICAL: materialize NOT called on replay.
+    materialize_mock.assert_not_awaited()

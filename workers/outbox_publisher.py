@@ -96,7 +96,10 @@ def _build_event(row: Any) -> dict:
             "event_type": row.event_type,
             "payload": row.payload_json,
         }),
-        "EventBusName": os.getenv("EVENT_BUS_NAME", "default"),
+        # Codex Round 2 P2 #5: align with the repo-wide env var name. The
+        # pre-existing aws_event_publisher integration reads
+        # EVENTBRIDGE_BUS_NAME (see main.py:62 + .env.example:55).
+        "EventBusName": os.getenv("EVENTBRIDGE_BUS_NAME", "default"),
     }
 
 

@@ -10,7 +10,7 @@ Optional:
 - WORKER_POLL_INTERVAL_SECONDS — Seconds between worker polls (default: 5)
 - PUBLISHER_POLL_INTERVAL_SECONDS — Seconds between publisher polls (default: 2)
 - AWS_REGION — EventBridge region (default: us-east-1)
-- EVENT_BUS_NAME — EventBridge bus name (default: default)
+- EVENTBRIDGE_BUS_NAME — EventBridge bus name (default: default)
 
 Architecture (Phase 1.5):
 The worker and publisher run as two asyncio tasks in the SAME OS process,
@@ -63,7 +63,7 @@ async def main() -> None:
     )
     logger.info(
         "Publisher starting: interval=%.1fs region=%s bus=%s",
-        publisher_interval, aws_region, os.getenv("EVENT_BUS_NAME", "default"),
+        publisher_interval, aws_region, os.getenv("EVENTBRIDGE_BUS_NAME", "default"),
     )
 
     try:
