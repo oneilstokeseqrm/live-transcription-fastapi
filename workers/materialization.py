@@ -84,11 +84,28 @@ async def materialize_account_approval(
     account_id: str,
     event_type: str,  # "account_created" | "account_mapped"
 ) -> None:
-    """Materialize all signals for a queue entry. Single transaction."""
+    """Materialize all signals for a queue entry.
+
+    IMPORTANT: Caller MUST open a transaction before calling this function and
+    call session.commit() or session.rollback() after. This function does NOT
+    commit. If called outside a transaction, each statement autocommits and the
+    atomic guarantee is lost.
+
+    Raises ValueError if no active signals exist for the queue_id — a queue
+    entry being materialized with zero signals is architecturally wrong (signals
+    are what materialize into contacts) and would produce a malformed outbox
+    row with contact_ids: []. Fail loud so the worker logs + retries.
+    """
     signals = (await session.execute(SELECT_SIGNALS_SQL, {"queue_id": queue_id})).all()
 
-    contact_ids = []
-    interaction_ids = []
+    if not signals:
+        raise ValueError(
+            f"materialize_account_approval called with no active signals "
+            f"for queue_id={queue_id!r}"
+        )
+
+    contact_ids: list[str] = []
+    interaction_ids: list[str] = []
     for s in signals:
         first, last = _split_name(s.contact_display_name)
         result = await session.execute(
@@ -124,8 +141,8 @@ async def materialize_account_approval(
         "account_id": account_id,
         "tenant_id": tenant_id,
         "queue_id": queue_id,
-        "contact_ids": contact_ids,
-        "interaction_ids": list(set(interaction_ids)),
+        "contact_ids": list(dict.fromkeys(contact_ids)),
+        "interaction_ids": list(dict.fromkeys(interaction_ids)),
     }
     await session.execute(
         INSERT_OUTBOX_SQL,

@@ -180,9 +180,11 @@ async def test_materialize_passes_correct_params_to_outbox():
 @pytest.mark.asyncio
 async def test_materialize_does_not_commit():
     """Caller manages the transaction; materialize_account_approval must NOT call session.commit()."""
+    signals = [_fake_signal("alice@acme.com")]
     session = MagicMock()
     session.execute = AsyncMock(side_effect=[
-        _fake_execute_result(all_rows=[]),  # no signals
+        _fake_execute_result(all_rows=signals),
+        _fake_execute_result(returning_value=str(uuid.uuid4())),  # INSERT contact
         _fake_execute_result(),  # UPDATE queue
         _fake_execute_result(returning_value=str(uuid.uuid4())),  # INSERT outbox
     ])
@@ -197,6 +199,77 @@ async def test_materialize_does_not_commit():
 
     session.commit.assert_not_called()
     session.rollback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_materialize_raises_on_empty_signals():
+    """Materializing a queue entry with no active signals is a contract violation.
+
+    The outbox row would carry contact_ids: [] which is architecturally meaningless
+    (signals are what become contacts). Fail loud so the worker logs + retries.
+    """
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[
+        _fake_execute_result(all_rows=[]),  # no signals
+    ])
+
+    with pytest.raises(ValueError, match="no active signals"):
+        await materialize_account_approval(
+            session=session,
+            tenant_id=str(uuid.uuid4()),
+            queue_id="queue-empty-001",
+            account_id=str(uuid.uuid4()),
+            event_type="account_created",
+        )
+
+    # Only the SELECT should have run; no UPDATE/INSERT past the guard
+    assert session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_materialize_dedupes_contact_ids_in_outbox_payload():
+    """Same contact email across multiple signals → single contact_id in payload.
+
+    ON CONFLICT DO UPDATE RETURNING returns the SAME contact_id for repeated
+    emails. The payload must dedupe so downstream consumers don't count or loop
+    over duplicates.
+    """
+    queue_id = str(uuid.uuid4())
+    tenant_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+
+    # Alice appears in three signals (different interactions, same email)
+    signals = [
+        _fake_signal("alice@acme.com", interaction_id=uuid.uuid4()),
+        _fake_signal("alice@acme.com", interaction_id=uuid.uuid4()),
+        _fake_signal("alice@acme.com"),
+    ]
+    alice_contact_id = str(uuid.uuid4())  # ON CONFLICT returns same id thrice
+
+    execute_results = [
+        _fake_execute_result(all_rows=signals),
+        _fake_execute_result(returning_value=alice_contact_id),  # INSERT contact 1
+        _fake_execute_result(),  # INSERT link 1
+        _fake_execute_result(returning_value=alice_contact_id),  # INSERT contact 2
+        _fake_execute_result(),  # INSERT link 2
+        _fake_execute_result(returning_value=alice_contact_id),  # INSERT contact 3
+        _fake_execute_result(),  # UPDATE queue
+        _fake_execute_result(returning_value=str(uuid.uuid4())),  # INSERT outbox
+    ]
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=execute_results)
+
+    await materialize_account_approval(
+        session=session,
+        tenant_id=tenant_id,
+        queue_id=queue_id,
+        account_id=account_id,
+        event_type="account_created",
+    )
+
+    outbox_call = session.execute.await_args_list[-1]
+    payload = json.loads(outbox_call.args[1]["payload_json"])
+    assert payload["contact_ids"] == [alice_contact_id]  # deduplicated
 
 
 # ---------------------------------------------------------------------------
