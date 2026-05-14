@@ -98,12 +98,13 @@ All from Phase 1, plus four new ones surfaced by Codex Round 1:
 - **Backend rejection over frontend trust:** every ingestion path validates `account_id` at the auth-context boundary or 400s (WebSocket: 1008). Queue-hold path is the ONLY exemption.
 - **First-owner-wins UPSERT:** `pending_account_mappings.owner_user_id` is never reassigned by routine UPSERT.
 
-**New invariants from Codex Round 1 (now load-bearing):**
+**New invariants from Codex Round 1 + this session (now load-bearing):**
 
 - **Caller-side completeness:** when adding a new parameter to an internal function, update every caller in the SAME commit. A "wire callers in Phase X.5" deferral is a silent-failure bomb — unit tests pass but production traffic never reaches the new code path. (T1.26.1 was the proof.)
 - **Auth-boundary wins on body/header conflicts:** body fields with the same semantic as an authenticated header value are at best verification checks, at worst security regressions. Default: reject mismatch with 400. (T1.26.2 + T1.26.3 were the proofs.)
 - **Real `/codex review` is non-substitutable.** Static-invariant self-review missed three P1s in the prior session; real Codex caught them. Always run real Codex at every phase boundary.
-- **Production E2E is a real quality gate.** Automated tests + Codex catch 90%+ of issues; the last 10% requires hitting the live API with a Railway-issued short-lived JWT. Wire this into every phase ship from now on.
+- **Production E2E is a real quality gate.** Automated tests + Codex catch 90%+ of issues; the last 10% requires hitting the live API with a Railway-issued short-lived JWT. Wire this into every phase ship from now on. Reusable script at `/tmp/e2e_phase_1_production.py`.
+- **`/context-save` at session end is mandatory.** Handoff docs (this file + auto-memory) answer "what's the state?"; the gstack checkpoint answers "is the next agent's first command going to work?" Both are required. The prior session shipped a great handoff doc but no checkpoint — when this session ran `/context-restore`, it returned `NO_CHECKPOINTS` and started cold. This session fixed it by saving a checkpoint at the end. Every session must do the same before declaring done.
 
 ---
 
@@ -180,7 +181,7 @@ When you stop, do a clean handoff: update auto-memory + rewrite this NEXT-SESSIO
 
 ## Suggested first actions for the next agent
 
-1. Run `/context-restore` to load any gstack checkpoint state for this project.
+1. Run `/context-restore`. You should see a checkpoint titled **"phase-1-shipped-handoff-for-phase-1.5"** dated 2026-05-14 — load it. It contains the working state at session end, including production credentials reference, project/service/environment IDs, and explicit warnings about gaps not to repeat (e.g., the production-E2E timing). If `/context-restore` returns `NO_CHECKPOINTS`, something went wrong — surface that immediately before doing any work.
 2. Read `MEMORY.md` + this file in full.
 3. Read `tasks/downstream/codex-phase-1-findings.md` Tasks 1.26.4, 1.26.5, 1.26.6 in order.
 4. Skim Phase 1 ship summary in the auto-memory project file (`## Phase 1 SHIPPED` section).
