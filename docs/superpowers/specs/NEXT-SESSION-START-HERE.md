@@ -110,6 +110,57 @@ All from Phase 1 + Phase 1.5 P2 cleanup, plus:
 
 ---
 
+## Pre-flight checks (run BEFORE any code work)
+
+These are non-negotiable verifications, because the user is running a database cleanup with a different agent between sessions.
+
+### Check 1: Test tenant still exists in Neon eq-dev
+
+```python
+# Via mcp__neon__run_sql
+SELECT id, name FROM tenants WHERE id = '11111111-1111-4111-8111-111111111111';
+```
+
+Expected: one row. If empty, the cleanup agent removed the test tenant — STOP and seed it before any other database work:
+
+```sql
+INSERT INTO tenants (id, name, created_at, updated_at)
+VALUES ('11111111-1111-4111-8111-111111111111', 'EQ Test Tenant', NOW(), NOW())
+ON CONFLICT (id) DO NOTHING;
+```
+
+### Check 2: Phase 1.5 schema still intact
+
+```python
+# Verify the key new columns + table exist
+SELECT column_name FROM information_schema.columns
+WHERE table_name = 'contacts' AND column_name = 'account_id' AND is_nullable = 'NO';
+
+SELECT to_regclass('public.account_provisioning_outbox') IS NOT NULL AS exists;
+```
+
+Both must return positive. If either fails, the cleanup agent damaged the schema and you must investigate before proceeding (likely Prisma migration drift from eq-frontend).
+
+### Check 3: Production E2E artifact still on disk
+
+```bash
+test -f /tmp/e2e_phase_1_production.py && echo "PRESENT" || echo "MISSING"
+```
+
+If MISSING (the file lives in `/tmp` which doesn't survive system reboots), you need to recreate it before you can run post-deploy verification. The recreation pattern: a Python script using `httpx` + `pyjwt` that pulls `INTERNAL_JWT_SECRET` via Railway MCP from service `59a69f3d-9a24-4041-942a-891c4a81c5fb`, issues a 5-min JWT with `{tenant_id: test_tenant, user_id: auth0|test-user-001, iss: eq-frontend, aud: eq-backend}` signed with HS256, and exercises 13 cases against `https://live-transcription-fastapi-production.up.railway.app`. Reference: prior session's checkpoint at `~/.gstack/projects/oneilstokeseqrm-live-transcription-fastapi/checkpoints/20260514-070009-phase-1-shipped-handoff-for-phase-1.5.md` describes the 9 original cases; current expanded version has 13. If recreate: copy the structure from `tasks/downstream/codex-phase-1-findings.md` Test plan section.
+
+### Check 4: Production endpoint reachable
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://live-transcription-fastapi-production.up.railway.app/healthz
+```
+
+Expected: `200` or `404` (both indicate the service is up; `/healthz` route may not exist but the server responds).
+
+If all four checks pass, proceed. If any fail, STOP and surface to user.
+
+---
+
 ## Suggested first actions
 
 1. Run `/context-restore`. Expect a checkpoint titled **"phase-1.5-worker-foundation-merged-publisher-pending"** dated 2026-05-14. Load it. If `NO_CHECKPOINTS`, STOP and investigate.
