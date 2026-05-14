@@ -147,6 +147,13 @@ def _build_event(row: Any) -> dict:
     - account_id (the materialized account)
     - event_type (denormalized for filtering)
     - payload (the original payload_json — contact_ids, interaction_ids, etc.)
+
+    TODO(phase-2 hardening): EventBridge enforces a 256KB cap on Detail.
+    A queue entry with ~250+ signals would exceed this and churn on
+    MARK_FAILED. Typical entries are 1-10 signals → ~1KB Detail, well
+    under the limit at Phase 1.5 scale. Codex Round 7 P2 finding
+    2026-05-14 — deferred to Phase 2 alongside batch publishing,
+    dead-letter queues, and outbox retention policies.
     """
     return {
         "Source": "com.eq.contact-quality",
