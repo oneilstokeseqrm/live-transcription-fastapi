@@ -2,10 +2,14 @@
 
 These tests cover the JWT auth path (the production path) for /text/clean. We
 issue a valid internal JWT and verify that the absence of the X-Account-ID
-header trips the 400 rejection inside get_auth_context() before any business
-logic runs. With the header present, we expect anything OTHER than 400-for-
-account_id (the 200 happy path is fine; other downstream validation failures
-are also fine for this test's purpose).
+header trips the 400 rejection inside get_auth_context_ingestion() before any
+business logic runs. With the header present, we expect anything OTHER than
+400-for-account_id (the 200 happy path is fine; other downstream validation
+failures are also fine for this test's purpose).
+
+The polling counterpart (get_auth_context_polling) is also exercised here for
+GET /upload/status/{job_id} — Phase 1.5 / T1.26.4 split the helper so polling
+routes do NOT require X-Account-ID. Ingestion routes still do.
 """
 
 import os
@@ -74,7 +78,7 @@ def test_text_clean_rejects_missing_account_id_header(client: TestClient):
     """Auth-context layer rejects missing X-Account-ID header with 400 (Phase 1 / T1.4).
 
     Body contains a valid account_id so Pydantic validation passes; the 400
-    must come from get_auth_context()'s header check.
+    must come from get_auth_context_ingestion()'s header check.
     """
     token = _make_jwt()
     response = client.post(
@@ -231,3 +235,45 @@ def test_upload_init_accepts_matching_account_id(client: TestClient):
     )
     assert "account_id mismatch" not in response.text.lower()
     assert "x-account-id header is required" not in response.text.lower()
+
+
+# --- Polling routes (T1.26.4) ---
+#
+# Polling/read-only routes must NOT require X-Account-ID. The auth-context
+# helper that gates ingestion writes (get_auth_context_ingestion) is too
+# strict for clients polling job status with just a JWT. Phase 1.5 splits
+# the helper so polling routes use get_auth_context_polling instead — same
+# JWT validation, no X-Account-ID gate. The route handler still enforces
+# tenant ownership on the job record.
+
+def test_upload_status_does_not_require_account_id_header(client: TestClient):
+    """GET /upload/status/{job_id} must NOT reject requests missing X-Account-ID.
+
+    Phase 1.5 / T1.26.4: polling endpoints use get_auth_context_polling and
+    therefore must NOT trip the auth-context 400 when X-Account-ID is absent.
+    Passing a bogus job_id is fine here — we expect 404 (job not found) or
+    similar non-auth-context failure, never the 400 "X-Account-ID header is
+    required" rejection that ingestion routes raise.
+    """
+    token = _make_jwt()
+    bogus_job_id = str(uuid.uuid4())
+    response = client.get(
+        f"/upload/status/{bogus_job_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    # The exact response code depends on whether the job exists. What matters
+    # is that the auth-context layer did NOT reject us for missing X-Account-ID.
+    assert response.status_code != 400 or "x-account-id" not in response.text.lower(), (
+        f"GET /upload/status should not require X-Account-ID but got: "
+        f"status={response.status_code}, body={response.text}"
+    )
+
+
+def test_upload_status_rejects_missing_jwt(client: TestClient):
+    """GET /upload/status/{job_id} still requires JWT authentication.
+
+    The polling helper relaxes X-Account-ID, NOT JWT verification.
+    """
+    bogus_job_id = str(uuid.uuid4())
+    response = client.get(f"/upload/status/{bogus_job_id}")
+    assert response.status_code == 401, response.text

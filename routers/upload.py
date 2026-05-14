@@ -47,7 +47,10 @@ from models.participant_spec import ParticipantSpec
 from services.s3_service import S3Service, S3ServiceError
 from services.database import get_async_session
 from services.internal_domains import get_tenant_internal_domains
-from utils.context_utils import get_auth_context
+from utils.context_utils import (
+    get_auth_context_ingestion,
+    get_auth_context_polling,
+)
 
 from sqlalchemy import select
 
@@ -127,8 +130,8 @@ async def upload_init(body: UploadInitRequest, request: Request):
         HTTPException 401: Invalid/missing JWT
         HTTPException 500: S3 or database error
     """
-    # Authenticate and get tenant context
-    context = get_auth_context(request)
+    # Authenticate and get tenant context (ingestion: X-Account-ID required)
+    context = get_auth_context_ingestion(request)
 
     job_id = str(uuid.uuid4())
     interaction_id = context.interaction_id
@@ -237,8 +240,9 @@ async def upload_complete(body: UploadCompleteRequest, request: Request):
         HTTPException 403: File key doesn't belong to tenant
         HTTPException 404: Job not found or file not in S3
     """
-    # Authenticate and get tenant context
-    context = get_auth_context(request)
+    # Authenticate and get tenant context (ingestion: X-Account-ID required —
+    # /upload/complete triggers async write/persist via _process_upload_job)
+    context = get_auth_context_ingestion(request)
 
     logger.info(
         f"Upload complete: file_key={body.file_key[:50]}..., "
@@ -338,8 +342,9 @@ async def upload_status(job_id: str, request: Request):
         HTTPException 403: Job doesn't belong to tenant
         HTTPException 404: Job not found
     """
-    # Authenticate and get tenant context
-    context = get_auth_context(request)
+    # Authenticate and get tenant context (polling: X-Account-ID NOT required —
+    # tenant ownership of the job is enforced below; this is a read-only route)
+    context = get_auth_context_polling(request)
 
     # Validate job_id format
     try:

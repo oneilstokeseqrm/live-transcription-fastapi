@@ -19,7 +19,7 @@ from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
 from services.internal_domains import get_tenant_internal_domains
-from utils.context_utils import get_auth_context
+from utils.context_utils import get_auth_context_ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
     """
     # Validate and extract context (raises HTTPException 401/400 on failure)
     # Supports JWT from gateway (preferred) or legacy headers (when ALLOW_LEGACY_HEADER_AUTH=true)
-    context = get_auth_context(request)
+    context = get_auth_context_ingestion(request)
     
     logger.info(
         f"Text cleaning started: interaction_id={context.interaction_id}, "

@@ -20,7 +20,7 @@ from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
 from services.internal_domains import get_tenant_internal_domains
-from utils.context_utils import get_auth_context
+from utils.context_utils import get_auth_context_ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ async def process_batch_audio(file: UploadFile, request: Request):
     # Extract and validate request context (raises HTTPException 401/400 on failure)
     # Supports JWT from gateway (preferred) or legacy headers (when ALLOW_LEGACY_HEADER_AUTH=true)
     # Requirements: 1.1, 1.2
-    context = get_auth_context(request)
+    context = get_auth_context_ingestion(request)
     
     processing_id = str(uuid.uuid4())
     logger.info(
