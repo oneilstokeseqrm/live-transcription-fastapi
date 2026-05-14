@@ -1,9 +1,10 @@
 # Next Session — Start Here
 
 **Project:** Contact Quality and Account-Anchoring Initiative
-**Last session:** 2026-05-14 (Phase 1.5 main-scope FOUNDATION — worker code shipped in PR #12)
-**Status:** PR #12 open. Worker code, agent client, materialization, advisory lock, entrypoint all landed across 19 commits. Cross-repo eq-frontend PR #366 applied the Phase 1.5 schema migration to Neon eq-dev. Codex review 6 rounds, GATE: PASS. Production E2E **13/13 PASS** against the live endpoint (no regression).
-**This session's job:** Land PR #12 to main, then ship the **outbox publisher (Task 1.5.9) + queue actions (Tasks 1.5.10-1.5.11)** and deploy the Railway worker service per `tasks/downstream/railway-phase-1-5-worker.md`. Optional stretch: extend production E2E with worker case once deployment lands.
+**Last session:** 2026-05-14 (Phase 1.5 main-scope FOUNDATION — worker code MERGED via PR #12 + post-merge E2E verified)
+**Status:** PR #12 MERGED to main at commit `11b3b30` via squash. Railway auto-deploy `c13b0847-bdc0-4a06-afd0-3c4e4c31804d` reached SUCCESS. Production E2E re-run post-merge: **13/13 PASS** against the live endpoint. Worker code (advisory lock, agent HTTP client, atomic materialization, worker poll loop, entrypoint) lives in main but the existing FastAPI Railway service doesn't run `python -m workers` — a new Railway service for that is below in Workstream D.
+**This session's job:** Ship the **outbox publisher (Task 1.5.9) + queue actions (Tasks 1.5.10-1.5.11)** and deploy the Railway worker service per `tasks/downstream/railway-phase-1-5-worker.md`. Optional stretch: extend production E2E with worker case once deployment lands.
+**Also available:** A dispatch-pattern research note may be at `docs/superpowers/specs/2026-05-14-dispatch-patterns-research.md` (background-dispatched at end of previous session to validate polling-vs-event-driven architecture before Phase 2). If present, read it BEFORE starting the publisher build — it may recommend an alternative dispatch pattern worth considering. If absent, the research subagent didn't complete; the polling architecture in PR #12 is the default.
 
 ---
 
@@ -25,15 +26,9 @@
 
 ## What this session does
 
-### Workstream A — Land PR #12 to main
+### Workstream A — ✅ DONE (in prior session)
 
-PR #12 contains 19 commits of worker code. The branch is `feat/contact-quality-phase-1-5`.
-
-Steps:
-1. Verify PR #12 CI is green (or skipping — this repo doesn't have CI for Python tests; the verification is `pytest` locally + production E2E).
-2. Run production E2E one more time against the live endpoint to confirm no regression. The artifact is `/tmp/e2e_phase_1_production.py` (may not survive across sessions — recreate from PR #11 / earlier session artifacts if needed). Expected: 13/13 PASS.
-3. Merge with `gh pr merge --squash --delete-branch`.
-4. Verify Railway auto-deploys the FastAPI service (existing service updates on every main commit). Note: the WORKER service does not yet exist — that's part of Workstream B.
+PR #12 merged to main at commit `11b3b30` via squash at end of prior session. Railway auto-deployed the FastAPI service (`c13b0847-bdc0-4a06-afd0-3c4e4c31804d` SUCCESS). Production E2E re-run post-merge: 13/13 PASS. Worker code is in main but the worker process itself is not yet running — that's Workstream D.
 
 ### Workstream B — Outbox publisher (Task 1.5.9)
 
@@ -117,13 +112,13 @@ All from Phase 1 + Phase 1.5 P2 cleanup, plus:
 
 ## Suggested first actions
 
-1. Run `/context-restore`. Expect a checkpoint titled **"phase-1.5-worker-foundation-shipped-publisher-pending"** dated 2026-05-14. Load it. If `NO_CHECKPOINTS`, STOP and investigate.
+1. Run `/context-restore`. Expect a checkpoint titled **"phase-1.5-worker-foundation-merged-publisher-pending"** dated 2026-05-14. Load it. If `NO_CHECKPOINTS`, STOP and investigate.
 
-2. Read this file + `feedback_destructive_ops_blast_radius.md` + `project_contact_quality_initiative.md`'s `## Phase 1.5 main-scope foundation SHIPPED` section.
+2. Read this file + `feedback_destructive_ops_blast_radius.md` + `project_contact_quality_initiative.md`'s `## Phase 1.5 main-scope foundation MERGED` section.
 
-3. Check PR #12 status. Either merge it (after confirming the user wants to ship) or address any review feedback first.
+3. **IF the dispatch-pattern research note exists** at `docs/superpowers/specs/2026-05-14-dispatch-patterns-research.md`: read it carefully. It may recommend a different dispatch architecture (e.g., Postgres logical replication via EventBridge Pipes, hybrid LISTEN/NOTIFY + polling). If it recommends a course change, surface that as a strategic decision before building the publisher. If it confirms polling is right, proceed with confidence.
 
-4. After PR #12 merges: implement the outbox publisher (Workstream B) via `superpowers:subagent-driven-development`. Spec the implementer with the plan's lines 3448-3640. Use TDD with mock-driven tests matching the Phase 1.5 P2 + main-scope patterns (no real-DB fixtures yet).
+4. Implement the outbox publisher (Workstream B) via `superpowers:subagent-driven-development`. Spec the implementer with the plan's lines 3448-3640. Use TDD with mock-driven tests matching the Phase 1.5 P2 + main-scope patterns (no real-DB fixtures yet).
 
 5. Then queue actions (Workstream C). Then Railway worker deployment (Workstream D). Then optionally the E2E extension (Workstream E).
 
