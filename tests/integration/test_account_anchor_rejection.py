@@ -277,3 +277,80 @@ def test_upload_status_rejects_missing_jwt(client: TestClient):
     bogus_job_id = str(uuid.uuid4())
     response = client.get(f"/upload/status/{bogus_job_id}")
     assert response.status_code == 401, response.text
+
+
+@pytest.fixture
+def mock_upload_status_session():
+    """Stub get_async_session for /upload/status so we don't hit a real DB.
+
+    The auth-context layer runs BEFORE the DB lookup; we mock the session so
+    the route returns 404 (job-not-found) cleanly instead of leaking real DB
+    connections across the test loop boundary.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    with patch("routers.upload.get_async_session") as mock_session:
+        async_session_cm = MagicMock()
+        async_session_instance = AsyncMock()
+        # session.execute(...).scalar_one_or_none() → None (job not found)
+        result_mock = MagicMock()
+        result_mock.scalar_one_or_none.return_value = None
+        async_session_instance.execute = AsyncMock(return_value=result_mock)
+        async_session_cm.__aenter__.return_value = async_session_instance
+        async_session_cm.__aexit__.return_value = None
+        mock_session.return_value = async_session_cm
+        yield
+
+
+@pytest.mark.usefixtures("mock_upload_status_session")
+def test_upload_status_polling_legacy_headers_no_account_id(
+    client: TestClient, monkeypatch
+):
+    """Polling tolerates missing X-Account-ID on the legacy-header path too.
+
+    Regression guard: the polling helper must not require X-Account-ID
+    regardless of whether the request is JWT-authed or legacy-header-authed.
+    Without this test, a future tightening of the legacy-header path on the
+    polling helper would slip through (only the JWT path is otherwise
+    covered).
+    """
+    monkeypatch.setenv("ALLOW_LEGACY_HEADER_AUTH", "true")
+    bogus_job_id = str(uuid.uuid4())
+    response = client.get(
+        f"/upload/status/{bogus_job_id}",
+        headers={
+            "X-Tenant-ID": "11111111-1111-4111-8111-111111111111",
+            "X-User-ID": "test-user@example.com",
+            # Deliberately no X-Account-ID
+        },
+    )
+    # 404 (job not found, expected with mocked session) is the happy path. The
+    # only failure mode this test guards against is a 400 mentioning
+    # X-Account-ID — that would mean the polling helper started requiring the
+    # header on the legacy path.
+    assert response.status_code != 400 or "x-account-id" not in response.text.lower(), (
+        f"GET /upload/status legacy-header path should not require X-Account-ID "
+        f"but got: status={response.status_code}, body={response.text}"
+    )
+
+
+# --- Whitespace regression (T1.26.4 follow-up) ---
+
+def test_text_clean_rejects_whitespace_account_id_header(client: TestClient):
+    """Whitespace-only X-Account-ID is treated as missing.
+
+    Regression guard for the auth-context contract: a whitespace string is
+    functionally the same as missing for FK / account-anchor purposes. The
+    boundary must reject it loudly instead of allowing whitespace to
+    propagate to the DB layer.
+    """
+    token = _make_jwt()
+    response = client.post(
+        "/text/clean",
+        json={"text": "hello world", "account_id": "acct-1"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": "   ",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "x-account-id" in response.text.lower()

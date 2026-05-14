@@ -10,11 +10,14 @@ Four extraction modes are available:
    - Falls back to environment variables and defaults
    - Never raises exceptions
 
-2. get_validated_context() - Strict header validation (legacy, ingestion variant)
-   - Requires X-Tenant-ID (valid UUID), X-User-ID (non-empty), X-Account-ID
+2. get_validated_context() - Legacy-header strict path; accepts a
+   require_account_id flag for ingestion vs polling contracts. Called by
+   get_auth_context_ingestion and get_auth_context_polling.
+   - Requires X-Tenant-ID (valid UUID), X-User-ID (non-empty)
+   - Requires X-Account-ID when require_account_id=True (ingestion);
+     allows it to be absent when require_account_id=False (polling).
    - Optional X-Trace-Id (valid UUID if provided, generated if missing)
    - Raises HTTPException 400 on validation failure
-   - Set require_account_id=False to relax the X-Account-ID requirement.
 
 3. get_auth_context_ingestion() - Unified auth for INGESTION (writes/mutations).
    - Tries JWT from Authorization header first (gateway requests)
@@ -152,16 +155,12 @@ def get_validated_context(
     # Validate X-Trace-Id (optional, generate if missing)
     trace_id = _validate_trace_id(request, interaction_id)
 
-    # Account anchor is required for ingestion endpoints; backend rejects when
-    # absent. Polling/read-only routes opt out via require_account_id=False.
-    header_account_id = request.headers.get("X-Account-ID")
-    if require_account_id and not header_account_id:
-        raise HTTPException(
-            status_code=400,
-            detail="X-Account-ID header is required for this endpoint"
-        )
-    # Sentinel "" when not required and absent — callers MUST NOT persist this.
-    account_id = header_account_id or ""
+    # Account anchor contract: required for ingestion (raises 400 when missing
+    # or whitespace-only); relaxed to "" sentinel for polling/read-only routes.
+    # Callers MUST NOT persist the "" sentinel.
+    account_id = _require_or_relax_account_id_header(
+        request, required=require_account_id
+    )
 
     # Log extracted context
     logger.info(
@@ -348,16 +347,12 @@ def _extract_context_from_jwt(
     # Extract trace_id from header or generate
     trace_id = _validate_trace_id(request, interaction_id)
 
-    # Account anchor is required for ingestion endpoints; backend rejects when
-    # absent. Polling/read-only routes opt out via require_account_id=False.
-    header_account_id = request.headers.get("X-Account-ID")
-    if require_account_id and not header_account_id:
-        raise HTTPException(
-            status_code=400,
-            detail="X-Account-ID header is required for this endpoint"
-        )
-    # Sentinel "" when not required and absent — callers MUST NOT persist this.
-    account_id = header_account_id or ""
+    # Account anchor contract: required for ingestion (raises 400 when missing
+    # or whitespace-only); relaxed to "" sentinel for polling/read-only routes.
+    # Callers MUST NOT persist the "" sentinel.
+    account_id = _require_or_relax_account_id_header(
+        request, required=require_account_id
+    )
 
     logger.info(
         f"JWT auth context: interaction_id={interaction_id}, "
@@ -374,6 +369,41 @@ def _extract_context_from_jwt(
         pg_user_id=claims.pg_user_id,
         user_name=claims.user_name,
     )
+
+
+def _require_or_relax_account_id_header(request: Request, *, required: bool) -> str:
+    """Resolve X-Account-ID per the ingestion-vs-polling contract.
+
+    Centralizes the contract for the X-Account-ID header so the JWT path
+    (`_extract_context_from_jwt`) and the legacy-header path
+    (`get_validated_context`) stay in lockstep. Whitespace-only values are
+    treated as missing — a whitespace string is functionally the same as
+    absent for FK/account-anchor purposes and would otherwise propagate
+    invalid identifiers to the DB layer.
+
+    Args:
+        request: FastAPI Request object
+        required: True for ingestion routes (missing/whitespace raises 400);
+            False for polling routes (missing returns "" sentinel).
+
+    Returns:
+        The trimmed header value when present and non-whitespace; "" when
+        absent or whitespace-only AND required is False.
+
+    Raises:
+        HTTPException: 400 when required is True and the header is missing
+        or whitespace-only.
+    """
+    header_account_id = request.headers.get("X-Account-ID")
+    trimmed = header_account_id.strip() if header_account_id else ""
+    if not trimmed:
+        if required:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Account-ID header is required for this endpoint",
+            )
+        return ""
+    return trimmed
 
 
 def _validate_tenant_id(request: Request) -> str:
