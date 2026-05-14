@@ -50,7 +50,7 @@ SET_CREATING_SQL = text("""
 
 
 SELECT_STATUS_SQL = text("""
-    SELECT status, resolved_account_id::text AS resolved_account_id
+    SELECT status, archived_at, resolved_account_id::text AS resolved_account_id
     FROM pending_account_mappings
     WHERE id = :queue_id
 """)
@@ -82,6 +82,15 @@ async def process_one_approved_entry(
         return
 
     row = (await session.execute(SELECT_STATUS_SQL, {"queue_id": queue_id})).one()
+    if row.archived_at is not None:
+        # Archive/expiry flows set archived_at without changing status. The
+        # outer poll may select a row that was archived between SELECT and
+        # this re-read. Skip — do NOT call the agent for retired entries.
+        logger.info(
+            "Queue %s archived_at=%s; skip (race: archived after poll)",
+            queue_id, row.archived_at,
+        )
+        return
     if row.status == "mapped":
         logger.info("Queue %s already mapped; skip (replay-safe)", queue_id)
         return

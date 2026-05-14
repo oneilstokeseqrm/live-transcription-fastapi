@@ -71,12 +71,43 @@ async def test_skips_when_advisory_lock_not_acquired():
 
 
 @pytest.mark.asyncio
+async def test_skips_when_archived_after_poll():
+    """archived_at IS NOT NULL → skip (race: archived between poll and process)."""
+    import datetime
+    queue_id = str(uuid.uuid4())
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[
+        _fake_result(one_value=_row(
+            status="approved",
+            archived_at=datetime.datetime(2026, 5, 14, 12, 0, 0),  # archived
+            resolved_account_id=None,
+        )),
+    ])
+
+    with patch(
+        "workers.account_provisioning_worker.try_acquire_queue_lock",
+        AsyncMock(return_value=True),
+    ):
+        agent_client = MagicMock()
+        agent_client.enrich = AsyncMock()
+        await process_one_approved_entry(
+            session=session,
+            queue_id=queue_id,
+            agent_client=agent_client,
+        )
+
+    # Only the SELECT_STATUS ran; no agent call, no further work
+    assert session.execute.await_count == 1
+    agent_client.enrich.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_skips_when_already_mapped_replay_safe():
     """If status='mapped' on read, worker no-ops (replay-safe)."""
     queue_id = str(uuid.uuid4())
     session = MagicMock()
     session.execute = AsyncMock(side_effect=[
-        _fake_result(one_value=_row(status="mapped", resolved_account_id=str(uuid.uuid4()))),
+        _fake_result(one_value=_row(status="mapped", archived_at=None, resolved_account_id=str(uuid.uuid4()))),
     ])
 
     with patch(
@@ -102,7 +133,7 @@ async def test_warns_and_returns_on_unexpected_status():
     queue_id = str(uuid.uuid4())
     session = MagicMock()
     session.execute = AsyncMock(side_effect=[
-        _fake_result(one_value=_row(status="pending", resolved_account_id=None)),
+        _fake_result(one_value=_row(status="pending", archived_at=None, resolved_account_id=None)),
     ])
 
     with patch(
@@ -131,7 +162,7 @@ async def test_happy_path_approved_to_mapped():
 
     session = MagicMock()
     session.execute = AsyncMock(side_effect=[
-        _fake_result(one_value=_row(status="approved", resolved_account_id=None)),  # SELECT_STATUS
+        _fake_result(one_value=_row(status="approved", archived_at=None, resolved_account_id=None)),  # SELECT_STATUS
         _fake_result(),  # SET_CREATING update
         _fake_result(one_value=_row(tenant_id=tenant_id, domain=domain)),  # SELECT tenant + domain
     ])
@@ -185,7 +216,7 @@ async def test_creating_status_skips_set_creating_but_still_processes():
 
     session = MagicMock()
     session.execute = AsyncMock(side_effect=[
-        _fake_result(one_value=_row(status="creating", resolved_account_id=None)),  # SELECT_STATUS
+        _fake_result(one_value=_row(status="creating", archived_at=None, resolved_account_id=None)),  # SELECT_STATUS
         _fake_result(),  # SET_CREATING update (will no-op due to WHERE status='approved')
         _fake_result(one_value=_row(tenant_id=tenant_id, domain=domain)),  # SELECT tenant + domain
     ])

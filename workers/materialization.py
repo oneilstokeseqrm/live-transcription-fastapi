@@ -11,6 +11,7 @@ session.commit() / session.rollback().
 """
 
 import json
+import uuid
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,20 +46,37 @@ INSERT_CONTACT_SQL = text("""
 # (cross-account reassignment is Phase 3 scope — fail loud).
 
 
+UPSERT_RAW_INTERACTION_SQL = text("""
+    INSERT INTO raw_interactions (
+        interaction_id, tenant_id, interaction_type, updated_at
+    ) VALUES (
+        :interaction_id, :tenant_id, :interaction_type, NOW()
+    )
+    ON CONFLICT (interaction_id) DO NOTHING
+""")
+
+
+INSERT_PLACEHOLDER_SUMMARY_SQL = text("""
+    INSERT INTO interaction_summaries (
+        summary_id, tenant_id, interaction_id, summary_type, created_at, updated_at
+    ) VALUES (
+        :summary_id, :tenant_id, :interaction_id, :summary_type, NOW(), NOW()
+    )
+""")
+
+
 INSERT_LINK_SQL = text("""
     INSERT INTO interaction_contact_links (link_id, interaction_id, contact_id)
-    SELECT gen_random_uuid(), s.summary_id, :contact_id
-    FROM interaction_summaries s
-    WHERE s.interaction_id = :raw_interaction_id
-    ORDER BY s.created_at DESC
-    LIMIT 1
-    ON CONFLICT DO NOTHING
+    VALUES (gen_random_uuid(), :summary_id, :contact_id)
 """)
-# Best-effort link: a raw_interaction_id may have 0 or N summaries (summaries
-# are produced async). We pick the most-recent summary deterministically.
-# When no summary exists yet, no link is inserted; the outbox payload's
-# interaction_ids list remains the durable source of truth for downstream
-# Neo4j consumers, which MERGE the edges from the AccountCreated event.
+# Link strategy: matches services/intelligence_service.py:_persist_contact_links.
+# Each materialize call creates at most one placeholder interaction_summaries
+# row per raw_interaction_id (lazily, cached in `summary_id_by_raw_id`). All
+# contacts for that interaction link to the same placeholder summary, so
+# (summary_id, contact_id) pairs are unique within one materialize call.
+# The summaries-writer service may later create additional rows for the same
+# raw_interaction_id (no unique constraint on interaction_id); that is
+# expected per the existing pattern.
 
 
 UPDATE_QUEUE_SQL = text("""
@@ -121,6 +139,13 @@ async def materialize_account_approval(
 
     contact_ids: list[str] = []
     interaction_ids: list[str] = []
+    # Lazy cache: at most one placeholder interaction_summaries row per
+    # raw_interaction_id, created on first reference. All contacts for that
+    # interaction link to the same summary_id, so (summary_id, contact_id)
+    # pairs are unique within this materialize call (no link duplication).
+    summary_id_by_raw_id: dict[str, str] = {}
+    linked_pairs: set[tuple[str, str]] = set()
+
     for s in signals:
         first, last = _split_name(s.contact_display_name)
         result = await session.execute(
@@ -148,14 +173,40 @@ async def materialize_account_approval(
         contact_ids.append(contact_id)
 
         if s.interaction_id is not None:
-            await session.execute(
-                INSERT_LINK_SQL,
-                {
-                    "contact_id": contact_id,
-                    "raw_interaction_id": s.interaction_id,
-                },
-            )
-            interaction_ids.append(str(s.interaction_id))
+            raw_id = str(s.interaction_id)
+            summary_id = summary_id_by_raw_id.get(raw_id)
+            if summary_id is None:
+                # Ensure parent raw_interactions row exists (summaries-writer
+                # may have already created it; ON CONFLICT DO NOTHING is safe).
+                await session.execute(
+                    UPSERT_RAW_INTERACTION_SQL,
+                    {
+                        "interaction_id": s.interaction_id,
+                        "tenant_id": tenant_id,
+                        "interaction_type": "meeting",
+                    },
+                )
+                # Create placeholder summary so FK is satisfied.
+                summary_id = str(uuid.uuid4())
+                await session.execute(
+                    INSERT_PLACEHOLDER_SUMMARY_SQL,
+                    {
+                        "summary_id": summary_id,
+                        "tenant_id": tenant_id,
+                        "interaction_id": s.interaction_id,
+                        "summary_type": "meeting",
+                    },
+                )
+                summary_id_by_raw_id[raw_id] = summary_id
+
+            pair = (summary_id, contact_id)
+            if pair not in linked_pairs:
+                await session.execute(
+                    INSERT_LINK_SQL,
+                    {"summary_id": summary_id, "contact_id": contact_id},
+                )
+                linked_pairs.add(pair)
+            interaction_ids.append(raw_id)
 
     await session.execute(
         UPDATE_QUEUE_SQL,
