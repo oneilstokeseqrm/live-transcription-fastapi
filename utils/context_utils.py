@@ -72,23 +72,25 @@ def get_request_context(request: Request) -> RequestContext:
     # Extract user_id with fallback chain
     user_id = _extract_user_id(request, interaction_id)
     
-    # Extract account_id (optional, no default)
+    # Extract account_id (optional in this lenient path; WebSocket /listen
+    # is the sole caller and gets tightened in Task 1.11 of the Contact
+    # Quality Initiative, after which this path will also require it).
     account_id = _extract_account_id(request)
-    
+
     # Extract trace_id (optional, generate if not provided)
     trace_id = _extract_trace_id(request, interaction_id)
-    
+
     # Log extracted context
     logger.info(
         f"Context extracted: interaction_id={interaction_id}, "
         f"tenant_id={tenant_id}, user_id={user_id}, "
         f"account_id={account_id or 'None'}, trace_id={trace_id}"
     )
-    
+
     return RequestContext(
         tenant_id=tenant_id,
         user_id=user_id,
-        account_id=account_id,
+        account_id=account_id,  # type: ignore[arg-type]  # T1.11 tightens this
         interaction_id=interaction_id,
         trace_id=trace_id
     )
@@ -129,15 +131,20 @@ def get_validated_context(request: Request) -> RequestContext:
     
     # Validate X-Trace-Id (optional, generate if missing)
     trace_id = _validate_trace_id(request, interaction_id)
-    
-    # Extract account_id (optional, no validation)
+
+    # Account anchor is required for ingestion endpoints; backend rejects when absent.
     account_id = request.headers.get("X-Account-ID")
-    
+    if not account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Account-ID header is required for this endpoint"
+        )
+
     # Log extracted context
     logger.info(
         f"Validated context: interaction_id={interaction_id}, "
         f"tenant_id={tenant_id}, user_id={user_id}, "
-        f"account_id={account_id or 'None'}, trace_id={trace_id}"
+        f"account_id={account_id}, trace_id={trace_id}"
     )
     
     return RequestContext(
@@ -250,13 +257,18 @@ def _extract_context_from_jwt(
     # Extract trace_id from header or generate
     trace_id = _validate_trace_id(request, interaction_id)
 
-    # Extract optional account_id from header (not in JWT)
+    # Account anchor is required for ingestion endpoints; backend rejects when absent.
     account_id = request.headers.get("X-Account-ID")
+    if not account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Account-ID header is required for this endpoint"
+        )
 
     logger.info(
         f"JWT auth context: interaction_id={interaction_id}, "
         f"tenant_id={claims.tenant_id[:8]}..., user_id={claims.user_id[:20]}..., "
-        f"account_id={account_id or 'None'}, trace_id={trace_id}"
+        f"account_id={account_id}, trace_id={trace_id}"
     )
 
     return RequestContext(

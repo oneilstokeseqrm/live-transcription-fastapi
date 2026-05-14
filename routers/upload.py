@@ -43,8 +43,10 @@ from models.job_models import (
     UploadCompleteRequest,
     UploadCompleteResponse,
 )
+from models.participant_spec import ParticipantSpec
 from services.s3_service import S3Service, S3ServiceError
 from services.database import get_async_session
+from services.internal_domains import get_tenant_internal_domains
 from utils.context_utils import get_auth_context
 
 from sqlalchemy import select
@@ -89,8 +91,13 @@ router = APIRouter(prefix="/upload", tags=["upload"])
 class UploadInitRequest(BaseModel):
     """Request model for POST /upload/init"""
     filename: str = Field(..., min_length=1, max_length=255)
+    account_id: str = Field(..., min_length=1, description="Account anchor; required.")
     mime_type: str = Field(default="audio/wav")
     file_size: Optional[int] = Field(default=None, ge=1, le=500_000_000)  # Max 500MB
+    participants: Optional[list[ParticipantSpec]] = Field(
+        default=None,
+        description="Caller-provided participants; flows through UploadJob to worker.",
+    )
 
 
 # --- Endpoints ---
@@ -126,6 +133,25 @@ async def upload_init(body: UploadInitRequest, request: Request):
     job_id = str(uuid.uuid4())
     interaction_id = context.interaction_id
 
+    # Reject body/header account_id mismatch. The auth-context account_id
+    # (X-Account-ID header) is the source of truth; a mismatch indicates
+    # inconsistent client behavior or a tampering attempt — 400 loudly rather
+    # than silently picking one source. UploadJob.account_id is persisted from
+    # context.account_id below; a body-supplied value would otherwise cause the
+    # background worker to publish under the wrong account. (Phase 1 / T1.26.3)
+    if body.account_id != context.account_id:
+        logger.warning(
+            f"account_id mismatch: job_id={job_id}, interaction_id={interaction_id}, "
+            f"body.account_id={body.account_id}, context.account_id={context.account_id}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "account_id mismatch: body.account_id and X-Account-ID header must agree. "
+                "The authenticated account_id is the source of truth."
+            ),
+        )
+
     # Normalize MIME type (browsers report non-standard types like audio/x-m4a)
     normalized_mime = _normalize_audio_mime_type(body.mime_type)
 
@@ -158,6 +184,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
         tenant_id=uuid.UUID(context.tenant_id),
         user_id=context.user_id,
         pg_user_id=context.pg_user_id,
+        account_id=context.account_id,
         user_name=context.user_name,
         job_type=JobType.audio_transcription,
         status=JobStatus.queued,
@@ -167,7 +194,6 @@ async def upload_init(body: UploadInitRequest, request: Request):
         file_size=body.file_size,
         interaction_id=uuid.UUID(interaction_id),
         trace_id=context.trace_id,
-        account_id=context.account_id,
     )
 
     try:
@@ -453,6 +479,8 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             raw_transcript=raw_transcript,
             user_name=user_name,
             account_id=account_id,
+            recording_user_id=pg_user_id or user_id,
+            tenant_internal_domains=await get_tenant_internal_domains(tenant_id),
         )
 
         # Prepend front-matter before cleaning
@@ -509,6 +537,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
                     cleaned_transcript=cleaned_transcript,
                     interaction_id=interaction_id,
                     tenant_id=tenant_id,
+                    account_id=account_id,
                     trace_id=trace_id,
                     interaction_type="batch_upload",
                     contact_ids=enrichment.contact_ids or None,

@@ -22,6 +22,18 @@ from sqlalchemy import text
 
 from models.enrichment_models import ResolvedContact, EnrichmentResult
 from services.database import get_async_session
+from services.domain_classification import (
+    DomainClass,
+    classify_domain,
+    email_domain,
+)
+from services.account_lookup import lookup_account_by_domain
+from services.pending_account_mappings import (
+    SignalProposal,
+    insert_signal,
+    reopen_archived_entry,
+    upsert_queue_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +69,17 @@ class TranscriptEnrichmentService:
         conference_url: Optional[str] = None,
         user_name: Optional[str] = None,
         account_id: Optional[str] = None,
+        recording_user_id: Optional[str] = None,
+        tenant_internal_domains: Optional[set[str]] = None,
     ) -> EnrichmentResult:
         """Enrich a transcript with calendar event contacts and front-matter.
+
+        Per-attendee three-state branching (Option A — no orphan contacts):
+        - PERSONAL domain → skip entirely (no contact, no signal).
+        - INTERNAL domain → skip entirely (Phase 2 wires internal users).
+        - BUSINESS + known account → create contact with looked-up account_id.
+        - BUSINESS + unknown account → upsert pending_account_mappings + signal,
+          NO contact. NEVER fall back to anchor account_id for unknown domains.
 
         Args:
             tenant_id: Tenant UUID string.
@@ -67,7 +88,14 @@ class TranscriptEnrichmentService:
             existing_contact_ids: Pre-existing contact_ids (if any).
             conference_url: Conference join URL (desktop mode, strong match signal).
             user_name: Name of the recording user (for front-matter).
-            account_id: Optional account UUID for new contacts.
+            account_id: Anchor account UUID (used ONLY for attendees whose
+                email-domain resolves to this account; never as a fallback).
+            recording_user_id: Postgres user_id of the recording user
+                (`pg_user_id` if available, else upstream user_id). Owner of
+                any pending_account_mappings rows created during enrichment.
+            tenant_internal_domains: Per-tenant connected-provider domains.
+                Defaults to empty (no internal-domain matches). Wiring this
+                from provider_connections is a follow-up.
 
         Returns:
             EnrichmentResult with resolved contacts, front-matter, and metadata.
@@ -123,9 +151,18 @@ class TranscriptEnrichmentService:
                 )
                 attendees = attendees[:ENRICHMENT_MAX_ATTENDEES]
 
-            # Step 3: Resolve each attendee to a contact
+            # Step 3: Per-attendee three-state branching (Option A).
+            # Domain classification decides:
+            #   PERSONAL  → skip entirely (no contact, no signal).
+            #   INTERNAL  → skip entirely (Phase 2 territory).
+            #   BUSINESS  → lookup account by domain:
+            #               HIT  → create contact with resolved account_id.
+            #               MISS → queue signal-only, NEVER fall back to anchor.
             contacts: list[ResolvedContact] = []
             tavily_lookups = 0
+            internal_domains: set[str] = (
+                tenant_internal_domains if tenant_internal_domains is not None else set()
+            )
 
             for att in attendees:
                 email = att["email"].lower().strip()
@@ -135,22 +172,105 @@ class TranscriptEnrichmentService:
 
                 role = "organizer" if is_organizer else ("optional" if is_optional else "attendee")
 
-                resolved = await self._resolve_contact(
-                    tenant_id=tenant_id,
-                    email=email,
-                    display_name=display_name,
-                    account_id=account_id,
-                    tavily_lookups=tavily_lookups,
-                )
-                tavily_lookups = resolved.get("tavily_lookups", tavily_lookups)
+                domain = email_domain(email)
+                if not domain:
+                    logger.debug(f"Skipping malformed attendee email: {email!r}")
+                    continue
 
-                contacts.append(ResolvedContact(
-                    contact_id=resolved["contact_id"],
-                    email=email,
-                    name=resolved["name"],
-                    role=role,
-                    is_new=resolved["is_new"],
-                ))
+                klass = classify_domain(domain, internal_domains=internal_domains)
+                if klass == DomainClass.PERSONAL:
+                    logger.info(
+                        f"Skipping personal-domain attendee: email={email}, "
+                        f"event_id={event_id[:8]}..."
+                    )
+                    continue
+                if klass == DomainClass.INTERNAL:
+                    logger.info(
+                        f"Skipping internal-domain attendee (Phase 1 no-op): "
+                        f"email={email}, event_id={event_id[:8]}..."
+                    )
+                    # Phase 2 will wire internal-user contacts.
+                    continue
+
+                # BUSINESS domain — look up the account for this domain.
+                async with get_async_session() as session:
+                    resolved_account_id = await lookup_account_by_domain(
+                        session=session,
+                        tenant_id=tenant_id,
+                        domain=domain,
+                    )
+
+                if resolved_account_id is not None:
+                    # KNOWN ACCOUNT — create contact normally.
+                    resolved = await self._resolve_contact(
+                        tenant_id=tenant_id,
+                        email=email,
+                        display_name=display_name,
+                        account_id=resolved_account_id,
+                        tavily_lookups=tavily_lookups,
+                    )
+                    tavily_lookups = resolved.get("tavily_lookups", tavily_lookups)
+
+                    contacts.append(ResolvedContact(
+                        contact_id=resolved["contact_id"],
+                        email=email,
+                        name=resolved["name"],
+                        role=role,
+                        is_new=resolved["is_new"],
+                    ))
+                    continue
+
+                # UNKNOWN BUSINESS DOMAIN — queue a signal; NO contact.
+                # Defense-in-depth: silent drops are worse than loud errors.
+                # All four ingress routes (/text/clean, /batch/process,
+                # /upload/..., /listen) MUST pass recording_user_id wired
+                # from the authenticated request context. A None here means
+                # a caller skipped the wiring — fail loudly so the
+                # regression cannot ship.
+                if recording_user_id is None:
+                    raise ValueError(
+                        "recording_user_id is required for unknown-domain "
+                        "queue insertion. Caller must pass the authenticated "
+                        "user from the request context."
+                    )
+
+                async with get_async_session() as session:
+                    reopened_id = await reopen_archived_entry(
+                        session=session,
+                        tenant_id=tenant_id,
+                        domain=domain,
+                    )
+                    if reopened_id is not None:
+                        queue_id = reopened_id
+                    else:
+                        queue_id = await upsert_queue_entry(
+                            session=session,
+                            tenant_id=tenant_id,
+                            domain=domain,
+                            owner_user_id=recording_user_id,
+                            discovered_from_type="transcript",
+                            discovered_from_interaction_id=event_id,
+                        )
+
+                    await insert_signal(
+                        session=session,
+                        tenant_id=tenant_id,
+                        queue_id=queue_id,
+                        proposal=SignalProposal(
+                            source_type="transcript",
+                            source_user_id=recording_user_id,
+                            interaction_id=event_id,
+                            calendar_event_id=event_id,
+                            contact_email=email,
+                            contact_display_name=display_name or None,
+                            contact_role=role,
+                        ),
+                    )
+                    await session.commit()
+                    logger.info(
+                        f"Queued pending_account_mappings signal: "
+                        f"domain={domain}, email={email}, queue_id={queue_id}"
+                    )
 
             contact_ids = [c.contact_id for c in contacts]
             new_count = sum(1 for c in contacts if c.is_new)
@@ -396,12 +516,33 @@ class TranscriptEnrichmentService:
                     "tavily_lookups": tavily_lookups,
                 }
 
-            # Create new contact
+            # Create new contact.
+            #
+            # Under Option A (T1.21+T1.22), `_resolve_contact` is ONLY
+            # reached for BUSINESS-domain attendees whose domain resolves
+            # to a known account_id; the caller passes that resolved
+            # account_id here. The orphan path that previously inherited
+            # the anchor account for unknown-domain attendees is GONE —
+            # those attendees now route to pending_account_mappings via
+            # the per-attendee branching in enrich(), with NO contact
+            # created.
+            #
+            # `validation_status="pending"` remains as the default for
+            # newly created contacts because the Prisma enum only permits
+            # pending|verified|discarded. Phase 2 design Section 7.4 covers
+            # the schema-debt cleanup for a richer state model. The
+            # name-unresolvable flag below is independent of the (now
+            # removed) account-orphan concept.
+            if not account_id:
+                # Defense-in-depth: post-T1.21, only known-account paths
+                # call into this helper. Loud failure makes regressions
+                # impossible to ship silently.
+                raise ValueError(
+                    "transcript_enrichment: _resolve_contact called without "
+                    "account_id; Option A forbids orphan contact creation."
+                )
             new_id = uuid.uuid4()
-            aid = uuid.UUID(account_id) if account_id else None
-            # Always "pending" — Prisma enum only allows pending|verified|discarded.
-            # Name-unresolvable contacts are flagged via pending_validations table below.
-            validation_status = "pending"
+            aid = uuid.UUID(account_id)
 
             await session.execute(
                 text("""
@@ -410,7 +551,7 @@ class TranscriptEnrichmentService:
                         source, validation_status, created_at, updated_at
                     ) VALUES (
                         :id, :tenant_id, :email, :first_name, :last_name, :account_id,
-                        :source, :validation_status, NOW(), NOW()
+                        :source, 'pending', NOW(), NOW()
                     )
                 """),
                 {
@@ -421,11 +562,11 @@ class TranscriptEnrichmentService:
                     "last_name": last_name or None,
                     "account_id": aid,
                     "source": "transcript_enrichment",
-                    "validation_status": validation_status,
                 },
             )
 
-            # Flag for review if name unresolvable
+            # Flag for review if name unresolvable (independent of account
+            # resolution; this is Phase 2 schema-debt territory).
             if not first_name:
                 await self._flag_pending_validation(
                     session, tid, new_id, "name_unresolvable"

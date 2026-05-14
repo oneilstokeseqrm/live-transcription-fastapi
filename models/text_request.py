@@ -8,6 +8,8 @@ These models handle validation and serialization for the POST /text/clean API.
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field, field_validator
 
+from models.participant_spec import ParticipantSpec
+
 
 class TextCleanRequest(BaseModel):
     """
@@ -22,6 +24,11 @@ class TextCleanRequest(BaseModel):
         ...,
         description="Raw text to clean"
     )
+    account_id: str = Field(
+        ...,
+        min_length=1,
+        description="Account anchor for the interaction. Required.",
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional metadata to include in extras"
@@ -34,7 +41,11 @@ class TextCleanRequest(BaseModel):
         default="note",
         description="Interaction type for envelope and intelligence"
     )
-    
+    participants: Optional[list[ParticipantSpec]] = Field(
+        default=None,
+        description="Caller-provided participants",
+    )
+
     @field_validator('text')
     @classmethod
     def text_must_not_be_empty(cls, v: str) -> str:

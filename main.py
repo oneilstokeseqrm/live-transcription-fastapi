@@ -16,6 +16,7 @@ from services.cleaner_service import CleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
+from services.internal_domains import get_tenant_internal_domains
 from models.envelope import EnvelopeV1, ContentModel
 from models.request_context import RequestContext
 from middleware.jwt_auth import verify_internal_jwt, extract_bearer_token, JWTVerificationError
@@ -110,6 +111,7 @@ async def process_audio(
     session_id: str,
     context: Optional[RequestContext] = None,
     desktop_config: Optional[Dict[str, Any]] = None,
+    interim_results_flag: bool = False,
 ):
     """Set up Deepgram connection and transcript callback.
 
@@ -118,6 +120,11 @@ async def process_audio(
         session_id: Unique session identifier.
         context: Authenticated request context (from JWT). None for legacy browser sessions.
         desktop_config: Desktop session_config payload. None for legacy browser sessions.
+        interim_results_flag: When True, opt in to Deepgram interim results and forward
+            them to the client as ``{type: "interim_chunk", text}``. Final transcripts are
+            wrapped as ``{type: "transcript_chunk", text}``. Only affects the non-desktop
+            (browser) transcript branch; desktop multichannel behavior is unchanged.
+            Defaults to False for backward compatibility.
     """
     is_desktop = desktop_config is not None
     user_name = (context.user_name if context else None) or "You"
@@ -130,7 +137,9 @@ async def process_audio(
         if not transcript:
             return
 
-        if is_desktop and data.get('is_final', False):
+        is_final = data.get('is_final', False)
+
+        if is_desktop and is_final:
             # Desktop multichannel: store structured segment
             channel_idx = data.get('channel_index', [0, 1])[0]
             speaker = user_name if channel_idx == 0 else "Others"
@@ -156,11 +165,43 @@ async def process_audio(
                 "text": transcript,
                 "timestamp": start_time,
             })
+        elif interim_results_flag and not is_desktop:
+            # Browser session opting in to interim results (additive, new in Add Account v1).
+            # Forward interims as interim_chunk; finals as transcript_chunk (harmonized
+            # message shape so consumers can distinguish firm vs. provisional text).
+            if not is_final:
+                try:
+                    await fast_socket.send_json({
+                        "type": "interim_chunk",
+                        "text": transcript,
+                    })
+                except Exception as send_err:
+                    logger.debug(
+                        f"Could not send interim_chunk: session_id={session_id}, error={send_err}"
+                    )
+                return
+
+            try:
+                await fast_socket.send_json({
+                    "type": "transcript_chunk",
+                    "text": transcript,
+                })
+            except Exception as send_err:
+                logger.debug(
+                    f"Could not send transcript_chunk: session_id={session_id}, error={send_err}"
+                )
+
+            await event_publisher.publish_transcript_event(
+                transcript=transcript,
+                metadata=data,
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
         else:
-            # Legacy browser: send plain text, store plain string
+            # Legacy browser default: send plain text, store plain string on finalization.
             await fast_socket.send_text(transcript)
 
-            if data.get('is_final', False):
+            if is_final:
                 await event_publisher.publish_transcript_event(
                     transcript=transcript,
                     metadata=data,
@@ -171,7 +212,7 @@ async def process_audio(
     # Build Deepgram options based on session type
     dg_options: Dict[str, Any] = {
         'punctuate': True,
-        'interim_results': False,
+        'interim_results': interim_results_flag,
         'smart_format': True,
     }
     if is_desktop:
@@ -212,6 +253,14 @@ async def websocket_endpoint(websocket: WebSocket):
     # Generate unique session ID
     session_id = str(uuid.uuid4())
 
+    # --- Opt-in interim results (additive; defaults to False for backward compat) ---
+    # Consumers pass ?interim_results=true on the WS URL to receive interim_chunk
+    # messages in addition to transcript_chunk finals. Only affects browser sessions;
+    # desktop multichannel behavior is unchanged.
+    interim_results_flag = (
+        websocket.query_params.get("interim_results", "false").lower() == "true"
+    )
+
     # --- JWT Authentication (optional, backward compatible) ---
     context: Optional[RequestContext] = None
     auth_header = websocket.headers.get("authorization")
@@ -220,12 +269,22 @@ async def websocket_endpoint(websocket: WebSocket):
     if token:
         try:
             claims = verify_internal_jwt(token)
+            # Account anchor must be supplied via header; backend rejects when absent.
+            # WebSocket headers are lowercased by Starlette.
+            account_id = websocket.headers.get("x-account-id")
+            if not account_id:
+                logger.warning(
+                    f"WebSocket /listen rejected: missing X-Account-ID, "
+                    f"session_id={session_id}"
+                )
+                await websocket.close(code=1008, reason="X-Account-ID required")
+                return
             context = RequestContext(
                 tenant_id=claims.tenant_id,
                 user_id=claims.user_id,
                 pg_user_id=claims.pg_user_id,
                 user_name=claims.user_name,
-                account_id=None,
+                account_id=account_id,
                 interaction_id=session_id,
                 trace_id=str(uuid.uuid4()),
             )
@@ -263,7 +322,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
         # --- Create Deepgram connection with appropriate config ---
         deepgram_socket = await process_audio(
-            websocket, session_id, context=context, desktop_config=desktop_config,
+            websocket,
+            session_id,
+            context=context,
+            desktop_config=desktop_config,
+            interim_results_flag=interim_results_flag,
         )
 
         # If the first message was audio (not session_config), forward it now
@@ -350,13 +413,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 enrichment_service = TranscriptEnrichmentService()
                 transcript_ts = datetime.now(timezone.utc)
                 conference_url_val = desktop_config.get("conference_url") if desktop_config else None
+                _ws_enrich_tenant_id = (
+                    context.tenant_id if context
+                    else os.getenv('MOCK_TENANT_ID', 'default_org')
+                )
+                _ws_enrich_recording_user_id = (
+                    (context.pg_user_id or context.user_id) if context else None
+                )
+                _ws_enrich_internal_domains = await get_tenant_internal_domains(
+                    _ws_enrich_tenant_id
+                )
                 enrichment = await enrichment_service.enrich(
-                    tenant_id=context.tenant_id if context else os.getenv('MOCK_TENANT_ID', 'default_org'),
+                    tenant_id=_ws_enrich_tenant_id,
                     transcript_timestamp=transcript_ts,
                     raw_transcript=raw_transcript,
                     conference_url=conference_url_val,
                     user_name=context.user_name if context else None,
                     account_id=context.account_id if context else None,
+                    recording_user_id=_ws_enrich_recording_user_id,
+                    tenant_internal_domains=_ws_enrich_internal_domains,
                 )
 
                 # Prepend front-matter before cleaning
@@ -395,6 +470,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 ws_tenant_id = context.tenant_id if context else os.getenv('MOCK_TENANT_ID', 'default_org')
                 ws_user_id = context.user_id if context else "websocket_user"
                 ws_trace_id = context.trace_id if context else str(uuid.uuid4())
+                ws_account_id = (
+                    context.account_id if context
+                    else os.getenv('MOCK_ACCOUNT_ID', 'default_account')
+                )
                 source = "desktop-companion" if desktop_config else "websocket"
                 extras: Dict[str, Any] = {}
                 if desktop_config:
@@ -424,7 +503,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             extras=extras,
                             interaction_id=uuid.UUID(session_id),
                             trace_id=ws_trace_id,
-                            account_id=None,
+                            account_id=ws_account_id,  # was None — required since Task 1.3
                         )
                         aws_publisher = AWSEventPublisher()
                         return await aws_publisher.publish_envelope(envelope)
@@ -440,6 +519,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             cleaned_transcript=meeting_output.cleaned_transcript,
                             interaction_id=session_id,
                             tenant_id=ws_tenant_id,
+                            account_id=ws_account_id,
                             trace_id=ws_trace_id,
                             interaction_type="meeting",
                             contact_ids=enrichment.contact_ids or None,

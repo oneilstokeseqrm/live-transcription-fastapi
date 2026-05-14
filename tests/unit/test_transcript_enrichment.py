@@ -3,12 +3,47 @@
 Tests calendar matching, contact resolution, front-matter composition,
 name heuristic, and enrichment result assembly with mocked DB.
 """
+import contextlib
 import pytest
 import uuid
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from models.enrichment_models import ResolvedContact, EnrichmentResult
+
+
+# --- Test helpers ---
+
+
+@contextlib.contextmanager
+def _patched_session_and_lookup(account_id: str):
+    """Patch get_async_session + lookup_account_by_domain together.
+
+    Under Option A (T1.21), BUSINESS-domain attendees only produce contacts
+    when their domain resolves to a known account. Tests that previously
+    relied on the uniform "anchor account" behavior pass through this
+    helper to seed a known account_id and bypass the real DB.
+    """
+    fake_session = MagicMock()
+    fake_session.execute = AsyncMock()
+    fake_session.commit = AsyncMock()
+
+    class _AsyncCM:
+        async def __aenter__(self_inner):
+            return fake_session
+
+        async def __aexit__(self_inner, exc_type, exc, tb):
+            return False
+
+    with patch(
+        "services.transcript_enrichment.get_async_session",
+        new=lambda: _AsyncCM(),
+    ), patch(
+        "services.transcript_enrichment.lookup_account_by_domain",
+        new_callable=AsyncMock,
+        return_value=account_id,
+    ):
+        yield
 
 
 # --- Name Heuristic Tests ---
@@ -287,9 +322,16 @@ class TestCalendarMatching:
 
     @pytest.mark.asyncio
     async def test_conference_url_match_is_high_confidence(self, service):
-        """Conference URL match → high confidence."""
+        """Conference URL match → high confidence.
+
+        Under Option A (T1.21), only BUSINESS attendees with a known account
+        produce contacts. We mock `lookup_account_by_domain` to return a
+        seeded account_id so the legitimate "organizer-role becomes a
+        contact" assertion still holds.
+        """
         event_id = uuid.uuid4()
         contact_id = str(uuid.uuid4())
+        seeded_account_id = str(uuid.uuid4())
         event = {
             "id": event_id,
             "title": "Zoom Call",
@@ -304,21 +346,27 @@ class TestCalendarMatching:
             with patch.object(service, "_get_attendees", new_callable=AsyncMock, return_value=attendees):
                 with patch.object(service, "_resolve_contact", new_callable=AsyncMock, return_value=resolve_result):
                     with patch("services.transcript_enrichment.ENABLE_TRANSCRIPT_ENRICHMENT", True):
-                        result = await service.enrich(
-                            tenant_id=str(uuid.uuid4()),
-                            transcript_timestamp=datetime.now(timezone.utc),
-                            raw_transcript="test",
-                            conference_url="https://zoom.us/j/12345",
-                        )
-                        assert result.match_confidence == "high"
-                        assert len(result.contacts) == 1
-                        assert result.contacts[0].role == "organizer"
+                        with _patched_session_and_lookup(seeded_account_id):
+                            result = await service.enrich(
+                                tenant_id=str(uuid.uuid4()),
+                                transcript_timestamp=datetime.now(timezone.utc),
+                                raw_transcript="test",
+                                conference_url="https://zoom.us/j/12345",
+                            )
+                            assert result.match_confidence == "high"
+                            assert len(result.contacts) == 1
+                            assert result.contacts[0].role == "organizer"
 
     @pytest.mark.asyncio
     async def test_time_window_match_is_medium_confidence(self, service):
-        """Time window match → medium confidence."""
+        """Time window match → medium confidence.
+
+        Under Option A, bob@co.com only becomes a contact if co.com is a
+        known account; we mock that here to preserve the test's intent.
+        """
         event_id = uuid.uuid4()
         contact_id = str(uuid.uuid4())
+        seeded_account_id = str(uuid.uuid4())
         event = {
             "id": event_id,
             "title": "Meeting",
@@ -333,22 +381,29 @@ class TestCalendarMatching:
             with patch.object(service, "_get_attendees", new_callable=AsyncMock, return_value=attendees):
                 with patch.object(service, "_resolve_contact", new_callable=AsyncMock, return_value=resolve_result):
                     with patch("services.transcript_enrichment.ENABLE_TRANSCRIPT_ENRICHMENT", True):
-                        result = await service.enrich(
-                            tenant_id=str(uuid.uuid4()),
-                            transcript_timestamp=datetime.now(timezone.utc),
-                            raw_transcript="test",
-                        )
-                        assert result.match_confidence == "medium"
-                        assert result.new_contacts_created == 1
+                        with _patched_session_and_lookup(seeded_account_id):
+                            result = await service.enrich(
+                                tenant_id=str(uuid.uuid4()),
+                                transcript_timestamp=datetime.now(timezone.utc),
+                                raw_transcript="test",
+                            )
+                            assert result.match_confidence == "medium"
+                            assert result.new_contacts_created == 1
 
     @pytest.mark.asyncio
     async def test_attendee_cap_enforced(self, service):
-        """Attendees over ENRICHMENT_MAX_ATTENDEES are truncated."""
+        """Attendees over ENRICHMENT_MAX_ATTENDEES are truncated.
+
+        Under Option A, the cap still applies before classification; we
+        mock a known account_id so every business attendee makes it through
+        to contact-creation and the count assertion holds.
+        """
         event = {"id": uuid.uuid4(), "title": "Big Meeting", "_match_method": "time_window"}
         many_attendees = [
             {"email": f"user{i}@co.com", "display_name": f"User {i}", "is_organizer": False, "is_optional": False}
             for i in range(30)
         ]
+        seeded_account_id = str(uuid.uuid4())
         resolve_result = {"contact_id": str(uuid.uuid4()), "name": "User", "is_new": False, "tavily_lookups": 0}
 
         with patch.object(service, "_match_calendar_event", new_callable=AsyncMock, return_value=event):
@@ -356,12 +411,13 @@ class TestCalendarMatching:
                 with patch.object(service, "_resolve_contact", new_callable=AsyncMock, return_value=resolve_result):
                     with patch("services.transcript_enrichment.ENABLE_TRANSCRIPT_ENRICHMENT", True):
                         with patch("services.transcript_enrichment.ENRICHMENT_MAX_ATTENDEES", 5):
-                            result = await service.enrich(
-                                tenant_id=str(uuid.uuid4()),
-                                transcript_timestamp=datetime.now(timezone.utc),
-                                raw_transcript="test",
-                            )
-                            assert len(result.contacts) == 5
+                            with _patched_session_and_lookup(seeded_account_id):
+                                result = await service.enrich(
+                                    tenant_id=str(uuid.uuid4()),
+                                    transcript_timestamp=datetime.now(timezone.utc),
+                                    raw_transcript="test",
+                                )
+                                assert len(result.contacts) == 5
 
     @pytest.mark.asyncio
     async def test_enrichment_error_returns_empty(self, service):
@@ -390,7 +446,12 @@ class TestContactResolution:
 
     @pytest.mark.asyncio
     async def test_roles_correctly_assigned(self, service):
-        """Organizer, attendee, and optional roles are correctly assigned."""
+        """Organizer, attendee, and optional roles are correctly assigned.
+
+        Under Option A (T1.21), the BUSINESS-domain attendees only become
+        contacts when their domain resolves to a known account. We mock
+        `lookup_account_by_domain` so all three are created.
+        """
         event = {"id": uuid.uuid4(), "title": "Test", "_match_method": "time_window"}
         attendees = [
             {"email": "org@co.com", "display_name": "Org", "is_organizer": True, "is_optional": False},
@@ -406,15 +467,17 @@ class TestContactResolution:
         async def mock_resolve(**kwargs):
             return next(resolve_results)
 
+        seeded_account_id = str(uuid.uuid4())
         with patch.object(service, "_match_calendar_event", new_callable=AsyncMock, return_value=event):
             with patch.object(service, "_get_attendees", new_callable=AsyncMock, return_value=attendees):
                 with patch.object(service, "_resolve_contact", side_effect=mock_resolve):
                     with patch("services.transcript_enrichment.ENABLE_TRANSCRIPT_ENRICHMENT", True):
-                        result = await service.enrich(
-                            tenant_id=str(uuid.uuid4()),
-                            transcript_timestamp=datetime.now(timezone.utc),
-                            raw_transcript="test",
-                        )
+                        with _patched_session_and_lookup(seeded_account_id):
+                            result = await service.enrich(
+                                tenant_id=str(uuid.uuid4()),
+                                transcript_timestamp=datetime.now(timezone.utc),
+                                raw_transcript="test",
+                            )
                         assert result.contacts[0].role == "organizer"
                         assert result.contacts[1].role == "attendee"
                         assert result.contacts[2].role == "optional"

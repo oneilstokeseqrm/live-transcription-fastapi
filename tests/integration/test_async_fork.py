@@ -30,7 +30,8 @@ def sample_envelope():
         source="websocket",
         extras={},
         interaction_id=uuid4(),
-        trace_id=str(uuid4())
+        trace_id=str(uuid4()),
+        account_id="test-acct-1",  # required since Phase 1 T1.3
     )
 
 

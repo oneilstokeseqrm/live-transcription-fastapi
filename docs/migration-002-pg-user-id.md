@@ -55,7 +55,7 @@ ALTER TABLE upload_jobs ADD COLUMN IF NOT EXISTS pg_user_id TEXT;
 
 ## Schema Ownership Note
 
-The `upload_jobs` table is **owned by this service**, not by `eq-frontend`. It is not present in `eq-frontend/schema.prisma`. The `eq-frontend` identity bridge migration (`add-pg-user-id-to-tables`) only covers its own tables:
+The `upload_jobs` table is **owned by this service**, not by `eq-frontend`. It is not present in `eq-frontend/prisma/schema.prisma`. The `eq-frontend` identity bridge migration (`add-pg-user-id-to-tables`) only covers its own tables:
 
 - `chat_threads`
 - `chat_jobs`

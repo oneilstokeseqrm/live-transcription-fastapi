@@ -18,6 +18,7 @@ from services.batch_cleaner_service import BatchCleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
+from services.internal_domains import get_tenant_internal_domains
 from utils.context_utils import get_auth_context
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,24 @@ async def clean_text(body: TextCleanRequest, request: Request):
             status_code=400,
             detail="text field cannot contain only whitespace"
         )
-    
+
+    # Reject body/header account_id mismatch. The auth-context account_id
+    # (X-Account-ID header) is the source of truth; a mismatch indicates
+    # inconsistent client behavior or a tampering attempt — 400 loudly rather
+    # than silently picking one source. (Phase 1 / T1.26.2)
+    if body.account_id != context.account_id:
+        logger.warning(
+            f"account_id mismatch: interaction_id={context.interaction_id}, "
+            f"body.account_id={body.account_id}, context.account_id={context.account_id}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "account_id mismatch: body.account_id and X-Account-ID header must agree. "
+                "The authenticated account_id is the source of truth."
+            ),
+        )
+
     # Enrich transcript with calendar event contacts + front-matter
     enrichment_service = TranscriptEnrichmentService()
     transcript_ts = datetime.now(timezone.utc)
@@ -75,6 +93,8 @@ async def clean_text(body: TextCleanRequest, request: Request):
         raw_transcript=body.text,
         user_name=context.user_name,
         account_id=context.account_id,
+        recording_user_id=context.pg_user_id or context.user_id,
+        tenant_internal_domains=await get_tenant_internal_domains(context.tenant_id),
     )
 
     # Prepend front-matter to text before cleaning (LLM sees attendee context)
