@@ -101,6 +101,10 @@ async def clean_text(body: TextCleanRequest, request: Request):
         recording_user_id=context.pg_user_id or context.user_id,
         tenant_internal_domains=await get_tenant_internal_domains(context.tenant_id),
         participants=body.participants,
+        # Codex Round 4 P2: thread the request's interaction_id into enrich()
+        # so queue-signal rows have a non-NULL anchor when there's no calendar
+        # match. Without this, retries can't dedupe under pending_signal_dedup.
+        interaction_id=context.interaction_id,
     )
 
     # Prepend front-matter to text before cleaning (LLM sees attendee context)

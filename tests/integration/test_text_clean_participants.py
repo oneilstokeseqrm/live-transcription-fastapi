@@ -180,6 +180,163 @@ async def test_enrich_uses_participants_when_no_calendar_match(service):
 
 
 # ---------------------------------------------------------------------------
+# Test 1b: enrich() — no-calendar + unknown-domain participant → queue rows
+#                      capture the REQUEST'S interaction_id, not NULL.
+#                      Codex Round 4 P2 fix.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enrich_threads_interaction_id_into_queue_signals_when_no_calendar(service):
+    """Codex Round 4 P2: in the manual-notes flow (no calendar match) with an
+    unknown-business-domain participant, both `upsert_queue_entry` and
+    `SignalProposal.interaction_id` MUST receive the request's interaction_id —
+    not None.
+
+    Why this matters: `pending_signal_dedup` is a unique constraint on
+    (queue_id, contact_email, source_type, interaction_id, calendar_event_id).
+    SQL semantics treat NULL != NULL, so a NULL interaction_id + NULL
+    calendar_event_id means retries of the same manual-notes interaction
+    will produce duplicate signal rows. The fix is to fall back to the
+    request's interaction_id when there is no calendar event to anchor to.
+    """
+    from models.participant_spec import ParticipantSpec
+
+    tenant_id = str(uuid.uuid4())
+    acme_account_id = str(uuid.uuid4())
+    queue_id = str(uuid.uuid4())
+    request_interaction_id = str(uuid.uuid4())
+
+    participants = [
+        ParticipantSpec(email="partner@consultingco.com", display_name="Partner"),
+    ]
+
+    async def fake_lookup(session, tenant_id, domain):
+        # consultingco.com is unknown → queue signal path
+        return None
+
+    with patch.object(service, "_match_calendar_event",
+                      new_callable=AsyncMock, return_value=None), \
+         patch.object(service, "_get_attendees",
+                      new_callable=AsyncMock) as mock_get_attendees, \
+         patch.object(service, "_resolve_contact",
+                      new_callable=AsyncMock) as mock_resolve, \
+         _mock_session_ctx(), \
+         patch("services.transcript_enrichment.lookup_account_by_domain",
+               side_effect=fake_lookup), \
+         patch("services.transcript_enrichment.reopen_archived_entry",
+               new_callable=AsyncMock, return_value=None), \
+         patch("services.transcript_enrichment.upsert_queue_entry",
+               new_callable=AsyncMock, return_value=queue_id) as mock_upsert, \
+         patch("services.transcript_enrichment.insert_signal",
+               new_callable=AsyncMock) as mock_insert_signal:
+        await service.enrich(
+            tenant_id=tenant_id,
+            transcript_timestamp=datetime.now(timezone.utc),
+            raw_transcript="manual note text",
+            account_id=acme_account_id,
+            recording_user_id="user-recording",
+            tenant_internal_domains=set(),
+            participants=participants,
+            interaction_id=request_interaction_id,
+        )
+
+    # No calendar → _get_attendees / _resolve_contact never called.
+    mock_get_attendees.assert_not_called()
+    mock_resolve.assert_not_called()
+
+    # Queue parent row captures the request's interaction_id.
+    mock_upsert.assert_awaited_once()
+    upsert_kwargs = mock_upsert.await_args.kwargs
+    assert upsert_kwargs["discovered_from_interaction_id"] == request_interaction_id, (
+        "no-calendar manual-notes flow must thread the request's "
+        "interaction_id into discovered_from_interaction_id so retries "
+        "deduplicate via pending_signal_dedup. Got "
+        f"{upsert_kwargs['discovered_from_interaction_id']!r}"
+    )
+
+    # Signal row captures the request's interaction_id (calendar_event_id
+    # stays None because there's no calendar event).
+    mock_insert_signal.assert_awaited_once()
+    proposal = mock_insert_signal.await_args.kwargs["proposal"]
+    assert proposal.interaction_id == request_interaction_id, (
+        "no-calendar manual-notes flow must thread the request's "
+        "interaction_id into SignalProposal.interaction_id so the dedup "
+        f"unique constraint matches across retries. Got {proposal.interaction_id!r}"
+    )
+    assert proposal.calendar_event_id is None, (
+        "calendar_event_id must remain None — there's no calendar event "
+        "in the no-calendar path. Only interaction_id is filled in."
+    )
+
+
+@pytest.mark.asyncio
+async def test_enrich_uses_event_id_when_calendar_match_present(service):
+    """Regression: when a calendar match IS present, the queue rows must
+    continue to use event_id (the existing behavior), NOT the request's
+    interaction_id. Calendar event is the more specific anchor when
+    available; interaction_id is only the fallback for no-calendar flows.
+    """
+    from models.participant_spec import ParticipantSpec
+
+    tenant_id = str(uuid.uuid4())
+    acme_account_id = str(uuid.uuid4())
+    queue_id = str(uuid.uuid4())
+    request_interaction_id = str(uuid.uuid4())
+
+    event_uuid = uuid.uuid4()
+    event = {
+        "id": event_uuid,
+        "title": "Cross-co sync",
+        "_match_method": "time_window",
+    }
+    participants = [
+        ParticipantSpec(email="partner@consultingco.com", display_name="Partner"),
+    ]
+
+    async def fake_lookup(session, tenant_id, domain):
+        return None  # unknown domain → queue path
+
+    with patch.object(service, "_match_calendar_event",
+                      new_callable=AsyncMock, return_value=event), \
+         patch.object(service, "_get_attendees",
+                      new_callable=AsyncMock, return_value=[]), \
+         patch.object(service, "_resolve_contact",
+                      new_callable=AsyncMock), \
+         _mock_session_ctx(), \
+         patch("services.transcript_enrichment.lookup_account_by_domain",
+               side_effect=fake_lookup), \
+         patch("services.transcript_enrichment.reopen_archived_entry",
+               new_callable=AsyncMock, return_value=None), \
+         patch("services.transcript_enrichment.upsert_queue_entry",
+               new_callable=AsyncMock, return_value=queue_id) as mock_upsert, \
+         patch("services.transcript_enrichment.insert_signal",
+               new_callable=AsyncMock) as mock_insert_signal:
+        await service.enrich(
+            tenant_id=tenant_id,
+            transcript_timestamp=datetime.now(timezone.utc),
+            raw_transcript="note",
+            account_id=acme_account_id,
+            recording_user_id="user-recording",
+            tenant_internal_domains=set(),
+            participants=participants,
+            interaction_id=request_interaction_id,
+        )
+
+    mock_upsert.assert_awaited_once()
+    upsert_kwargs = mock_upsert.await_args.kwargs
+    assert upsert_kwargs["discovered_from_interaction_id"] == str(event_uuid), (
+        "When a calendar event matches, queue rows must anchor to event_id, "
+        "not the request's interaction_id."
+    )
+
+    mock_insert_signal.assert_awaited_once()
+    proposal = mock_insert_signal.await_args.kwargs["proposal"]
+    assert proposal.interaction_id == str(event_uuid)
+    assert proposal.calendar_event_id == str(event_uuid)
+
+
+# ---------------------------------------------------------------------------
 # Test 2: enrich() — participants override calendar attendees (caller-wins)
 # ---------------------------------------------------------------------------
 

@@ -73,6 +73,7 @@ class TranscriptEnrichmentService:
         recording_user_id: Optional[str] = None,
         tenant_internal_domains: Optional[set[str]] = None,
         participants: Optional[list[ParticipantSpec]] = None,
+        interaction_id: Optional[str] = None,
     ) -> EnrichmentResult:
         """Enrich a transcript with calendar event contacts and front-matter.
 
@@ -124,6 +125,14 @@ class TranscriptEnrichmentService:
                 signal (callers can claim arbitrary participants the same way
                 they can fake a calendar invite); it does NOT override the
                 authenticated account_id anchor.
+            interaction_id: The request's interaction_id (per the ingress
+                route's RequestContext / UploadJob / WS session). Used as the
+                queue-signal anchor when no calendar event matched: the source
+                of the signal IS the interaction itself in the manual-notes
+                flow. Without this, `discovered_from_interaction_id` and
+                `SignalProposal.interaction_id` would be NULL, which breaks
+                `pending_signal_dedup` (SQL NULL != NULL) and lets retries
+                duplicate rows. (Codex Round 4 P2 fix.)
 
         Returns:
             EnrichmentResult with resolved contacts, front-matter, and metadata.
@@ -306,6 +315,17 @@ class TranscriptEnrichmentService:
                         "user from the request context."
                     )
 
+                # Codex Round 4 P2: in the manual-notes flow there's no
+                # calendar event, so anchor the queue+signal rows to the
+                # request's interaction_id. Without this fallback both
+                # discovered_from_interaction_id and SignalProposal.interaction_id
+                # would be NULL when event_id is None, and pending_signal_dedup
+                # (unique on queue_id+contact_email+source_type+interaction_id+
+                # calendar_event_id) cannot dedupe NULLs — retries would
+                # accumulate duplicate signal rows. calendar_event_id stays
+                # bound to event_id only (NULL when no calendar match), which
+                # is the correct semantic for that column.
+                signal_anchor_id = event_id or interaction_id
                 async with get_async_session() as session:
                     reopened_id = await reopen_archived_entry(
                         session=session,
@@ -321,7 +341,7 @@ class TranscriptEnrichmentService:
                             domain=domain,
                             owner_user_id=recording_user_id,
                             discovered_from_type="transcript",
-                            discovered_from_interaction_id=event_id,
+                            discovered_from_interaction_id=signal_anchor_id,
                         )
 
                     await insert_signal(
@@ -331,7 +351,7 @@ class TranscriptEnrichmentService:
                         proposal=SignalProposal(
                             source_type="transcript",
                             source_user_id=recording_user_id,
-                            interaction_id=event_id,
+                            interaction_id=signal_anchor_id,
                             calendar_event_id=event_id,
                             contact_email=email,
                             contact_display_name=display_name or None,

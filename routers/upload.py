@@ -531,6 +531,12 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             recording_user_id=pg_user_id or user_id,
             tenant_internal_domains=await get_tenant_internal_domains(tenant_id),
             participants=participants,
+            # Codex Round 4 P2: thread the job's interaction_id so queue-signal
+            # rows anchor to it when there's no calendar match. The /upload
+            # path commonly has caller-provided participants without a
+            # calendar event, so this is the path where the dedup fix
+            # matters most in practice.
+            interaction_id=interaction_id,
         )
 
         # Prepend front-matter before cleaning

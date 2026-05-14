@@ -438,6 +438,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     recording_user_id=_ws_enrich_recording_user_id,
                     tenant_internal_domains=_ws_enrich_internal_domains,
                     participants=None,
+                    # Codex Round 4 P2: in the WS flow, session_id IS the
+                    # interaction_id (see line ~288 where the auth context's
+                    # interaction_id is set to session_id). Thread it through
+                    # so queue-signal rows anchor to it when there's no
+                    # calendar match. Live recording sessions usually have a
+                    # calendar match (conference_url), so this primarily
+                    # protects the dedup invariant for sessions that don't.
+                    interaction_id=session_id,
                 )
 
                 # Prepend front-matter before cleaning

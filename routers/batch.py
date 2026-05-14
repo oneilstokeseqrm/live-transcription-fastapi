@@ -164,6 +164,12 @@ async def process_batch_audio(file: UploadFile, request: Request):
         recording_user_id=context.pg_user_id or context.user_id,
         tenant_internal_domains=await get_tenant_internal_domains(context.tenant_id),
         participants=None,
+        # Codex Round 4 P2: thread the request's interaction_id so queue-signal
+        # rows anchor to it when there's no calendar match. /batch/process
+        # passes participants=None, so today this only matters defensively
+        # (no participants → no queue-signal path), but the caller-side
+        # invariant is "always thread interaction_id" — keep it symmetrical.
+        interaction_id=context.interaction_id,
     )
 
     # Prepend front-matter before cleaning
