@@ -26,12 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from workers.account_provisioning_worker import (
-    SELECT_APPROVED_SQL,
-    SELECT_STATUS_SQL,
-    SET_CREATING_SQL,
-    process_one_approved_entry,
-)
+from workers.account_provisioning_worker import process_one_approved_entry
 
 
 def _row(**kwargs):

@@ -106,6 +106,11 @@ async def process_one_approved_entry(
         event_type="account_created",
     )
 
+    logger.info(
+        "Materialized queue_id=%s → account_id=%s (tenant=%s)",
+        queue_id, enrich_result.account_id, info.tenant_id,
+    )
+
 
 async def run_worker_loop(
     session_factory: "async_sessionmaker",
@@ -113,19 +118,37 @@ async def run_worker_loop(
     interval_seconds: float = 5.0,
     batch_size: int = 10,
 ) -> None:
-    """Main worker loop — polls for approved entries and processes them."""
+    """Main worker loop — polls for approved entries and processes them.
+
+    Per-entry transactional isolation: each queue entry runs in its OWN
+    session.begin() block. One entry's failure (agent timeout, DB constraint,
+    etc.) does NOT roll back successful entries' materialization. This is
+    architecturally required — the agent's account-creation commits to its
+    own DB on HTTP success, independently of our Postgres transaction; a
+    batched rollback would leave our outbox row in inconsistent state with
+    the agent's already-committed account.
+
+    The poll SELECT itself runs outside any transaction (it's a snapshot read).
+    Advisory locks are transaction-scoped, so each entry's lock auto-releases
+    on its own txn commit/rollback.
+    """
     while True:
         try:
             async with session_factory() as session:
-                async with session.begin():
-                    rows = (await session.execute(
-                        SELECT_APPROVED_SQL, {"limit": batch_size},
-                    )).all()
-                    for row in rows:
-                        await process_one_approved_entry(
-                            session=session,
-                            queue_id=row.id,
-                            agent_client=agent_client,
+                rows = (await session.execute(
+                    SELECT_APPROVED_SQL, {"limit": batch_size},
+                )).all()
+                for row in rows:
+                    try:
+                        async with session.begin():
+                            await process_one_approved_entry(
+                                session=session,
+                                queue_id=row.id,
+                                agent_client=agent_client,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Worker failed processing queue_id=%s", row.id,
                         )
         except Exception:
             logger.exception("Worker loop error")
