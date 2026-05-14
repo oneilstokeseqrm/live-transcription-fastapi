@@ -23,6 +23,7 @@ from middleware.jwt_auth import verify_internal_jwt, extract_bearer_token, JWTVe
 from routers import batch
 from routers import text
 from routers import upload
+from routers import queue_actions
 from routers.upload import reap_stuck_jobs
 
 load_dotenv()
@@ -99,6 +100,7 @@ async def health_check():
 app.include_router(batch.router)
 app.include_router(text.router, prefix="/text", tags=["text"])
 app.include_router(upload.router)
+app.include_router(queue_actions.router)
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
 event_publisher = EventPublisher()

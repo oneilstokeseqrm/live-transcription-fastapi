@@ -51,6 +51,13 @@ UPSERT_PARENT_SQL = text("""
 """)
 
 
+# TODO(task-1.5.12 reopen lifecycle): also reset the approval/materialization
+# fields here so a reopened entry doesn't 409 forever on /approve|/map with a
+# new attempt_id. Add: approval_attempt_id = NULL, creation_started_at = NULL,
+# mapped_at = NULL, resolved_account_id = NULL, ignored_at = NULL,
+# ignored_by = NULL. Codex Round 7 P1 finding 2026-05-14 — deferred to the
+# Task 1.5.12 expiry-sweep PR that wires reopen end-to-end (without that PR,
+# the reopen path is not exercised in production today).
 REOPEN_PARENT_SQL = text("""
     UPDATE pending_account_mappings
     SET archived_at = NULL,
