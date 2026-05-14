@@ -60,25 +60,23 @@ UPSERT_RAW_INTERACTION_SQL = text("""
 # we use the materialization's account_id as the anchor.
 
 
-SELECT_EXISTING_SUMMARY_SQL = text("""
-    SELECT summary_id::text AS summary_id
-    FROM interaction_summaries
-    WHERE interaction_id = :interaction_id
-    LIMIT 1
-""")
-
-
-INSERT_PLACEHOLDER_SUMMARY_SQL = text("""
+UPSERT_PLACEHOLDER_SUMMARY_SQL = text("""
     INSERT INTO interaction_summaries (
         summary_id, tenant_id, interaction_id, summary_type, created_at, updated_at
     ) VALUES (
         :summary_id, :tenant_id, :interaction_id, :summary_type, NOW(), NOW()
     )
+    ON CONFLICT (interaction_id) DO UPDATE
+        SET updated_at = interaction_summaries.updated_at
+    RETURNING summary_id::text
 """)
 # interaction_summaries.interaction_id has a UNIQUE INDEX
-# (interaction_summaries_interaction_id_key). The materialization code first
-# SELECTs an existing summary; only if none exists does it INSERT a placeholder.
-# Blind INSERT would fail with a unique-constraint violation.
+# (interaction_summaries_interaction_id_key). The ON CONFLICT clause makes
+# this race-safe: if the summaries-writer service inserts a row between
+# our intent to insert and our actual write, the conflict path fires a
+# no-op UPDATE (preserving the existing updated_at) and RETURNING gives
+# us the existing summary_id. Eliminates the SELECT-then-INSERT race that
+# would otherwise abort the per-entry transaction.
 
 
 INSERT_LINK_SQL = text("""
@@ -203,27 +201,21 @@ async def materialize_account_approval(
                         "interaction_type": "meeting",
                     },
                 )
-                # Reuse existing summary if the summaries-writer already wrote
-                # one; otherwise insert a placeholder. interaction_summaries
-                # has a UNIQUE constraint on interaction_id, so we must check
-                # before inserting.
-                existing = (await session.execute(
-                    SELECT_EXISTING_SUMMARY_SQL,
-                    {"interaction_id": s.interaction_id},
-                )).one_or_none()
-                if existing is not None:
-                    summary_id = existing.summary_id
-                else:
-                    summary_id = str(uuid.uuid4())
-                    await session.execute(
-                        INSERT_PLACEHOLDER_SUMMARY_SQL,
-                        {
-                            "summary_id": summary_id,
-                            "tenant_id": tenant_id,
-                            "interaction_id": s.interaction_id,
-                            "summary_type": "meeting",
-                        },
-                    )
+                # UPSERT the placeholder summary atomically. The ON CONFLICT
+                # (interaction_id) branch handles the race where the
+                # summaries-writer service inserts a row concurrently — we
+                # get the existing summary_id back without aborting our txn.
+                proposed_summary_id = str(uuid.uuid4())
+                result = await session.execute(
+                    UPSERT_PLACEHOLDER_SUMMARY_SQL,
+                    {
+                        "summary_id": proposed_summary_id,
+                        "tenant_id": tenant_id,
+                        "interaction_id": s.interaction_id,
+                        "summary_type": "meeting",
+                    },
+                )
+                summary_id = result.scalar_one()
                 summary_id_by_raw_id[raw_id] = summary_id
 
             pair = (summary_id, contact_id)

@@ -21,9 +21,9 @@ from workers.materialization import (
     INSERT_CONTACT_SQL,
     INSERT_LINK_SQL,
     INSERT_OUTBOX_SQL,
-    INSERT_PLACEHOLDER_SUMMARY_SQL,
     SELECT_SIGNALS_SQL,
     UPDATE_QUEUE_SQL,
+    UPSERT_PLACEHOLDER_SUMMARY_SQL,
     UPSERT_RAW_INTERACTION_SQL,
     _split_name,
     materialize_account_approval,
@@ -130,26 +130,25 @@ async def test_materialize_emits_statement_sequence_in_order():
     new_contact_ids = [str(uuid.uuid4()) for _ in signals]
     new_outbox_id = str(uuid.uuid4())
 
-    # Expected sequence (11 calls). For each NEW raw_interaction_id, we do:
-    # UPSERT raw + SELECT existing summary (none) + INSERT placeholder + link.
-    # The shared interaction caches summary_id so carol reuses it.
+    # Expected sequence (10 calls). For each NEW raw_interaction_id we do
+    # UPSERT raw + UPSERT placeholder summary (returns summary_id) + INSERT
+    # link. The shared interaction caches summary_id so carol reuses it.
     # 1. SELECT signals
     # 2. INSERT contact alice
     # 3. UPSERT raw_interactions
-    # 4. SELECT existing summary (returns nothing)
-    # 5. INSERT placeholder summary
-    # 6. INSERT link (alice)
-    # 7. INSERT contact bob (no interaction)
-    # 8. INSERT contact carol
-    # 9. INSERT link (carol ↔ cached summary)
-    # 10. UPDATE queue
-    # 11. INSERT outbox
+    # 4. UPSERT placeholder summary (returning summary_id)
+    # 5. INSERT link (alice)
+    # 6. INSERT contact bob (no interaction)
+    # 7. INSERT contact carol
+    # 8. INSERT link (carol ↔ cached summary)
+    # 9. UPDATE queue
+    # 10. INSERT outbox
+    placeholder_summary_id = str(uuid.uuid4())
     execute_results = [
         _fake_execute_result(all_rows=signals),
         _fake_execute_result(returning_row=_fake_contact_row(new_contact_ids[0], account_id)),
         _fake_execute_result(),  # UPSERT raw_interactions
-        _fake_execute_result(one_or_none_value=None),  # SELECT existing summary (none)
-        _fake_execute_result(),  # INSERT placeholder summary
+        _fake_execute_result(returning_value=placeholder_summary_id),  # UPSERT summary
         _fake_execute_result(),  # INSERT link (alice)
         _fake_execute_result(returning_row=_fake_contact_row(new_contact_ids[1], account_id)),
         _fake_execute_result(returning_row=_fake_contact_row(new_contact_ids[2], account_id)),
@@ -168,20 +167,19 @@ async def test_materialize_emits_statement_sequence_in_order():
         event_type="account_created",
     )
 
-    assert session.execute.await_count == 11
+    assert session.execute.await_count == 10
 
     statements = [call.args[0] for call in session.execute.await_args_list]
     assert statements[0] is SELECT_SIGNALS_SQL
     assert statements[1] is INSERT_CONTACT_SQL                 # alice
     assert statements[2] is UPSERT_RAW_INTERACTION_SQL         # first ref to interaction
-    # statements[3] is SELECT_EXISTING_SUMMARY_SQL — imported from workers.materialization
-    assert statements[4] is INSERT_PLACEHOLDER_SUMMARY_SQL     # placeholder
-    assert statements[5] is INSERT_LINK_SQL                    # alice link
-    assert statements[6] is INSERT_CONTACT_SQL                 # bob
-    assert statements[7] is INSERT_CONTACT_SQL                 # carol
-    assert statements[8] is INSERT_LINK_SQL                    # carol link (cached summary)
-    assert statements[9] is UPDATE_QUEUE_SQL
-    assert statements[10] is INSERT_OUTBOX_SQL
+    assert statements[3] is UPSERT_PLACEHOLDER_SUMMARY_SQL     # race-safe upsert
+    assert statements[4] is INSERT_LINK_SQL                    # alice link
+    assert statements[5] is INSERT_CONTACT_SQL                 # bob
+    assert statements[6] is INSERT_CONTACT_SQL                 # carol
+    assert statements[7] is INSERT_LINK_SQL                    # carol link (cached summary)
+    assert statements[8] is UPDATE_QUEUE_SQL
+    assert statements[9] is INSERT_OUTBOX_SQL
 
 
 @pytest.mark.asyncio
@@ -199,8 +197,7 @@ async def test_materialize_passes_correct_params_to_outbox():
         _fake_execute_result(all_rows=signals),
         _fake_execute_result(returning_row=_fake_contact_row(new_contact_id, account_id)),
         _fake_execute_result(),  # UPSERT raw_interactions
-        _fake_execute_result(one_or_none_value=None),  # SELECT existing summary (none)
-        _fake_execute_result(),  # INSERT placeholder summary
+        _fake_execute_result(returning_value=str(uuid.uuid4())),  # UPSERT placeholder summary
         _fake_execute_result(),  # INSERT link
         _fake_execute_result(),  # UPDATE queue
         _fake_execute_result(returning_value=str(uuid.uuid4())),  # INSERT outbox
@@ -304,19 +301,17 @@ async def test_materialize_dedupes_contact_ids_in_outbox_payload():
     alice_contact_id = str(uuid.uuid4())  # ON CONFLICT returns same id thrice
 
     # Two of alice's signals have distinct interaction_ids; the third has none.
-    # Each distinct interaction triggers: UPSERT raw + SELECT-existing + INSERT
-    # placeholder + INSERT link. So 14 calls total.
+    # Each distinct interaction triggers: UPSERT raw + UPSERT placeholder
+    # summary + INSERT link. So 12 calls total.
     execute_results = [
         _fake_execute_result(all_rows=signals),
         _fake_execute_result(returning_row=_fake_contact_row(alice_contact_id, account_id)),
         _fake_execute_result(),  # UPSERT raw 1
-        _fake_execute_result(one_or_none_value=None),  # SELECT existing summary 1
-        _fake_execute_result(),  # INSERT placeholder summary 1
+        _fake_execute_result(returning_value=str(uuid.uuid4())),  # UPSERT summary 1
         _fake_execute_result(),  # INSERT link 1
         _fake_execute_result(returning_row=_fake_contact_row(alice_contact_id, account_id)),
         _fake_execute_result(),  # UPSERT raw 2
-        _fake_execute_result(one_or_none_value=None),  # SELECT existing summary 2
-        _fake_execute_result(),  # INSERT placeholder summary 2
+        _fake_execute_result(returning_value=str(uuid.uuid4())),  # UPSERT summary 2
         _fake_execute_result(),  # INSERT link 2
         _fake_execute_result(returning_row=_fake_contact_row(alice_contact_id, account_id)),
         _fake_execute_result(),  # UPDATE queue
