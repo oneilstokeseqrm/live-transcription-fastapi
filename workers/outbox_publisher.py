@@ -150,7 +150,25 @@ async def publish_one(
             )).one()
 
     event = _build_event(row)
-    response = await eventbridge_client.put_events(Entries=[event])
+
+    try:
+        response = await eventbridge_client.put_events(Entries=[event])
+    except Exception as e:
+        # Codex P2 #5: put_events raised (network error, auth error,
+        # throttling exception, etc.). Without this branch the row stays
+        # unchanged and the publisher retries it forever with zero visible
+        # state change (publish_attempts not incremented, last_publish_error
+        # empty). MARK_FAILED on a fresh session so the error is durably
+        # visible, then re-raise so the run_publisher_loop can log + skip
+        # to the next row.
+        error_msg = f"EventBridge exception: {type(e).__name__}: {e}"[:1000]
+        async with session_factory() as fail_session:
+            async with fail_session.begin():
+                await fail_session.execute(
+                    MARK_FAILED_SQL,
+                    {"id": outbox_row_id, "error": error_msg},
+                )
+        raise
 
     if response.get("FailedEntryCount", 0) > 0:
         # Encode the failed entries for diagnostic context, truncated to fit

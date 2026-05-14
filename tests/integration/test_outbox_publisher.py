@@ -309,6 +309,100 @@ async def test_publish_one_failure_truncates_long_error_messages():
 
 
 @pytest.mark.asyncio
+async def test_publish_one_marks_failed_when_put_events_raises():
+    """Codex P2 #5: put_events raises (network, auth, throttle exception) →
+    MARK_FAILED commits in its OWN fresh session, then the exception re-raises.
+
+    Without this fix, an exception from put_events leaves the row unchanged
+    (publish_attempts not incremented, last_publish_error empty) and the
+    publisher retries the same row forever with zero visible state change.
+    """
+    outbox_id = str(uuid.uuid4())
+    row = _row(
+        id=outbox_id,
+        tenant_id=str(uuid.uuid4()),
+        queue_id=str(uuid.uuid4()),
+        event_type="account_created",
+        account_id=str(uuid.uuid4()),
+        payload_json={},
+    )
+
+    factory = _make_recording_session_factory([
+        [_fake_result(one_value=row)],   # session 1: SELECT_SINGLE
+        [_fake_result()],                # session 2: MARK_FAILED (exception path)
+    ])
+
+    class _BotoConnectionError(Exception):
+        pass
+
+    eb = MagicMock()
+    eb.put_events = AsyncMock(side_effect=_BotoConnectionError("network down"))
+
+    with pytest.raises(_BotoConnectionError):
+        await publish_one(
+            session_factory=factory,
+            eventbridge_client=eb,
+            outbox_row_id=outbox_id,
+        )
+
+    # Two sessions: read + fail. The fail session committed MARK_FAILED
+    # BEFORE the raise propagated. If the fix isn't applied, factory.sessions
+    # has length 1 (no fail session opened) and this assert fails.
+    assert len(factory.sessions) == 2  # type: ignore[attr-defined]
+    read_session, fail_session = factory.sessions  # type: ignore[attr-defined]
+    assert read_session is not fail_session
+
+    fail_stmts = [c.args[0] for c in fail_session.execute.await_args_list]
+    assert fail_stmts == [MARK_FAILED_SQL]
+
+    mark_failed_params = fail_session.execute.await_args_list[0].args[1]
+    assert mark_failed_params["id"] == outbox_id
+    assert "network down" in mark_failed_params["error"]
+    assert "_BotoConnectionError" in mark_failed_params["error"]
+    # Truncation invariant still holds.
+    assert len(mark_failed_params["error"]) <= 1000
+
+    # MARK_PUBLISHED never executed.
+    read_stmts = [c.args[0] for c in read_session.execute.await_args_list]
+    assert MARK_PUBLISHED_SQL not in (read_stmts + fail_stmts)
+
+
+@pytest.mark.asyncio
+async def test_publish_one_marks_failed_with_truncated_long_exception_message():
+    """The exception-path MARK_FAILED honors the same <=1000 truncation rule
+    as the FailedEntryCount-path."""
+    outbox_id = str(uuid.uuid4())
+    row = _row(
+        id=outbox_id,
+        tenant_id=str(uuid.uuid4()),
+        queue_id=str(uuid.uuid4()),
+        event_type="account_created",
+        account_id=str(uuid.uuid4()),
+        payload_json={},
+    )
+
+    long_msg = "y" * 5000
+    factory = _make_recording_session_factory([
+        [_fake_result(one_value=row)],
+        [_fake_result()],
+    ])
+
+    eb = MagicMock()
+    eb.put_events = AsyncMock(side_effect=RuntimeError(long_msg))
+
+    with pytest.raises(RuntimeError):
+        await publish_one(
+            session_factory=factory,
+            eventbridge_client=eb,
+            outbox_row_id=outbox_id,
+        )
+
+    fail_session = factory.sessions[1]  # type: ignore[attr-defined]
+    mark_failed_params = fail_session.execute.await_args_list[0].args[1]
+    assert len(mark_failed_params["error"]) <= 1000
+
+
+@pytest.mark.asyncio
 async def test_publish_one_failure_uses_distinct_session_for_mark_failed():
     """Regression test for the rollback bug (commit d218cd4 → fix).
 
