@@ -19,6 +19,7 @@ from services.batch_cleaner_service import BatchCleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
+from services.internal_domains import get_tenant_internal_domains
 from utils.context_utils import get_auth_context
 
 logger = logging.getLogger(__name__)
@@ -158,6 +159,8 @@ async def process_batch_audio(file: UploadFile, request: Request):
         raw_transcript=raw_transcript,
         user_name=context.user_name,
         account_id=context.account_id,
+        recording_user_id=context.pg_user_id or context.user_id,
+        tenant_internal_domains=await get_tenant_internal_domains(context.tenant_id),
     )
 
     # Prepend front-matter before cleaning

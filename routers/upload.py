@@ -46,6 +46,7 @@ from models.job_models import (
 from models.participant_spec import ParticipantSpec
 from services.s3_service import S3Service, S3ServiceError
 from services.database import get_async_session
+from services.internal_domains import get_tenant_internal_domains
 from utils.context_utils import get_auth_context
 
 from sqlalchemy import select
@@ -459,6 +460,8 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             raw_transcript=raw_transcript,
             user_name=user_name,
             account_id=account_id,
+            recording_user_id=pg_user_id or user_id,
+            tenant_internal_domains=await get_tenant_internal_domains(tenant_id),
         )
 
         # Prepend front-matter before cleaning

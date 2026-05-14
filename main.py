@@ -16,6 +16,7 @@ from services.cleaner_service import CleanerService
 from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
+from services.internal_domains import get_tenant_internal_domains
 from models.envelope import EnvelopeV1, ContentModel
 from models.request_context import RequestContext
 from middleware.jwt_auth import verify_internal_jwt, extract_bearer_token, JWTVerificationError
@@ -412,13 +413,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 enrichment_service = TranscriptEnrichmentService()
                 transcript_ts = datetime.now(timezone.utc)
                 conference_url_val = desktop_config.get("conference_url") if desktop_config else None
+                _ws_enrich_tenant_id = (
+                    context.tenant_id if context
+                    else os.getenv('MOCK_TENANT_ID', 'default_org')
+                )
+                _ws_enrich_recording_user_id = (
+                    (context.pg_user_id or context.user_id) if context else None
+                )
+                _ws_enrich_internal_domains = await get_tenant_internal_domains(
+                    _ws_enrich_tenant_id
+                )
                 enrichment = await enrichment_service.enrich(
-                    tenant_id=context.tenant_id if context else os.getenv('MOCK_TENANT_ID', 'default_org'),
+                    tenant_id=_ws_enrich_tenant_id,
                     transcript_timestamp=transcript_ts,
                     raw_transcript=raw_transcript,
                     conference_url=conference_url_val,
                     user_name=context.user_name if context else None,
                     account_id=context.account_id if context else None,
+                    recording_user_id=_ws_enrich_recording_user_id,
+                    tenant_internal_domains=_ws_enrich_internal_domains,
                 )
 
                 # Prepend front-matter before cleaning

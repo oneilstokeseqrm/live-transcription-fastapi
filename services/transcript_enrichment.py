@@ -221,13 +221,18 @@ class TranscriptEnrichmentService:
                     continue
 
                 # UNKNOWN BUSINESS DOMAIN — queue a signal; NO contact.
-                if not recording_user_id:
-                    logger.warning(
-                        f"Cannot queue pending_account_mappings without "
-                        f"recording_user_id; skipping signal: email={email}, "
-                        f"domain={domain}"
+                # Defense-in-depth: silent drops are worse than loud errors.
+                # All four ingress routes (/text/clean, /batch/process,
+                # /upload/..., /listen) MUST pass recording_user_id wired
+                # from the authenticated request context. A None here means
+                # a caller skipped the wiring — fail loudly so the
+                # regression cannot ship.
+                if recording_user_id is None:
+                    raise ValueError(
+                        "recording_user_id is required for unknown-domain "
+                        "queue insertion. Caller must pass the authenticated "
+                        "user from the request context."
                     )
-                    continue
 
                 async with get_async_session() as session:
                     reopened_id = await reopen_archived_entry(
