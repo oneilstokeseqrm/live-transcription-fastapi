@@ -219,6 +219,75 @@ def test_upload_init_without_participants_leaves_participants_json_null():
     )
 
 
+def test_upload_init_preserves_explicit_empty_participants_as_empty_json_array():
+    """Explicit `participants: []` round-trips as `"[]"` (not collapsed to None).
+
+    Regression guard for Codex Round 3 P2: collapsing `[]` to `None` defeats
+    the "explicit no participants — do NOT fall back to calendar" semantic
+    Task 1.26.6 established for /text/clean. The upload path must honor
+    the same contract so the worker passes `participants=[]` to enrich()
+    instead of `participants=None`.
+    """
+    from fastapi.testclient import TestClient
+    from main import app
+
+    captured_jobs: list = []
+
+    class _AsyncSessionStub:
+        def __init__(self):
+            self.add = MagicMock(side_effect=captured_jobs.append)
+            self.commit = AsyncMock()
+
+    class _AsyncCM:
+        def __init__(self):
+            self._session = _AsyncSessionStub()
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    account_id = "acct-empty-1"
+    request_payload = {
+        "filename": "empty.wav",
+        "mime_type": "audio/wav",
+        "file_size": 4096,
+        "account_id": account_id,
+        "participants": [],  # explicit empty list
+    }
+
+    with patch("routers.upload.S3Service") as mock_s3_cls, \
+         patch("routers.upload.get_async_session", new=lambda: _AsyncCM()):
+        mock_s3 = MagicMock()
+        mock_s3.generate_file_key.return_value = "tenants/foo/jobs/bar/empty.wav"
+        mock_s3.generate_presigned_put_url.return_value = (
+            "https://example.com/upload",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        mock_s3_cls.return_value = mock_s3
+
+        token = _make_jwt()
+        client = TestClient(app)
+        response = client.post(
+            "/upload/init",
+            json=request_payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Account-ID": account_id,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert len(captured_jobs) == 1
+    job = captured_jobs[0]
+    assert job.participants_json == "[]", (
+        "explicit empty participants list MUST round-trip as the JSON string "
+        "'[]' so the worker can distinguish 'caller explicitly said no one' "
+        f"from 'caller did not provide the field'; got {job.participants_json!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 3: _process_upload_job deserializes participants_json and forwards
 # ---------------------------------------------------------------------------

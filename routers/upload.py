@@ -186,9 +186,16 @@ async def upload_init(body: UploadInitRequest, request: Request):
     # is required so Pydantic types like EmailStr round-trip cleanly as
     # strings (instead of the unserializable EmailStr instance). Stored as
     # JSON TEXT on UploadJob and deserialized by _process_upload_job().
+    #
+    # `is not None` (not truthy): an explicit empty list `[]` is preserved
+    # as `"[]"` so the worker passes `participants=[]` to enrich(), which
+    # honors the "explicit no participants, do NOT fall back to calendar"
+    # semantic established for /text/clean in Task 1.26.6. Collapsing `[]`
+    # to None would re-enable calendar fallback against the caller's
+    # explicit signal. (Codex Round 3 P2 — fixed before Phase 1.5 ship.)
     participants_json = (
         json.dumps([p.model_dump(mode="json") for p in body.participants])
-        if body.participants
+        if body.participants is not None
         else None
     )
 
