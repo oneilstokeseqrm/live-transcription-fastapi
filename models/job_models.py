@@ -95,6 +95,16 @@ class UploadJob(SQLModel, table=True):
     # _process_upload_job() and forwarded to TranscriptEnrichmentService.enrich()
     # so manual-notes workflows (uploads without calendar match) still get
     # contact_ids and front-matter. (Task 1.26.5)
+    #
+    # SCHEMA DEPENDENCY: this column is added by migrations/004_add_participants_json.sql.
+    # The schema MUST be applied before this code rolls out — SQLAlchemy includes the
+    # column in every INSERT/SELECT against upload_jobs and will fail with
+    # "undefined column participants_json" if the migration hasn't run. Verify via:
+    #   SELECT column_name FROM information_schema.columns
+    #   WHERE table_name='upload_jobs' AND column_name='participants_json';
+    # Confirmed applied to Neon eq-dev (project super-glitter-11265514) on 2026-05-14
+    # via Neon MCP BEFORE this code branch was created. Rollout discipline is
+    # schema-first by construction. (Codex Round 5 P2 — acknowledged + mitigated.)
     participants_json: Optional[str] = Field(default=None, sa_column=Column(Text, name="participants_json"))
 
     # Timestamps (explicit timezone-aware columns for asyncpg compatibility)
