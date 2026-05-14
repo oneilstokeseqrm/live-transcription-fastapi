@@ -86,11 +86,29 @@ MARK_PUBLISHED_SQL = text("""
 """)
 
 
+# Codex Round 6 P2 #2: `AND published_at IS NULL` prevents MARK_FAILED from
+# producing contradictory state during deploy-window publisher overlap.
+#
+# Race: publisher A fails to publish row X, releases its FOR UPDATE row
+# lock (per Round 5 fix, MARK_FAILED runs in a SEPARATE fail_session after
+# lock_session exits). Between A's lock release and A's fail_session open,
+# publisher B (the other replica during a rolling deploy) acquires the
+# lock on X, publishes successfully, sets published_at, and commits. A's
+# fail_session then runs MARK_FAILED — and pre-fix, it unconditionally
+# stamped last_publish_error on the now-published row, producing
+# `published_at IS NOT NULL AND last_publish_error IS NOT NULL` —
+# contradictory state that breaks downstream observability/alerting (was
+# it published or did it fail? both?).
+#
+# Post-fix: the WHERE clause makes the UPDATE a 0-row no-op when a sibling
+# has already published the row. A's fail_session still commits cleanly;
+# the outbox row reflects B's success only.
 MARK_FAILED_SQL = text("""
     UPDATE account_provisioning_outbox
     SET publish_attempts = publish_attempts + 1,
         last_publish_error = :error
     WHERE id = :id
+      AND published_at IS NULL
 """)
 
 

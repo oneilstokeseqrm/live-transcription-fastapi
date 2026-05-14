@@ -1098,3 +1098,36 @@ async def test_publish_one_releases_lock_before_mark_failed_on_failed_entries():
         "while lock_session still held its FOR UPDATE lock. "
         f"Events: {events}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 6 P2 #2 — MARK_FAILED must no-op on already-published rows
+# ---------------------------------------------------------------------------
+#
+# Pre-fix: MARK_FAILED unconditionally wrote publish_attempts++ and
+# last_publish_error. During a deploy overlap, publisher A could fail to
+# publish row X, release its FOR UPDATE lock, and then publisher B could
+# acquire the lock, publish X successfully (setting published_at), and
+# release its lock — BEFORE publisher A's separate fail_session ran
+# MARK_FAILED. Publisher A's MARK_FAILED then wrote last_publish_error
+# on top of the now-published row, producing a row with BOTH
+# published_at IS NOT NULL AND last_publish_error IS NOT NULL —
+# contradictory state for downstream observability.
+#
+# Post-fix: MARK_FAILED carries `AND published_at IS NULL`. If a sibling
+# publishes the row between publisher A's lock release and publisher A's
+# fail_session open, MARK_FAILED matches 0 rows; the fail_session commits
+# cleanly; the outbox row reflects the sibling's success only.
+
+
+def test_mark_failed_sql_excludes_already_published():
+    """Round 6 P2 #2: MARK_FAILED_SQL must filter `published_at IS NULL`
+    so a fail-write that lands after a sibling publisher's success-commit
+    is a no-op rather than producing contradictory state
+    (published_at IS NOT NULL AND last_publish_error IS NOT NULL).
+    """
+    sql_text = str(MARK_FAILED_SQL)
+    assert "published_at IS NULL" in sql_text
+    # Existing Round 1 invariants stay.
+    assert "publish_attempts = publish_attempts + 1" in sql_text
+    assert "last_publish_error = :error" in sql_text

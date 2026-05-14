@@ -875,6 +875,9 @@ def test_ignore_happy_path(client: TestClient):
         # Codex Round 3: IGNORE_SQL returns id::text via RETURNING; handler
         # consumes .one_or_none().
         _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+        # Codex Round 6: ARCHIVE_SIGNALS_SQL cascades the archive to child
+        # signals; the handler ignores the result (no row count read).
+        _execute_result(one_or_none=None),
     ])
 
     with _patch_session(session):
@@ -1034,6 +1037,8 @@ def test_ignore_owner_with_pg_user_id_returns_200(client: TestClient):
             owner_user_id=PG_USER_UUID,
         )),
         _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+        # Codex Round 6: ARCHIVE_SIGNALS_SQL cascade after IGNORE_SQL succeeds.
+        _execute_result(one_or_none=None),
     ])
 
     with _patch_session(session):
@@ -1450,6 +1455,8 @@ def test_ignore_on_pending_row_still_succeeds(client: TestClient):
         )),
         # IGNORE_SQL — 1 row (RETURNING)
         _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+        # Codex Round 6: ARCHIVE_SIGNALS_SQL cascade.
+        _execute_result(one_or_none=None),
     ])
 
     with _patch_session(session):
@@ -1580,6 +1587,8 @@ def test_ignore_on_pending_non_archived_still_succeeds(client: TestClient):
         # IGNORE_SQL: 1 row (filter matches because archived_at IS NULL
         # AND status NOT IN terminal).
         _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+        # Codex Round 6: ARCHIVE_SIGNALS_SQL cascade after IGNORE_SQL.
+        _execute_result(one_or_none=None),
     ])
 
     with _patch_session(session):
@@ -1593,9 +1602,9 @@ def test_ignore_on_pending_non_archived_still_succeeds(client: TestClient):
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "ignored"
-    # Only 2 calls: SELECT (auth) + IGNORE_SQL (success). No re-SELECT
-    # needed because IGNORE_SQL returned a row.
-    assert len(session.calls) == 2
+    # Three calls: SELECT (auth) + IGNORE_SQL (success) + ARCHIVE_SIGNALS_SQL
+    # cascade. No re-SELECT needed because IGNORE_SQL returned a row.
+    assert len(session.calls) == 3
 
 
 # P2 #3 — /map replay-success must require matching approval_attempt_id.
@@ -1908,3 +1917,211 @@ def test_approve_replay_with_uppercase_attempt_id_returns_200(client: TestClient
     # Bound attempt_id was canonicalized to lowercase before binding.
     update_params = session.calls[1][1]
     assert update_params["attempt_id"] == attempt_id_canonical
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 6 fixes
+# ---------------------------------------------------------------------------
+#
+# P1 #1 — /ignore must archive child signals so a future reopen+materialize
+# does not re-consume contacts the user explicitly dismissed.
+#
+# Pre-fix: only the parent pending_account_mappings row was archived.
+# Child pending_account_mapping_signals rows kept archived_at = NULL. If a
+# new signal for the same domain later upserted (reopening the parent), the
+# worker's SELECT_SIGNALS_SQL — which filters `archived_at IS NULL` —
+# returned ALL signals (dismissed + new). Dismissed contacts got
+# materialized anyway.
+#
+# Post-fix: /ignore archives child signals in the same transaction as
+# IGNORE_SQL. Reopen + materialize now sees only the new signal.
+
+
+def test_ignore_archives_child_signals_on_success(client: TestClient):
+    """Round 6 P1 #1: when IGNORE_SQL successfully archives the parent
+    (1 row from RETURNING), the handler must ALSO archive the child
+    pending_account_mapping_signals rows in the same transaction.
+
+    Without this, a later reopen + worker materialization would re-consume
+    the dismissed signals (the worker's SELECT_SIGNALS_SQL filters
+    `archived_at IS NULL`, not `queue.archived_at`).
+    """
+    queue_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        # SELECT_QUEUE (_load_and_authorize)
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id, owner_user_id=PG_USER_UUID,
+        )),
+        # IGNORE_SQL — 1 row returning
+        _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+        # ARCHIVE_SIGNALS_SQL — N rows updated (count is opaque)
+        _execute_result(one_or_none=None, rowcount=3),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ignored"
+
+    # Three execute calls — SELECT (auth), IGNORE_SQL (parent), ARCHIVE_SIGNALS_SQL.
+    assert len(session.calls) == 3
+
+    # Assert the third call is the child-signal archive: SQL text + params shape.
+    third_sql, third_params = session.calls[2]
+    sql_str = str(third_sql)
+    assert "UPDATE pending_account_mapping_signals" in sql_str
+    assert "archived_at = NOW()" in sql_str
+    assert "queue_id = :queue_id" in sql_str
+    assert "archived_at IS NULL" in sql_str
+    assert third_params == {"queue_id": queue_id}
+
+    # And the IGNORE_SQL ran BEFORE the archive (parent → children order).
+    from routers.queue_actions import IGNORE_SQL, ARCHIVE_SIGNALS_SQL
+    executed = [stmt for stmt, _ in session.calls]
+    assert executed.index(IGNORE_SQL) < executed.index(ARCHIVE_SIGNALS_SQL)
+
+
+def test_ignore_does_not_archive_signals_when_already_ignored(client: TestClient):
+    """Round 6 P1 #1: the early /ignore short-circuit (status='ignored') must
+    NOT run ARCHIVE_SIGNALS_SQL — the signals were already archived during
+    the original /ignore call, and re-running it would re-stamp archived_at
+    on signals that may belong to a sweeper-archived row.
+    """
+    queue_id = str(uuid.uuid4())
+    archived_at = _dt.datetime(2026, 5, 14, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+    session = _SessionStub(execute_results=[
+        # SELECT_QUEUE: already-ignored + already-archived row → short-circuit.
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="ignored",
+            archived_at=archived_at,
+        )),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    # Only ONE call: SELECT (auth). Short-circuit fires; no IGNORE_SQL, no
+    # ARCHIVE_SIGNALS_SQL.
+    assert len(session.calls) == 1
+
+    from routers.queue_actions import ARCHIVE_SIGNALS_SQL
+    executed = [stmt for stmt, _ in session.calls]
+    assert ARCHIVE_SIGNALS_SQL not in executed
+
+
+def test_ignore_does_not_archive_signals_on_mapped_row(client: TestClient):
+    """Round 6 P1 #1: the 0-row branch on a 'mapped' row returns 409 and
+    must NOT re-archive child signals — the materialization already
+    consumed them; touching their archived_at is meaningless.
+    """
+    queue_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            resolved_account_id=str(uuid.uuid4()),
+        )),
+        # IGNORE_SQL — 0 rows
+        _execute_result(one_or_none=None),
+        # Re-SELECT — still 'mapped' → 409
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            resolved_account_id=str(uuid.uuid4()),
+        )),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 409, response.text
+
+    from routers.queue_actions import ARCHIVE_SIGNALS_SQL
+    executed = [stmt for stmt, _ in session.calls]
+    assert ARCHIVE_SIGNALS_SQL not in executed
+
+
+def test_ignore_does_not_archive_signals_on_sweeper_archived(client: TestClient):
+    """Round 6 P1 #1: the 0-row branch on an already-archived (e.g. sweeper)
+    row returns 200 idempotent and must NOT re-stamp child signals'
+    archived_at — the signals may have been archived under a different
+    archive_reason and re-stamping would lose audit fidelity.
+    """
+    queue_id = str(uuid.uuid4())
+    archived_at = _dt.datetime(2026, 5, 14, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="pending",
+            archived_at=archived_at,
+        )),
+        # IGNORE_SQL — 0 rows (archived_at IS NULL filter blocks)
+        _execute_result(one_or_none=None),
+        # Re-SELECT — still pending+archived
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="pending",
+            archived_at=archived_at,
+        )),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+
+    from routers.queue_actions import ARCHIVE_SIGNALS_SQL
+    executed = [stmt for stmt, _ in session.calls]
+    assert ARCHIVE_SIGNALS_SQL not in executed
+
+
+def test_archive_signals_sql_filters_archived_at_null():
+    """Round 6 P1 #1: ARCHIVE_SIGNALS_SQL must filter `archived_at IS NULL`
+    to avoid re-stamping signals that another flow (e.g. a future explicit
+    signal-archive flow) has already archived. The `queue_id = :queue_id`
+    filter scopes the update to this queue entry's children, and the
+    parent auth helper already verified the queue belongs to the caller's
+    tenant — so child writes inherit tenant isolation transitively.
+    """
+    from routers.queue_actions import ARCHIVE_SIGNALS_SQL
+    sql = str(ARCHIVE_SIGNALS_SQL)
+    assert "UPDATE pending_account_mapping_signals" in sql
+    assert "SET archived_at = NOW()" in sql
+    assert "queue_id = :queue_id" in sql
+    assert "archived_at IS NULL" in sql

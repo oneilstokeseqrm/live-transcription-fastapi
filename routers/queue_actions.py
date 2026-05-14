@@ -219,6 +219,30 @@ IGNORE_SQL = text("""
 """)
 
 
+# Codex Round 6 P1 #1: archive child signals whenever /ignore archives the
+# parent. Without this, a future signal for the same domain that reopens
+# the parent (services/pending_account_mappings.REOPEN_PARENT_SQL clears
+# the parent's archived_at but leaves children untouched) would let the
+# worker's SELECT_SIGNALS_SQL (workers/materialization.py:19) return BOTH
+# the previously-dismissed signals AND the new one — re-materializing
+# contacts the user explicitly dismissed.
+#
+# Scoping: signals are scoped to a queue_id, and _load_and_authorize has
+# already verified the queue belongs to the caller's tenant. So tenant
+# isolation is transitive through queue_id; no tenant_id filter is needed
+# here (and adding one would couple this query to schema assumptions about
+# whether signals carry tenant_id directly).
+#
+# The `AND archived_at IS NULL` filter is belt-and-suspenders: idempotent
+# replays won't re-stamp signals already archived by an earlier /ignore.
+ARCHIVE_SIGNALS_SQL = text("""
+    UPDATE pending_account_mapping_signals
+    SET archived_at = NOW()
+    WHERE queue_id = :queue_id
+      AND archived_at IS NULL
+""")
+
+
 # Tenant-scoped account lookup (Codex P1 #1). Without this, a caller could
 # attach contacts to a foreign tenant's account because the contacts
 # table's FK on account_id references accounts(id) only — there is no
@@ -624,56 +648,78 @@ async def ignore_entry(queue_id: str, request: Request):
                 IGNORE_SQL,
                 {"queue_id": queue_id, "user_id": effective_id},
             )
-            if ignore_result.one_or_none() is None:
-                # 0 rows — re-SELECT to discriminate the cases.
-                current = (await session.execute(
-                    SELECT_QUEUE_SQL, {"queue_id": queue_id},
-                )).one_or_none()
-                if current is None:
-                    raise HTTPException(
-                        status_code=404, detail="Queue entry not found",
-                    )
-
-                # Codex Round 4 P2 #2: ANY archived row (regardless of who
-                # archived it — owner_ignored, expiry sweeper, etc.) is
-                # idempotently a 200. /ignore on an already-archived row is
-                # a no-op; do NOT mutate. The early /ignore short-circuit at
-                # the top of this handler only fires on status='ignored',
-                # so a sweeper-archived pending row reaches here. We MUST
-                # NOT return 409 (operators didn't do anything wrong) and
-                # MUST NOT re-run IGNORE_SQL (would overwrite archive_reason).
-                if current.archived_at is not None:
-                    logger.info(
-                        "Ignore noop on already-archived entry: "
-                        "queue_id=%s, status=%s, archive_reason=%s",
-                        queue_id, current.status,
-                        current._mapping.get("archive_reason"),
-                    )
-                    return {"status": "ignored", "queue_id": queue_id}
-
-                if current.status in ("mapped", "creating"):
-                    logger.info(
-                        "Ignore blocked on terminal/in-flight entry: "
-                        "queue_id=%s, status=%s",
-                        queue_id, current.status,
-                    )
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Cannot ignore queue entry in status='{current.status}'; "
-                            f"materialization already succeeded or is in progress."
-                        ),
-                    )
-
-                # Defensive: status that doesn't match terminal AND
-                # archived_at IS NULL but IGNORE_SQL still 0-rowed. This
-                # shouldn't happen with the current schema; surface as
-                # 200 so callers can move on. If we hit this in
-                # production, the log line below will be the breadcrumb.
-                logger.warning(
-                    "Ignore noop with unexpected state: queue_id=%s, status=%s",
-                    queue_id, current.status,
+            ignored_row = ignore_result.one_or_none()
+            if ignored_row is not None:
+                # Codex Round 6 P1 #1: parent archived successfully. Cascade
+                # to child signals in the SAME transaction so a future
+                # reopen + worker materialization doesn't re-consume the
+                # dismissed contacts. Parent → children order matches the
+                # logical lifecycle (parent decision first, then ripple to
+                # children); both write paths atomically commit-or-rollback
+                # together since they share `async with session.begin()`.
+                #
+                # Why ONLY on the 1-row branch: we deliberately do NOT
+                # cascade on the 0-row paths (mapped/creating → 409;
+                # already-archived → 200 idempotent). For mapped/creating,
+                # the materializer already consumed the signals — re-archiving
+                # is meaningless. For sweeper-archived rows, the signals may
+                # have been archived under a different archive_reason and
+                # re-stamping their archived_at would lose audit fidelity.
+                await session.execute(
+                    ARCHIVE_SIGNALS_SQL,
+                    {"queue_id": queue_id},
                 )
                 return {"status": "ignored", "queue_id": queue_id}
+
+            # 0 rows — re-SELECT to discriminate the cases.
+            current = (await session.execute(
+                SELECT_QUEUE_SQL, {"queue_id": queue_id},
+            )).one_or_none()
+            if current is None:
+                raise HTTPException(
+                    status_code=404, detail="Queue entry not found",
+                )
+
+            # Codex Round 4 P2 #2: ANY archived row (regardless of who
+            # archived it — owner_ignored, expiry sweeper, etc.) is
+            # idempotently a 200. /ignore on an already-archived row is
+            # a no-op; do NOT mutate. The early /ignore short-circuit at
+            # the top of this handler only fires on status='ignored',
+            # so a sweeper-archived pending row reaches here. We MUST
+            # NOT return 409 (operators didn't do anything wrong) and
+            # MUST NOT re-run IGNORE_SQL (would overwrite archive_reason).
+            if current.archived_at is not None:
+                logger.info(
+                    "Ignore noop on already-archived entry: "
+                    "queue_id=%s, status=%s, archive_reason=%s",
+                    queue_id, current.status,
+                    current._mapping.get("archive_reason"),
+                )
+                return {"status": "ignored", "queue_id": queue_id}
+
+            if current.status in ("mapped", "creating"):
+                logger.info(
+                    "Ignore blocked on terminal/in-flight entry: "
+                    "queue_id=%s, status=%s",
+                    queue_id, current.status,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot ignore queue entry in status='{current.status}'; "
+                        f"materialization already succeeded or is in progress."
+                    ),
+                )
+
+            # Defensive: status that doesn't match terminal AND
+            # archived_at IS NULL but IGNORE_SQL still 0-rowed. This
+            # shouldn't happen with the current schema; surface as
+            # 200 so callers can move on. If we hit this in
+            # production, the log line below will be the breadcrumb.
+            logger.warning(
+                "Ignore noop with unexpected state: queue_id=%s, status=%s",
+                queue_id, current.status,
+            )
+            return {"status": "ignored", "queue_id": queue_id}
 
     return {"status": "ignored", "queue_id": queue_id}
