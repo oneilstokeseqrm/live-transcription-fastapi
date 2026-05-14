@@ -103,3 +103,53 @@ The 0 CRITICAL / 0 IMPORTANT split matches what the design doc set up. The 2 NIT
 Phase 1 ship is gated on the eq-email-pipeline cross-repo PR (T1.23 + T1.24) merging. The cross-repo agent dispatched during this orchestration session reports back when its PR is ready for review.
 
 Once the cross-repo PR lands, the Phase 1 PR in this repo can merge.
+
+---
+
+## Round 2 results (2026-05-14)
+
+After the three P1 fix commits landed (`4aecbb5`, `cb451cf`, `9eaf170`), real `codex review --base main -c 'model_reasoning_effort="high"' --enable web_search_cached` was re-run.
+
+### Verdict
+
+**GATE: PASS for merge — zero P1 findings.**
+
+The three P1 findings from Round 1 are all closed:
+
+1. **P1 #1 (queue feature unreachable)** — Task 1.26.1 (commit `4aecbb5`). `recording_user_id` and `tenant_internal_domains` now wired through all four ingress routes (`main.py /listen`, `routers/text.py`, `routers/batch.py`, `routers/upload.py`). New helper `services/internal_domains.py` looks up `provider_connections`. Defense-in-depth: `transcript_enrichment.py:230-235` raises `ValueError` if `recording_user_id` is None (was silent skip).
+
+2. **P1 #2 (`/text/clean` auth-bypass)** — Task 1.26.2 (commit `cb451cf`). Mismatch check at `routers/text.py:74-85` returns 400 if `body.account_id != context.account_id`. Both `EnvelopeV1` and `process_transcript()` writes now use `context.account_id`. The previously-correct `enrich(account_id=context.account_id, ...)` was preserved.
+
+3. **P1 #3 (`/upload/init` auth-bypass)** — Task 1.26.3 (commit `9eaf170`). Same shape as 1.26.2 but on the upload path. Mismatch check at `routers/upload.py:142` fires before any side effects (S3 key generation, presigned URL, DB write). `UploadJob.account_id` persisted from `context.account_id`.
+
+### Three P2 findings remain — DEFERRED to Phase 1.5
+
+Codex Round 2 surfaced the same three P2s that Round 1 flagged. These are pre-existing-known and explicitly deferrable per the original handoff (`tasks/downstream/codex-phase-1-findings.md`):
+
+- **P2 — `/text/clean` ignores `body.participants`** (Task 1.26.6 — deferred)
+- **P2 — `/upload/init` drops `body.participants` before persistence** (Task 1.26.5 — deferred; cross-repo: needs eq-frontend Prisma migration to add `participants_json` column to UploadJob)
+- **P2 — `get_auth_context()` makes `X-Account-ID` mandatory for ALL routes, breaking `GET /upload/status/{job_id}` polling** (Task 1.26.4 — deferred; **highest-priority P2** because it's a regression on a working path, not a silent drop)
+
+Deferral rationale (per session orchestrator): all three P1s closed and no new P1s surfaced; merging unblocks Phase 1's contract enforcement in production while Phase 1.5 closes the remaining ergonomic gaps. The P2 #3 (polling regression) is the most user-visible and should be the first thing Phase 1.5 fixes.
+
+### Verification (Round 2 post-fix)
+
+- `./scripts/verify_phase_1_invariants.sh` — exit 0, all 12 static contract invariants PASS
+- `pytest tests/unit/` — 122 passed
+- `pytest tests/integration/` — 39 passed, 1 skipped (Phase 1.5 DB scaffold)
+- All three new fix-related test files green (T1.26.1's `test_recording_user_id_wiring.py` 4 tests; T1.26.2 and T1.26.3 share `test_account_anchor_rejection.py` which is now 8 tests).
+
+### Top-level legacy tests (`tests/test_jwt_auth.py`, `tests/test_integration_endpoints.py`)
+
+52 failures pre-existing. These test PRE-Phase-1 auth behavior (no `X-Account-ID` required) and were intentionally broken by Phase 1's T1.4 / T1.10 contract tightening. The verify script intentionally excludes them; they should be deleted or rewritten in a Phase 1.5 cleanup task. **NOT regressions from this session.**
+
+### Lesson carried forward (Phase 1.5 T1.5.23 and beyond)
+
+Round 1's structural self-review (in `codex-phase-1-review.md` above) returned "0 CRITICAL, 0 IMPORTANT, 2 NITs" — the three P1s real Codex found were missed by static-invariant analysis. **Real `/codex review` is non-substitutable as the recurring quality gate.** The carry-forward invariants from `codex-phase-1-findings.md` remain in force:
+
+- When adding a new parameter to an internal function, immediately update every caller — never defer "wire callers in Phase X.5."
+- Auth boundary wins on body/header conflicts for sensitive identity fields — body fields are at best verification checks, at worst security regressions.
+
+### PR #10 status post-Round-2
+
+Unblocked for merge. Cross-repo: `eq-email-pipeline` PR #6 ships first (independent of these fixes), then `live-transcription-fastapi` PR #10.
