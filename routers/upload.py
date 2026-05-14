@@ -26,6 +26,7 @@ Security:
 - Cross-tenant access is rejected with 403
 """
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -181,6 +182,16 @@ async def upload_init(body: UploadInitRequest, request: Request):
         logger.error(f"S3 error generating presigned URL: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate upload URL")
 
+    # Serialize caller-provided participants (Task 1.26.5). `mode="json"`
+    # is required so Pydantic types like EmailStr round-trip cleanly as
+    # strings (instead of the unserializable EmailStr instance). Stored as
+    # JSON TEXT on UploadJob and deserialized by _process_upload_job().
+    participants_json = (
+        json.dumps([p.model_dump(mode="json") for p in body.participants])
+        if body.participants
+        else None
+    )
+
     # Create job record
     job = UploadJob(
         id=uuid.UUID(job_id),
@@ -197,6 +208,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
         file_size=body.file_size,
         interaction_id=uuid.UUID(interaction_id),
         trace_id=context.trace_id,
+        participants_json=participants_json,
     )
 
     try:
@@ -436,6 +448,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             user_name = job.user_name
             trace_id = job.trace_id
             account_id = job.account_id
+            participants_json = job.participants_json
 
         # Generate presigned GET URL for Deepgram
         s3_service = S3Service()
@@ -474,12 +487,31 @@ async def _process_upload_job(job_id: str, tenant_id: str):
                     await session.commit()
             return
 
-        # Enrich transcript with calendar event contacts.
-        # `participants=None` for now — Task 1.26.5 will wire
-        # UploadJob.participants_json through this worker so callers can
-        # provide manual participants on /upload/init. Today /upload/init
-        # accepts `participants` but drops it; explicit None documents
-        # that decision rather than silently passing junk. (Task 1.26.6)
+        # Deserialize caller-provided participants from the persisted JSON
+        # (Task 1.26.5). Graceful fallback on corrupt rows: if json.loads
+        # or ParticipantSpec.model_validate fail on ANY participant, the
+        # whole payload is suspect, so we log loudly and continue with
+        # participants=None rather than crashing the upload. The transcript
+        # still processes; only the participant signal is lost.
+        participants = None
+        if participants_json:
+            try:
+                raw_participants = json.loads(participants_json)
+                participants = [
+                    ParticipantSpec.model_validate(p) for p in raw_participants
+                ]
+            except (json.JSONDecodeError, ValueError, TypeError) as exc:
+                logger.error(
+                    f"Corrupt participants_json on UploadJob, falling back to "
+                    f"participants=None: job_id={job_id}, error={exc!r}"
+                )
+                participants = None
+
+        # Enrich transcript with calendar event contacts. `participants` is
+        # forwarded explicitly (caller-side completeness, Task 1.26.6) — it
+        # carries body.participants from /upload/init through the async worker
+        # so manual-notes / no-calendar-match workflows still get contact_ids
+        # and front-matter.
         from services.transcript_enrichment import TranscriptEnrichmentService
         enrichment_service = TranscriptEnrichmentService()
         transcript_ts = datetime.now(timezone.utc)
@@ -491,7 +523,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             account_id=account_id,
             recording_user_id=pg_user_id or user_id,
             tenant_internal_domains=await get_tenant_internal_domains(tenant_id),
-            participants=None,
+            participants=participants,
         )
 
         # Prepend front-matter before cleaning

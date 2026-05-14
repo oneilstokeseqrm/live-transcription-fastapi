@@ -90,6 +90,13 @@ class UploadJob(SQLModel, table=True):
     # Metadata for extensibility
     metadata_json: Optional[str] = Field(default=None, sa_column=Column(Text, name="metadata_json"))
 
+    # Caller-provided participants (JSON-serialized list[ParticipantSpec]).
+    # Set by POST /upload/init when body.participants is non-empty; read by
+    # _process_upload_job() and forwarded to TranscriptEnrichmentService.enrich()
+    # so manual-notes workflows (uploads without calendar match) still get
+    # contact_ids and front-matter. (Task 1.26.5)
+    participants_json: Optional[str] = Field(default=None, sa_column=Column(Text, name="participants_json"))
+
     # Timestamps (explicit timezone-aware columns for asyncpg compatibility)
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
