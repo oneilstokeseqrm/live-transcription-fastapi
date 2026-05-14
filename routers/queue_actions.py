@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -75,11 +74,6 @@ class MapRequest(BaseModel):
     """Body for `POST /queue/{id}/map`."""
     account_id: str = Field(..., min_length=1)
     approval_attempt_id: str = Field(..., min_length=1)
-
-
-class IgnoreRequest(BaseModel):
-    """Body for `POST /queue/{id}/ignore` — no fields today."""
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +287,7 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
 
 
 @router.post("/{queue_id}/ignore")
-async def ignore_entry(queue_id: str, body: IgnoreRequest, request: Request):
+async def ignore_entry(queue_id: str, request: Request):
     """Archive a queue entry (status='ignored', archived_at=NOW)."""
     ctx = get_auth_context_polling(request)
     _validate_uuid_path_param(queue_id, "queue_id")

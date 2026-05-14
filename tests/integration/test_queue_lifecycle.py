@@ -400,6 +400,7 @@ def test_map_happy_path(client: TestClient):
     assert body["account_id"] == account_id
 
     materialize_mock.assert_awaited_once()
+    assert materialize_mock.await_args is not None
     call_kwargs = materialize_mock.await_args.kwargs
     assert call_kwargs["tenant_id"] == TENANT_ID
     assert call_kwargs["queue_id"] == queue_id
