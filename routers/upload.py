@@ -133,6 +133,25 @@ async def upload_init(body: UploadInitRequest, request: Request):
     job_id = str(uuid.uuid4())
     interaction_id = context.interaction_id
 
+    # Reject body/header account_id mismatch. The auth-context account_id
+    # (X-Account-ID header) is the source of truth; a mismatch indicates
+    # inconsistent client behavior or a tampering attempt — 400 loudly rather
+    # than silently picking one source. UploadJob.account_id is persisted from
+    # context.account_id below; a body-supplied value would otherwise cause the
+    # background worker to publish under the wrong account. (Phase 1 / T1.26.3)
+    if body.account_id != context.account_id:
+        logger.warning(
+            f"account_id mismatch: job_id={job_id}, interaction_id={interaction_id}, "
+            f"body.account_id={body.account_id}, context.account_id={context.account_id}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "account_id mismatch: body.account_id and X-Account-ID header must agree. "
+                "The authenticated account_id is the source of truth."
+            ),
+        )
+
     # Normalize MIME type (browsers report non-standard types like audio/x-m4a)
     normalized_mime = _normalize_audio_mime_type(body.mime_type)
 
@@ -165,7 +184,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
         tenant_id=uuid.UUID(context.tenant_id),
         user_id=context.user_id,
         pg_user_id=context.pg_user_id,
-        account_id=body.account_id,
+        account_id=context.account_id,
         user_name=context.user_name,
         job_type=JobType.audio_transcription,
         status=JobStatus.queued,

@@ -143,3 +143,91 @@ def test_text_clean_accepts_matching_account_id(client: TestClient):
     # The auth-context boundary must NOT 400, and the mismatch check must NOT 400.
     assert "account_id mismatch" not in response.text.lower()
     assert "x-account-id header is required" not in response.text.lower()
+
+
+# --- /upload/init tests (T1.26.3) ---
+
+def test_upload_init_rejects_missing_account_id_header(client: TestClient):
+    """Auth-context layer rejects missing X-Account-ID header with 400 for /upload/init."""
+    token = _make_jwt()
+    response = client.post(
+        "/upload/init",
+        json={
+            "filename": "test.wav",
+            "mime_type": "audio/wav",
+            "file_size": 1024,
+            "account_id": "acct-1",  # body has it; header missing → 400 from auth-context
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 400, response.text
+    assert "x-account-id" in response.text.lower()
+
+
+def test_upload_init_rejects_account_id_mismatch(client: TestClient):
+    """Backend rejects /upload/init requests where body.account_id != X-Account-ID header.
+
+    The auth-context account_id is the source of truth. UploadJob.account_id
+    must be persisted from context, not body — a mismatch indicates inconsistent
+    client behavior and the worker would otherwise publish under the wrong account.
+    """
+    token = _make_jwt()
+    response = client.post(
+        "/upload/init",
+        json={
+            "filename": "test.wav",
+            "mime_type": "audio/wav",
+            "file_size": 1024,
+            "account_id": "acct-A",
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": "acct-B",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "account_id mismatch" in response.text.lower()
+
+
+@pytest.fixture
+def mock_upload_services():
+    """Stub S3 + DB so /upload/init can return without hitting external systems."""
+    from unittest.mock import AsyncMock, MagicMock
+    with patch("routers.upload.S3Service") as mock_s3_cls, \
+         patch("routers.upload.get_async_session") as mock_session:
+        mock_s3 = MagicMock()
+        mock_s3.generate_file_key.return_value = "tenants/foo/jobs/bar/test.wav"
+        mock_s3.generate_presigned_put_url.return_value = (
+            "https://example.com/upload",
+            "2026-01-01T00:00:00Z",
+        )
+        mock_s3_cls.return_value = mock_s3
+        # Mock the async context manager for get_async_session()
+        async_session_cm = MagicMock()
+        async_session_instance = AsyncMock()
+        async_session_instance.add = MagicMock()
+        async_session_cm.__aenter__.return_value = async_session_instance
+        async_session_cm.__aexit__.return_value = None
+        mock_session.return_value = async_session_cm
+        yield
+
+
+@pytest.mark.usefixtures("mock_upload_services")
+def test_upload_init_accepts_matching_account_id(client: TestClient):
+    """When body.account_id matches X-Account-ID header, /upload/init proceeds normally."""
+    token = _make_jwt()
+    response = client.post(
+        "/upload/init",
+        json={
+            "filename": "test.wav",
+            "mime_type": "audio/wav",
+            "file_size": 1024,
+            "account_id": "acct-1",
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": "acct-1",
+        },
+    )
+    assert "account_id mismatch" not in response.text.lower()
+    assert "x-account-id header is required" not in response.text.lower()
