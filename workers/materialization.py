@@ -27,14 +27,22 @@ INSERT_CONTACT_SQL = text("""
     INSERT INTO contacts (id, tenant_id, email, first_name, last_name, account_id,
                           source, validation_status, created_at, updated_at)
     VALUES (gen_random_uuid(), :tenant_id, lower(:email), :first_name, :last_name,
-            :account_id, :source, 'validated', NOW(), NOW())
+            :account_id, :source, 'verified', NOW(), NOW())
     ON CONFLICT (tenant_id, email) DO UPDATE
         SET first_name = COALESCE(contacts.first_name, EXCLUDED.first_name),
             last_name = COALESCE(contacts.last_name, EXCLUDED.last_name),
             account_id = COALESCE(contacts.account_id, EXCLUDED.account_id),
             updated_at = NOW()
-    RETURNING id::text
+    RETURNING id::text, account_id::text
 """)
+# validation_status='verified' matches the live ContactValidationStatus enum
+# (pending | verified | discarded). Materialization runs only when the queue
+# resolves an account; the contact is therefore verified, not pending.
+#
+# account_id is preserved on conflict via COALESCE; the caller checks the
+# RETURNED account_id against the materialization's input account_id. A
+# mismatch means the contact already belongs to a different account
+# (cross-account reassignment is Phase 3 scope — fail loud).
 
 
 INSERT_LINK_SQL = text("""
@@ -126,7 +134,17 @@ async def materialize_account_approval(
                 "source": s.source_type,
             },
         )
-        contact_id = result.scalar_one()
+        row = result.one()
+        contact_id = row.id
+        returned_account_id = row.account_id
+        if returned_account_id != account_id:
+            raise ValueError(
+                f"Contact {s.contact_email!r} already belongs to account "
+                f"{returned_account_id!r}; cannot materialize against account "
+                f"{account_id!r} for queue_id={queue_id!r}. Cross-account "
+                f"contact reassignment is Phase 3 scope; the worker fails "
+                f"loud so the operator can investigate."
+            )
         contact_ids.append(contact_id)
 
         if s.interaction_id is not None:

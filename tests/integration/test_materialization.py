@@ -68,14 +68,29 @@ def _fake_signal(email, display_name=None, role=None, interaction_id=None, sourc
     return row
 
 
-def _fake_execute_result(returning_value=None, all_rows=None):
-    """Build a mock SQLAlchemy result object."""
+def _fake_execute_result(returning_value=None, all_rows=None, returning_row=None):
+    """Build a mock SQLAlchemy result object.
+
+    - returning_value: configures .scalar_one() (used by single-column RETURNING)
+    - returning_row:   configures .one() (used by multi-column RETURNING — contacts)
+    - all_rows:        configures .all() (used by signals SELECT)
+    """
     result = MagicMock()
     if returning_value is not None:
         result.scalar_one = MagicMock(return_value=returning_value)
+    if returning_row is not None:
+        result.one = MagicMock(return_value=returning_row)
     if all_rows is not None:
         result.all = MagicMock(return_value=all_rows)
     return result
+
+
+def _fake_contact_row(contact_id, account_id):
+    """Build a mock SQLAlchemy row with .id and .account_id (matches INSERT_CONTACT_SQL RETURNING)."""
+    row = MagicMock()
+    row.id = contact_id
+    row.account_id = account_id
+    return row
 
 
 @pytest.mark.asyncio
@@ -97,10 +112,10 @@ async def test_materialize_emits_5_statement_kinds_in_order():
 
     execute_results = [
         _fake_execute_result(all_rows=signals),  # SELECT signals
-        _fake_execute_result(returning_value=new_contact_ids[0]),  # INSERT contact 0
+        _fake_execute_result(returning_row=_fake_contact_row(new_contact_ids[0], account_id)),
         _fake_execute_result(),  # INSERT link 0
-        _fake_execute_result(returning_value=new_contact_ids[1]),  # INSERT contact 1
-        _fake_execute_result(returning_value=new_contact_ids[2]),  # INSERT contact 2
+        _fake_execute_result(returning_row=_fake_contact_row(new_contact_ids[1], account_id)),
+        _fake_execute_result(returning_row=_fake_contact_row(new_contact_ids[2], account_id)),
         _fake_execute_result(),  # INSERT link 2
         _fake_execute_result(),  # UPDATE queue
         _fake_execute_result(returning_value=new_outbox_id),  # INSERT outbox
@@ -144,7 +159,7 @@ async def test_materialize_passes_correct_params_to_outbox():
 
     execute_results = [
         _fake_execute_result(all_rows=signals),
-        _fake_execute_result(returning_value=new_contact_id),
+        _fake_execute_result(returning_row=_fake_contact_row(new_contact_id, account_id)),
         _fake_execute_result(),  # link
         _fake_execute_result(),  # update
         _fake_execute_result(returning_value=str(uuid.uuid4())),  # outbox
@@ -180,11 +195,12 @@ async def test_materialize_passes_correct_params_to_outbox():
 @pytest.mark.asyncio
 async def test_materialize_does_not_commit():
     """Caller manages the transaction; materialize_account_approval must NOT call session.commit()."""
+    account_id = str(uuid.uuid4())
     signals = [_fake_signal("alice@acme.com")]
     session = MagicMock()
     session.execute = AsyncMock(side_effect=[
         _fake_execute_result(all_rows=signals),
-        _fake_execute_result(returning_value=str(uuid.uuid4())),  # INSERT contact
+        _fake_execute_result(returning_row=_fake_contact_row(str(uuid.uuid4()), account_id)),
         _fake_execute_result(),  # UPDATE queue
         _fake_execute_result(returning_value=str(uuid.uuid4())),  # INSERT outbox
     ])
@@ -193,7 +209,7 @@ async def test_materialize_does_not_commit():
         session=session,
         tenant_id=str(uuid.uuid4()),
         queue_id=str(uuid.uuid4()),
-        account_id=str(uuid.uuid4()),
+        account_id=account_id,
         event_type="account_created",
     )
 
@@ -248,11 +264,11 @@ async def test_materialize_dedupes_contact_ids_in_outbox_payload():
 
     execute_results = [
         _fake_execute_result(all_rows=signals),
-        _fake_execute_result(returning_value=alice_contact_id),  # INSERT contact 1
+        _fake_execute_result(returning_row=_fake_contact_row(alice_contact_id, account_id)),  # 1
         _fake_execute_result(),  # INSERT link 1
-        _fake_execute_result(returning_value=alice_contact_id),  # INSERT contact 2
+        _fake_execute_result(returning_row=_fake_contact_row(alice_contact_id, account_id)),  # 2
         _fake_execute_result(),  # INSERT link 2
-        _fake_execute_result(returning_value=alice_contact_id),  # INSERT contact 3
+        _fake_execute_result(returning_row=_fake_contact_row(alice_contact_id, account_id)),  # 3
         _fake_execute_result(),  # UPDATE queue
         _fake_execute_result(returning_value=str(uuid.uuid4())),  # INSERT outbox
     ]
@@ -270,6 +286,47 @@ async def test_materialize_dedupes_contact_ids_in_outbox_payload():
     outbox_call = session.execute.await_args_list[-1]
     payload = json.loads(outbox_call.args[1]["payload_json"])
     assert payload["contact_ids"] == [alice_contact_id]  # deduplicated
+
+
+@pytest.mark.asyncio
+async def test_materialize_raises_on_cross_account_collision():
+    """Existing contact under a different account → fail loud, do not silently misroute.
+
+    The ON CONFLICT branch preserves existing account_id via COALESCE. When the
+    contact already belongs to account A and the worker is materializing against
+    account B, the RETURNED account_id is A; the function must raise rather than
+    write a queue + outbox event pointing at B. Cross-account reassignment is
+    Phase 3 scope.
+    """
+    queue_id = str(uuid.uuid4())
+    tenant_id = str(uuid.uuid4())
+    new_account_id = str(uuid.uuid4())
+    pre_existing_account_id = str(uuid.uuid4())
+
+    signals = [_fake_signal("alice@acme.com")]
+    pre_existing_contact_id = str(uuid.uuid4())
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[
+        _fake_execute_result(all_rows=signals),
+        # Contact already belongs to pre_existing_account_id; COALESCE preserves it
+        _fake_execute_result(returning_row=_fake_contact_row(
+            pre_existing_contact_id, pre_existing_account_id,
+        )),
+    ])
+
+    with pytest.raises(ValueError, match="cross-account|already belongs"):
+        await materialize_account_approval(
+            session=session,
+            tenant_id=tenant_id,
+            queue_id=queue_id,
+            account_id=new_account_id,
+            event_type="account_created",
+        )
+
+    # Only SELECT signals + 1 INSERT contact (which detected the collision) should run
+    # — no UPDATE queue, no INSERT outbox
+    assert session.execute.await_count == 2
 
 
 # ---------------------------------------------------------------------------
