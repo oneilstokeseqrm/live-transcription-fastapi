@@ -71,18 +71,26 @@ router = APIRouter(prefix="/queue", tags=["queue"])
 
 def _validate_uuid_field(field_name: str):
     """Pydantic v2 validator factory — rejects non-UUID strings at the API
-    boundary so the SQL binder never sees garbage.
+    boundary so the SQL binder never sees garbage, AND canonicalizes valid
+    UUIDs to their lowercase, brace-free, hyphenated form via
+    `str(uuid.UUID(v))`.
 
-    Without this, malformed UUIDs raised 500 errors from Postgres's UUID
-    cast (`:attempt_id::uuid`) instead of clean 422 validation errors.
-    See Codex P2 #4.
+    Without canonicalization, raw string equality on body fields
+    (`current.approval_attempt_id == body.approval_attempt_id`) FAILS for
+    valid retries that send a non-canonical form (uppercase, braced),
+    because the DB-stored value is canonical (Postgres's `::uuid` cast
+    normalizes). A same-attempt-id retry would receive 409 instead of the
+    contractually-required 200. See Codex Round 5 P2 #2.
+
+    Without UUID validation, malformed UUIDs raised 500 errors from
+    Postgres's UUID cast (`:attempt_id::uuid`) instead of clean 422
+    validation errors. See Codex P2 #4.
     """
     def _validator(v: str) -> str:
         try:
-            uuid.UUID(v)
+            return str(uuid.UUID(v))
         except (ValueError, AttributeError, TypeError):
             raise ValueError(f"{field_name} must be a valid UUID")
-        return v
     return _validator
 
 

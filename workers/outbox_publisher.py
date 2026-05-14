@@ -171,6 +171,12 @@ async def publish_one(
 ) -> None:
     """Publish a single outbox row to EventBridge.
 
+    Concurrency model: a per-row SELECT FOR UPDATE SKIP LOCKED holds a
+    Postgres row lock for the duration of the EventBridge call +
+    MARK_PUBLISHED. This prevents duplicate emissions during multi-process
+    overlap (e.g., deploy windows). Concurrent siblings calling publish_one
+    on the same row see None from SELECT FOR UPDATE and no-op.
+
     Codex Round 4 P1 #1 — multi-replica safe via per-row row lock:
 
     The publish lifecycle for a single row is wrapped in ONE lock-holding
@@ -190,15 +196,30 @@ async def publish_one(
     sibling's next poll won't return this row at all (published_at IS NULL
     filter). No duplicate put_events.
 
-    Failure paths still write MARK_FAILED in a SEPARATE fresh session:
+    Codex Round 5 P1 #1 — failure-path deadlock fix:
 
-    - On EventBridge exception: open a fresh session, MARK_FAILED + COMMIT,
-      then re-raise. The fail session is decoupled from the lock session
-      so the failure-state write persists even though the lock session
-      rolls back on the raise.
+    If put_events raises (or returns FailedEntryCount > 0), we CAPTURE the
+    error message via the `captured_error` closure variable, RAISE to exit
+    the `lock_session.begin()` block (rolls back the txn AND releases the
+    FOR UPDATE row lock), and THEN open a fresh fail_session for
+    MARK_FAILED — AFTER lock_session has already exited.
 
-    - On FailedEntryCount > 0: same pattern — fresh session, MARK_FAILED +
-      COMMIT, raise RuntimeError.
+    Why: doing MARK_FAILED inside the lock-holding block would deadlock
+    the fresh fail_session against our own row lock. The fail_session
+    UPDATE would block waiting for the row lock to release; the
+    lock_session's transaction can't release the lock until its
+    `async with begin():` block exits; that block can't exit because the
+    inner code (the fresh fail_session UPDATE) is still pending. Postgres
+    does NOT detect this as a true deadlock because lock_session isn't
+    waiting on a Postgres lock — it's waiting on the async call stack to
+    unwind. Production result: the call hangs forever (or until the
+    container is killed).
+
+    Carry-forward invariant: MARK_FAILED still commits on a SEPARATE
+    session from the SELECT/MARK_PUBLISHED session, so a sibling row's
+    success-commit is not coupled to this row's failure-commit. The
+    timing of the fail_session open is what changed (after lock_session
+    exits, not inside its begin block).
 
     No-op paths (return without put_events):
 
@@ -208,91 +229,100 @@ async def publish_one(
       sibling already finished publishing between our poll batch and our
       lock acquisition. Nothing to do.
     """
-    # Open the lock session. We hold it across put_events and MARK_PUBLISHED
-    # so a sibling replica cannot also publish this row.
-    async with session_factory() as lock_session:
-        async with lock_session.begin():
-            row = (await lock_session.execute(
-                SELECT_FOR_UPDATE_SQL, {"id": outbox_row_id},
-            )).one_or_none()
+    # Closure variable captured by the inner block on the failure paths
+    # and consumed by the post-block MARK_FAILED write. None on success
+    # paths and on the no-op paths (returns without raising).
+    captured_error: str | None = None
 
-            if row is None:
-                # SKIP LOCKED returned zero rows — either a sibling
-                # publisher holds the lock, or the row was deleted (rare,
-                # not currently a code path). Either way: noop.
-                logger.debug(
-                    "publish_one noop: outbox row %s not lockable "
-                    "(sibling has lock or row absent)",
-                    outbox_row_id,
+    try:
+        # Open the lock session. We hold it across put_events and
+        # MARK_PUBLISHED so a sibling replica cannot also publish this row.
+        async with session_factory() as lock_session:
+            async with lock_session.begin():
+                row = (await lock_session.execute(
+                    SELECT_FOR_UPDATE_SQL, {"id": outbox_row_id},
+                )).one_or_none()
+
+                if row is None:
+                    # SKIP LOCKED returned zero rows — either a sibling
+                    # publisher holds the lock, or the row was deleted (rare,
+                    # not currently a code path). Either way: noop.
+                    logger.debug(
+                        "publish_one noop: outbox row %s not lockable "
+                        "(sibling has lock or row absent)",
+                        outbox_row_id,
+                    )
+                    return
+
+                if row.published_at is not None:
+                    # Race: a sibling publisher published this row between our
+                    # poll batch SELECT and our per-row lock acquisition.
+                    logger.debug(
+                        "publish_one noop: outbox row %s already published",
+                        outbox_row_id,
+                    )
+                    return
+
+                event = _build_event(row)
+
+                # The put_events call happens INSIDE the lock session's
+                # transaction. The row lock spans this network call, which
+                # bounds how long a publisher container can hold a row lock to
+                # the EventBridge put_events latency (typically <500ms). This
+                # is acceptable because (a) we want sibling replicas to back
+                # off cleanly via SKIP LOCKED, and (b) a stuck publisher will
+                # release the lock when the container restarts, freeing the
+                # row for retry on the next poll cycle.
+                try:
+                    response = await eventbridge_client.put_events(Entries=[event])
+                except Exception as e:
+                    # Capture the error message so the post-lock block can
+                    # write MARK_FAILED in a fresh session AFTER this
+                    # session's row lock releases. Re-raise to unwind
+                    # `lock_session.begin()` (rollback + lock release).
+                    captured_error = (
+                        f"EventBridge exception: {type(e).__name__}: {e}"[:1000]
+                    )
+                    raise
+
+                if response.get("FailedEntryCount", 0) > 0:
+                    # Encode the failed entries for diagnostic context,
+                    # truncated to fit the last_publish_error column.
+                    captured_error = json.dumps(response.get("Entries", []))[:1000]
+                    # Raise so the lock_session begin() block unwinds; the
+                    # post-lock branch writes MARK_FAILED in a fresh session.
+                    raise RuntimeError(
+                        f"EventBridge publish failed: {captured_error}"
+                    )
+
+                # Success — MARK_PUBLISHED IN THE SAME LOCK SESSION so the
+                # row's published_at flip is atomic w.r.t. concurrent
+                # publishers. When this session's COMMIT lands, the row's
+                # published_at is set AND its row lock is released; any
+                # sibling now-polling for unpublished rows will skip it.
+                await lock_session.execute(
+                    MARK_PUBLISHED_SQL, {"id": outbox_row_id},
                 )
-                return
-
-            if row.published_at is not None:
-                # Race: a sibling publisher published this row between our
-                # poll batch SELECT and our per-row lock acquisition.
-                logger.debug(
-                    "publish_one noop: outbox row %s already published",
-                    outbox_row_id,
-                )
-                return
-
-            event = _build_event(row)
-
-            # The put_events call happens INSIDE the lock session's
-            # transaction. The row lock spans this network call, which
-            # bounds how long a publisher container can hold a row lock to
-            # the EventBridge put_events latency (typically <500ms). This
-            # is acceptable because (a) we want sibling replicas to back
-            # off cleanly via SKIP LOCKED, and (b) a stuck publisher will
-            # release the lock when the container restarts, freeing the
-            # row for retry on the next poll cycle.
-            try:
-                response = await eventbridge_client.put_events(Entries=[event])
-            except Exception as e:
-                # Codex P2 #5: put_events raised (network error, auth error,
-                # throttling exception, etc.). Open a FRESH session for
-                # MARK_FAILED so the failure-state UPDATE commits
-                # independently of the lock session rollback that the raise
-                # unwinds. Without this branch the row stays unchanged and
-                # the publisher retries it forever with zero visible state
-                # change (publish_attempts not incremented, last_publish_error
-                # empty).
-                error_msg = f"EventBridge exception: {type(e).__name__}: {e}"[:1000]
-                async with session_factory() as fail_session:
-                    async with fail_session.begin():
-                        await fail_session.execute(
-                            MARK_FAILED_SQL,
-                            {"id": outbox_row_id, "error": error_msg},
-                        )
-                raise
-
-            if response.get("FailedEntryCount", 0) > 0:
-                # Encode the failed entries for diagnostic context, truncated
-                # to fit the last_publish_error column without an arbitrarily
-                # large blob.
-                error_msg = json.dumps(response.get("Entries", []))[:1000]
-                # MARK_FAILED in a FRESH session — commits before we raise
-                # so the error is durably visible (publish_attempts
-                # increments, last_publish_error is set). The lock session
-                # rolls back on the raise; that's fine because we have NOT
-                # marked it published, and the SKIP-LOCKED filter will
-                # surface the row on the next poll cycle (still unpublished).
-                async with session_factory() as fail_session:
-                    async with fail_session.begin():
-                        await fail_session.execute(
-                            MARK_FAILED_SQL,
-                            {"id": outbox_row_id, "error": error_msg},
-                        )
-                raise RuntimeError(f"EventBridge publish failed: {error_msg}")
-
-            # Success — MARK_PUBLISHED IN THE SAME LOCK SESSION so the
-            # row's published_at flip is atomic w.r.t. concurrent
-            # publishers. When this session's COMMIT lands, the row's
-            # published_at is set AND its row lock is released; any
-            # sibling now-polling for unpublished rows will skip it.
-            await lock_session.execute(
-                MARK_PUBLISHED_SQL, {"id": outbox_row_id},
-            )
+    except Exception:
+        # By the time we land here, the lock_session has exited its
+        # `begin()` block AND its `session_factory()` context manager.
+        # The transaction rolled back; the FOR UPDATE row lock is
+        # released. We can safely open a fresh session to commit
+        # MARK_FAILED without blocking on our own (now-released) lock.
+        #
+        # captured_error is set iff the exception came from the
+        # put_events failure paths. Other unexpected exceptions (e.g. DB
+        # connection drops mid-SELECT) propagate without writing
+        # MARK_FAILED — the publisher loop's per-row try/except logs
+        # them and the next poll cycle picks the row up unchanged.
+        if captured_error is not None:
+            async with session_factory() as fail_session:
+                async with fail_session.begin():
+                    await fail_session.execute(
+                        MARK_FAILED_SQL,
+                        {"id": outbox_row_id, "error": captured_error},
+                    )
+        raise
 
 
 async def run_publisher_loop(

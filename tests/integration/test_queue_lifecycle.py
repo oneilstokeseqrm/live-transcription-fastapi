@@ -1725,3 +1725,186 @@ def test_map_replay_with_same_account_same_attempt_id_returns_200(client: TestCl
     assert body["status"] == "mapped"
     assert body["account_id"] == account_id
     materialize_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 5 fixes
+# ---------------------------------------------------------------------------
+
+# P2 #2 — UUID canonicalization for replay detection.
+#
+# Postgres `::uuid` cast canonicalizes UUIDs (lowercase, no braces, hyphens
+# at standard positions). If a client sends an uppercase UUID like
+# `ABCDEF12-3456-7890-ABCD-1234567890AB`, the SQL stores the canonical
+# lowercase form. The replay-detect comparison (current.approval_attempt_id
+# == body.approval_attempt_id) is a raw string equality — which FAILS
+# because the stored value is canonical lowercase and body.approval_attempt_id
+# is the raw client form. Result: a valid same-attempt_id retry receives
+# 409 instead of 200.
+#
+# Fix: Pydantic validators on ApproveRequest.approval_attempt_id,
+# MapRequest.approval_attempt_id, and MapRequest.account_id RETURN the
+# canonical form via `str(UUID(v))` — so body.* is already canonical when
+# compared against the DB-canonicalized form.
+
+
+def test_approve_request_canonicalizes_uppercase_attempt_id():
+    """Codex Round 5 P2 #2: ApproveRequest's approval_attempt_id validator
+    must canonicalize uppercase UUIDs to lowercase via `str(UUID(v))`.
+
+    Without this, an uppercase request UUID stored as a canonical lowercase
+    DB value would never compare equal on replay, breaking idempotency.
+    """
+    from routers.queue_actions import ApproveRequest
+
+    uppercase = "ABCDEF12-3456-7890-ABCD-1234567890AB"
+    body = ApproveRequest(approval_attempt_id=uppercase)
+
+    assert body.approval_attempt_id == "abcdef12-3456-7890-abcd-1234567890ab"
+
+
+def test_map_request_canonicalizes_uppercase_account_id():
+    """Codex Round 5 P2 #2: MapRequest's account_id validator canonicalizes."""
+    from routers.queue_actions import MapRequest
+
+    uppercase_account = "ABCDEF12-3456-7890-ABCD-1234567890AB"
+    uppercase_attempt = "FEDCBA98-7654-3210-DCBA-9876543210FE"
+    body = MapRequest(
+        account_id=uppercase_account,
+        approval_attempt_id=uppercase_attempt,
+    )
+
+    assert body.account_id == "abcdef12-3456-7890-abcd-1234567890ab"
+    assert body.approval_attempt_id == "fedcba98-7654-3210-dcba-9876543210fe"
+
+
+def test_map_request_canonicalizes_braced_uuid():
+    """Validator accepts braced UUIDs and canonicalizes them.
+
+    `UUID('{abcdef12-...}')` strips the braces. Without the str(UUID(v))
+    return, the body field would carry the raw `{...}` form which would
+    never compare equal against the DB-canonicalized form.
+    """
+    from routers.queue_actions import MapRequest
+
+    braced_account = "{abcdef12-3456-7890-abcd-1234567890ab}"
+    body = MapRequest(
+        account_id=braced_account,
+        approval_attempt_id=str(uuid.uuid4()),
+    )
+
+    assert body.account_id == "abcdef12-3456-7890-abcd-1234567890ab"
+    assert "{" not in body.account_id and "}" not in body.account_id
+
+
+def test_map_replay_with_uppercase_uuid_returns_200(client: TestClient):
+    """End-to-end regression: a replay /map call with UPPERCASE UUIDs
+    matching a row whose DB-stored values are canonical lowercase must
+    return 200 (replay-success), not 409.
+
+    Scenario: Alice's /map call materialized with attempt_id and account_id
+    stored as canonical lowercase in Postgres (via `::uuid` cast). Alice
+    retries with the SAME UUIDs but in UPPERCASE form (e.g. her client
+    formatter uppercases UUIDs). Pre-fix: validators return v as-is, the
+    body fields are UPPERCASE, current.approval_attempt_id (LOWERCASE from
+    DB) != body.approval_attempt_id (UPPERCASE) → fall through to 409.
+    Post-fix: validators canonicalize to lowercase, comparison succeeds,
+    handler returns 200.
+    """
+    queue_id = str(uuid.uuid4())
+    # Canonical lowercase values — these are what the DB stores after
+    # ::uuid cast.
+    account_id_canonical = "abcdef12-3456-7890-abcd-1234567890ab"
+    attempt_id_canonical = "fedcba98-7654-3210-dcba-9876543210fe"
+    # Uppercase forms — what the client sends in this replay.
+    account_id_uppercase = account_id_canonical.upper()
+    attempt_id_uppercase = attempt_id_canonical.upper()
+
+    session = _SessionStub(execute_results=[
+        # SELECT_QUEUE: row already mapped (DB-canonical lowercase).
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=attempt_id_canonical,
+            resolved_account_id=account_id_canonical,
+        )),
+        # SELECT_ACCOUNT: account in tenant.
+        _execute_result(one_or_none=_fake_account_row(account_id_canonical)),
+        # MAP_RESERVE: 0 rows (status='mapped' excluded).
+        _execute_result(one_or_none=None),
+        # Re-SELECT: same row, same attempt_id (DB-canonical), same account.
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            approval_attempt_id=attempt_id_canonical,
+            resolved_account_id=account_id_canonical,
+        )),
+    ])
+
+    materialize_mock = AsyncMock()
+    with _patch_session(session), \
+         patch("routers.queue_actions.materialize_account_approval", new=materialize_mock):
+        response = client.post(
+            f"/queue/{queue_id}/map",
+            json={
+                "account_id": account_id_uppercase,
+                "approval_attempt_id": attempt_id_uppercase,
+            },
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    # CRITICAL: replay-success despite uppercase request UUIDs.
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "mapped"
+    # The response account_id is the canonicalized form (because the
+    # validator already canonicalized body.account_id before the handler
+    # built the response). Either form is acceptable — the contract is
+    # that the call returns 200 with status='mapped'.
+    assert body["account_id"].lower() == account_id_canonical
+    materialize_mock.assert_not_awaited()
+
+
+def test_approve_replay_with_uppercase_attempt_id_returns_200(client: TestClient):
+    """Same canonicalization regression for /approve replay-success: an
+    UPPERCASE attempt_id matching a stored canonical-lowercase attempt_id
+    must take the same-attempt-id idempotent UPDATE path (1 row from
+    RETURNING → 200).
+
+    Pre-fix: UPPERCASE binding cast OK via ::uuid (which canonicalizes
+    in the comparison), so APPROVE_SQL's WHERE matched and UPDATE returned
+    1 row. So the regression here is specifically about state coupling
+    that may emerge in handler comparisons. We pin the happy path:
+    APPROVE_SQL with an UPPERCASE attempt_id still returns 200.
+    """
+    queue_id = str(uuid.uuid4())
+    attempt_id_canonical = "11111111-2222-3333-4444-555555555555"
+    attempt_id_uppercase = attempt_id_canonical.upper()
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="approved",
+            approval_attempt_id=attempt_id_canonical,
+        )),
+        _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/approve",
+            json={"approval_attempt_id": attempt_id_uppercase},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    # Bound attempt_id was canonicalized to lowercase before binding.
+    update_params = session.calls[1][1]
+    assert update_params["attempt_id"] == attempt_id_canonical

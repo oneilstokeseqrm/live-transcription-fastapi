@@ -927,3 +927,174 @@ def test_mark_failed_increments_attempts_and_records_error():
     # MARK_FAILED must NOT set published_at — failed rows stay unpublished
     # for the next poll cycle's retry attempt.
     assert "published_at" not in sql or "published_at = NOW()" not in sql
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 5 P1 #1 — publisher self-deadlock regression tests
+# ---------------------------------------------------------------------------
+#
+# Bug pre-Round-5: the failure-path opened the fresh fail_session INSIDE
+# the lock_session's `async with begin():` block. In production this would
+# block on a real Postgres lock — the fail_session UPDATE waits for the
+# lock_session's FOR UPDATE row lock to release, but the lock_session
+# can't release because its `async with begin():` block is waiting for
+# the inner code (i.e. the fail_session) to return. Python control-flow
+# deadlock. Postgres doesn't detect it as a true deadlock because
+# lock_session isn't waiting on a Postgres lock — it's waiting on the
+# async call stack to unwind.
+#
+# Fix: capture error inside the lock_session block, raise to unwind it
+# (rolls back + releases the row lock), THEN open fail_session AFTER
+# lock_session has exited.
+#
+# These regression tests record the lifecycle ordering of __aenter__ /
+# __aexit__ on each session_factory() invocation and assert that
+# lock_session __aexit__ happens BEFORE fail_session __aenter__.
+
+
+def _make_lifecycle_tracking_session_factory(
+    execute_results_per_session,
+    eventbridge_response=None,
+    eventbridge_exception=None,
+):
+    """session_factory variant that records ('enter', label) / ('exit', label)
+    events on a shared list so tests can assert lifecycle ordering.
+
+    Returns (factory, events) where events is the shared list.
+    """
+    from contextlib import asynccontextmanager
+
+    events: list = []
+    sessions: list = []
+    pending = list(execute_results_per_session)
+    call_count = {"n": 0}
+
+    @asynccontextmanager
+    async def _scoped():
+        call_count["n"] += 1
+        label = f"session{call_count['n']}"
+        events.append(("enter", label))
+
+        session = MagicMock()
+        side_effects = pending.pop(0) if pending else []
+        session.execute = AsyncMock(side_effect=side_effects)
+        begin_cm = MagicMock()
+        begin_cm.__aenter__ = AsyncMock(return_value=None)
+        begin_cm.__aexit__ = AsyncMock(return_value=None)
+        session.begin = MagicMock(return_value=begin_cm)
+        sessions.append(session)
+        try:
+            yield session
+        finally:
+            events.append(("exit", label))
+
+    def factory():
+        return _scoped()
+
+    factory.sessions = sessions  # type: ignore[attr-defined]
+    factory.events = events  # type: ignore[attr-defined]
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_publish_one_releases_lock_before_mark_failed_on_exception():
+    """REGRESSION (Codex Round 5 P1 #1): prevent self-deadlock when put_events raises.
+
+    The fix: lock_session MUST rollback and release the FOR UPDATE lock
+    BEFORE the fail_session opens to write MARK_FAILED. Otherwise the
+    fail_session blocks on our own row lock and the call hangs in
+    production (the test would deadlock against a real DB).
+
+    Verifies: lock_session __aexit__ happens BEFORE fail_session __aenter__.
+    """
+    outbox_id = str(uuid.uuid4())
+    row = _row(
+        id=outbox_id,
+        tenant_id=str(uuid.uuid4()),
+        queue_id=str(uuid.uuid4()),
+        event_type="account_created",
+        account_id=str(uuid.uuid4()),
+        payload_json={},
+        published_at=None,
+    )
+
+    factory = _make_lifecycle_tracking_session_factory([
+        [_fake_result(one_or_none_value=row)],  # lock_session
+        [_fake_result()],                        # fail_session
+    ])
+
+    eb = MagicMock()
+    eb.put_events = AsyncMock(side_effect=RuntimeError("network down"))
+
+    with pytest.raises(RuntimeError, match="network down"):
+        await publish_one(
+            session_factory=factory,
+            eventbridge_client=eb,
+            outbox_row_id=outbox_id,
+        )
+
+    events = factory.events  # type: ignore[attr-defined]
+
+    # Both sessions opened.
+    assert ("enter", "session1") in events
+    assert ("exit", "session1") in events
+    assert ("enter", "session2") in events
+    assert ("exit", "session2") in events
+
+    exit_session1_idx = events.index(("exit", "session1"))
+    enter_session2_idx = events.index(("enter", "session2"))
+
+    assert exit_session1_idx < enter_session2_idx, (
+        "Deadlock regression: fail_session opened while lock_session still "
+        f"held its FOR UPDATE lock. Events: {events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_one_releases_lock_before_mark_failed_on_failed_entries():
+    """REGRESSION (Codex Round 5 P1 #1): same deadlock guard for the
+    FailedEntryCount > 0 path.
+
+    The original Round 4 fix opened fail_session inside the lock-session
+    begin() block for BOTH the exception path and the FailedEntryCount > 0
+    path. Both deadlocked. This test pins the FailedEntryCount path.
+    """
+    outbox_id = str(uuid.uuid4())
+    row = _row(
+        id=outbox_id,
+        tenant_id=str(uuid.uuid4()),
+        queue_id=str(uuid.uuid4()),
+        event_type="account_created",
+        account_id=str(uuid.uuid4()),
+        payload_json={},
+        published_at=None,
+    )
+
+    factory = _make_lifecycle_tracking_session_factory([
+        [_fake_result(one_or_none_value=row)],  # lock_session
+        [_fake_result()],                        # fail_session
+    ])
+
+    eb = MagicMock()
+    eb.put_events = AsyncMock(return_value={
+        "FailedEntryCount": 1,
+        "Entries": [{"ErrorCode": "Throttled", "ErrorMessage": "nope"}],
+    })
+
+    with pytest.raises(RuntimeError, match="EventBridge publish failed"):
+        await publish_one(
+            session_factory=factory,
+            eventbridge_client=eb,
+            outbox_row_id=outbox_id,
+        )
+
+    events = factory.events  # type: ignore[attr-defined]
+
+    exit_session1_idx = events.index(("exit", "session1"))
+    enter_session2_idx = events.index(("enter", "session2"))
+
+    assert exit_session1_idx < enter_session2_idx, (
+        "Deadlock regression (FailedEntryCount path): fail_session opened "
+        "while lock_session still held its FOR UPDATE lock. "
+        f"Events: {events}"
+    )
