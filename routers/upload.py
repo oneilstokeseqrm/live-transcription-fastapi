@@ -474,7 +474,12 @@ async def _process_upload_job(job_id: str, tenant_id: str):
                     await session.commit()
             return
 
-        # Enrich transcript with calendar event contacts
+        # Enrich transcript with calendar event contacts.
+        # `participants=None` for now — Task 1.26.5 will wire
+        # UploadJob.participants_json through this worker so callers can
+        # provide manual participants on /upload/init. Today /upload/init
+        # accepts `participants` but drops it; explicit None documents
+        # that decision rather than silently passing junk. (Task 1.26.6)
         from services.transcript_enrichment import TranscriptEnrichmentService
         enrichment_service = TranscriptEnrichmentService()
         transcript_ts = datetime.now(timezone.utc)
@@ -486,6 +491,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             account_id=account_id,
             recording_user_id=pg_user_id or user_id,
             tenant_internal_domains=await get_tenant_internal_domains(tenant_id),
+            participants=None,
         )
 
         # Prepend front-matter before cleaning

@@ -84,7 +84,12 @@ async def clean_text(body: TextCleanRequest, request: Request):
             ),
         )
 
-    # Enrich transcript with calendar event contacts + front-matter
+    # Enrich transcript with calendar event contacts + front-matter.
+    # Pass body.participants so manual-notes flows (no calendar event in the
+    # time window) still resolve contacts and queue unknown-domain signals.
+    # See TranscriptEnrichmentService.enrich() docstring for caller-wins
+    # semantics when both a calendar match and body.participants are present.
+    # (Task 1.26.6)
     enrichment_service = TranscriptEnrichmentService()
     transcript_ts = datetime.now(timezone.utc)
     enrichment = await enrichment_service.enrich(
@@ -95,6 +100,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
         account_id=context.account_id,
         recording_user_id=context.pg_user_id or context.user_id,
         tenant_internal_domains=await get_tenant_internal_domains(context.tenant_id),
+        participants=body.participants,
     )
 
     # Prepend front-matter to text before cleaning (LLM sees attendee context)

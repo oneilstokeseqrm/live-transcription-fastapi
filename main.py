@@ -423,6 +423,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 _ws_enrich_internal_domains = await get_tenant_internal_domains(
                     _ws_enrich_tenant_id
                 )
+                # `participants=None` for the WebSocket /listen flow:
+                # streaming audio sessions don't accept caller-provided
+                # participants — calendar matching is the sole attendee
+                # source. Explicit None documents the caller-side audit
+                # rather than relying on the default. (Task 1.26.6)
                 enrichment = await enrichment_service.enrich(
                     tenant_id=_ws_enrich_tenant_id,
                     transcript_timestamp=transcript_ts,
@@ -432,6 +437,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     account_id=context.account_id if context else None,
                     recording_user_id=_ws_enrich_recording_user_id,
                     tenant_internal_domains=_ws_enrich_internal_domains,
+                    participants=None,
                 )
 
                 # Prepend front-matter before cleaning
