@@ -1,6 +1,3 @@
-# tests/unit/test_advisory_lock.py
-import pytest
-import hashlib
 from workers.advisory_lock import lock_key_for_queue_id
 
 

@@ -2,6 +2,7 @@
 
 import hashlib
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 def lock_key_for_queue_id(queue_id: str) -> int:
@@ -18,7 +19,7 @@ def lock_key_for_queue_id(queue_id: str) -> int:
 TRY_LOCK_SQL = text("SELECT pg_try_advisory_xact_lock(:key)")
 
 
-async def try_acquire_queue_lock(session, queue_id: str) -> bool:
+async def try_acquire_queue_lock(session: AsyncSession, queue_id: str) -> bool:
     """Try to acquire a transaction-scoped advisory lock for this queue_id.
 
     Returns True on acquisition; False if another worker holds it.
