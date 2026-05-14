@@ -20,7 +20,7 @@ from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
 from services.internal_domains import get_tenant_internal_domains
-from utils.context_utils import get_auth_context
+from utils.context_utils import get_auth_context_ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ async def process_batch_audio(file: UploadFile, request: Request):
     # Extract and validate request context (raises HTTPException 401/400 on failure)
     # Supports JWT from gateway (preferred) or legacy headers (when ALLOW_LEGACY_HEADER_AUTH=true)
     # Requirements: 1.1, 1.2
-    context = get_auth_context(request)
+    context = get_auth_context_ingestion(request)
     
     processing_id = str(uuid.uuid4())
     logger.info(
@@ -150,7 +150,9 @@ async def process_batch_audio(file: UploadFile, request: Request):
             detail="Transcription service failed. Please try again."
         )
     
-    # Step 2: Enrich transcript with calendar event contacts
+    # Step 2: Enrich transcript with calendar event contacts.
+    # `participants=None` explicitly: /batch/process accepts an audio file
+    # and lets calendar matching be the sole attendee source. (Task 1.26.6)
     enrichment_service = TranscriptEnrichmentService()
     transcript_ts = datetime.now(timezone.utc)
     enrichment = await enrichment_service.enrich(
@@ -161,6 +163,13 @@ async def process_batch_audio(file: UploadFile, request: Request):
         account_id=context.account_id,
         recording_user_id=context.pg_user_id or context.user_id,
         tenant_internal_domains=await get_tenant_internal_domains(context.tenant_id),
+        participants=None,
+        # Codex Round 4 P2: thread the request's interaction_id so queue-signal
+        # rows anchor to it when there's no calendar match. /batch/process
+        # passes participants=None, so today this only matters defensively
+        # (no participants → no queue-signal path), but the caller-side
+        # invariant is "always thread interaction_id" — keep it symmetrical.
+        interaction_id=context.interaction_id,
     )
 
     # Prepend front-matter before cleaning

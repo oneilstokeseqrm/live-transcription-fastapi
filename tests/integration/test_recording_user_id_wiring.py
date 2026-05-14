@@ -213,7 +213,7 @@ async def test_text_clean_passes_recording_user_id_and_internal_domains_to_enric
     )
 
     with patch(
-        "routers.text.get_auth_context", return_value=fake_context,
+        "routers.text.get_auth_context_ingestion", return_value=fake_context,
     ), patch(
         "services.transcript_enrichment.TranscriptEnrichmentService.enrich",
         new=fake_enrich,

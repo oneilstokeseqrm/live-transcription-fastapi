@@ -19,7 +19,7 @@ from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
 from services.internal_domains import get_tenant_internal_domains
-from utils.context_utils import get_auth_context
+from utils.context_utils import get_auth_context_ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
     """
     # Validate and extract context (raises HTTPException 401/400 on failure)
     # Supports JWT from gateway (preferred) or legacy headers (when ALLOW_LEGACY_HEADER_AUTH=true)
-    context = get_auth_context(request)
+    context = get_auth_context_ingestion(request)
     
     logger.info(
         f"Text cleaning started: interaction_id={context.interaction_id}, "
@@ -84,7 +84,12 @@ async def clean_text(body: TextCleanRequest, request: Request):
             ),
         )
 
-    # Enrich transcript with calendar event contacts + front-matter
+    # Enrich transcript with calendar event contacts + front-matter.
+    # Pass body.participants so manual-notes flows (no calendar event in the
+    # time window) still resolve contacts and queue unknown-domain signals.
+    # See TranscriptEnrichmentService.enrich() docstring for caller-wins
+    # semantics when both a calendar match and body.participants are present.
+    # (Task 1.26.6)
     enrichment_service = TranscriptEnrichmentService()
     transcript_ts = datetime.now(timezone.utc)
     enrichment = await enrichment_service.enrich(
@@ -95,6 +100,11 @@ async def clean_text(body: TextCleanRequest, request: Request):
         account_id=context.account_id,
         recording_user_id=context.pg_user_id or context.user_id,
         tenant_internal_domains=await get_tenant_internal_domains(context.tenant_id),
+        participants=body.participants,
+        # Codex Round 4 P2: thread the request's interaction_id into enrich()
+        # so queue-signal rows have a non-NULL anchor when there's no calendar
+        # match. Without this, retries can't dedupe under pending_signal_dedup.
+        interaction_id=context.interaction_id,
     )
 
     # Prepend front-matter to text before cleaning (LLM sees attendee context)

@@ -26,6 +26,7 @@ Security:
 - Cross-tenant access is rejected with 403
 """
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -47,7 +48,10 @@ from models.participant_spec import ParticipantSpec
 from services.s3_service import S3Service, S3ServiceError
 from services.database import get_async_session
 from services.internal_domains import get_tenant_internal_domains
-from utils.context_utils import get_auth_context
+from utils.context_utils import (
+    get_auth_context_ingestion,
+    get_auth_context_polling,
+)
 
 from sqlalchemy import select
 
@@ -127,8 +131,8 @@ async def upload_init(body: UploadInitRequest, request: Request):
         HTTPException 401: Invalid/missing JWT
         HTTPException 500: S3 or database error
     """
-    # Authenticate and get tenant context
-    context = get_auth_context(request)
+    # Authenticate and get tenant context (ingestion: X-Account-ID required)
+    context = get_auth_context_ingestion(request)
 
     job_id = str(uuid.uuid4())
     interaction_id = context.interaction_id
@@ -178,6 +182,23 @@ async def upload_init(body: UploadInitRequest, request: Request):
         logger.error(f"S3 error generating presigned URL: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate upload URL")
 
+    # Serialize caller-provided participants (Task 1.26.5). `mode="json"`
+    # is required so Pydantic types like EmailStr round-trip cleanly as
+    # strings (instead of the unserializable EmailStr instance). Stored as
+    # JSON TEXT on UploadJob and deserialized by _process_upload_job().
+    #
+    # `is not None` (not truthy): an explicit empty list `[]` is preserved
+    # as `"[]"` so the worker passes `participants=[]` to enrich(), which
+    # honors the "explicit no participants, do NOT fall back to calendar"
+    # semantic established for /text/clean in Task 1.26.6. Collapsing `[]`
+    # to None would re-enable calendar fallback against the caller's
+    # explicit signal. (Codex Round 3 P2 — fixed before Phase 1.5 ship.)
+    participants_json = (
+        json.dumps([p.model_dump(mode="json") for p in body.participants])
+        if body.participants is not None
+        else None
+    )
+
     # Create job record
     job = UploadJob(
         id=uuid.UUID(job_id),
@@ -194,6 +215,7 @@ async def upload_init(body: UploadInitRequest, request: Request):
         file_size=body.file_size,
         interaction_id=uuid.UUID(interaction_id),
         trace_id=context.trace_id,
+        participants_json=participants_json,
     )
 
     try:
@@ -237,8 +259,9 @@ async def upload_complete(body: UploadCompleteRequest, request: Request):
         HTTPException 403: File key doesn't belong to tenant
         HTTPException 404: Job not found or file not in S3
     """
-    # Authenticate and get tenant context
-    context = get_auth_context(request)
+    # Authenticate and get tenant context (ingestion: X-Account-ID required —
+    # /upload/complete triggers async write/persist via _process_upload_job)
+    context = get_auth_context_ingestion(request)
 
     logger.info(
         f"Upload complete: file_key={body.file_key[:50]}..., "
@@ -338,8 +361,9 @@ async def upload_status(job_id: str, request: Request):
         HTTPException 403: Job doesn't belong to tenant
         HTTPException 404: Job not found
     """
-    # Authenticate and get tenant context
-    context = get_auth_context(request)
+    # Authenticate and get tenant context (polling: X-Account-ID NOT required —
+    # tenant ownership of the job is enforced below; this is a read-only route)
+    context = get_auth_context_polling(request)
 
     # Validate job_id format
     try:
@@ -431,6 +455,7 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             user_name = job.user_name
             trace_id = job.trace_id
             account_id = job.account_id
+            participants_json = job.participants_json
 
         # Generate presigned GET URL for Deepgram
         s3_service = S3Service()
@@ -469,7 +494,31 @@ async def _process_upload_job(job_id: str, tenant_id: str):
                     await session.commit()
             return
 
-        # Enrich transcript with calendar event contacts
+        # Deserialize caller-provided participants from the persisted JSON
+        # (Task 1.26.5). Graceful fallback on corrupt rows: if json.loads
+        # or ParticipantSpec.model_validate fail on ANY participant, the
+        # whole payload is suspect, so we log loudly and continue with
+        # participants=None rather than crashing the upload. The transcript
+        # still processes; only the participant signal is lost.
+        participants = None
+        if participants_json:
+            try:
+                raw_participants = json.loads(participants_json)
+                participants = [
+                    ParticipantSpec.model_validate(p) for p in raw_participants
+                ]
+            except (json.JSONDecodeError, ValueError, TypeError) as exc:
+                logger.error(
+                    f"Corrupt participants_json on UploadJob, falling back to "
+                    f"participants=None: job_id={job_id}, error={exc!r}"
+                )
+                participants = None
+
+        # Enrich transcript with calendar event contacts. `participants` is
+        # forwarded explicitly (caller-side completeness, Task 1.26.6) — it
+        # carries body.participants from /upload/init through the async worker
+        # so manual-notes / no-calendar-match workflows still get contact_ids
+        # and front-matter.
         from services.transcript_enrichment import TranscriptEnrichmentService
         enrichment_service = TranscriptEnrichmentService()
         transcript_ts = datetime.now(timezone.utc)
@@ -481,6 +530,13 @@ async def _process_upload_job(job_id: str, tenant_id: str):
             account_id=account_id,
             recording_user_id=pg_user_id or user_id,
             tenant_internal_domains=await get_tenant_internal_domains(tenant_id),
+            participants=participants,
+            # Codex Round 4 P2: thread the job's interaction_id so queue-signal
+            # rows anchor to it when there's no calendar match. The /upload
+            # path commonly has caller-provided participants without a
+            # calendar event, so this is the path where the dedup fix
+            # matters most in practice.
+            interaction_id=interaction_id,
         )
 
         # Prepend front-matter before cleaning

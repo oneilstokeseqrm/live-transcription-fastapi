@@ -21,6 +21,7 @@ import httpx
 from sqlalchemy import text
 
 from models.enrichment_models import ResolvedContact, EnrichmentResult
+from models.participant_spec import ParticipantSpec
 from services.database import get_async_session
 from services.domain_classification import (
     DomainClass,
@@ -71,6 +72,8 @@ class TranscriptEnrichmentService:
         account_id: Optional[str] = None,
         recording_user_id: Optional[str] = None,
         tenant_internal_domains: Optional[set[str]] = None,
+        participants: Optional[list[ParticipantSpec]] = None,
+        interaction_id: Optional[str] = None,
     ) -> EnrichmentResult:
         """Enrich a transcript with calendar event contacts and front-matter.
 
@@ -80,6 +83,25 @@ class TranscriptEnrichmentService:
         - BUSINESS + known account → create contact with looked-up account_id.
         - BUSINESS + unknown account → upsert pending_account_mappings + signal,
           NO contact. NEVER fall back to anchor account_id for unknown domains.
+
+        Attendee-source semantics (Task 1.26.6 — caller-wins for `participants`):
+        - `participants is None` + calendar match → use calendar attendees
+          (the default flow; calendar is the source of truth).
+        - `participants is None` + NO calendar match → no attendees,
+          return calendar metadata-only enrichment (empty before Task 1.26.6;
+          unchanged here).
+        - `participants is not None` (including empty list) + NO calendar match
+          → use `participants` as the attendee list (manual-notes flow). This
+          unlocks contact resolution and queue signals for notes without a
+          calendar event.
+        - `participants is not None` (including empty list) + calendar match
+          → `participants` OVERRIDES the calendar attendees for the three-state
+          loop (caller-wins). Manual-notes flows are an explicit "here are the
+          people who were in the room" signal that should win over the
+          calendar's snapshot. Calendar match metadata (meeting_title,
+          calendar_event_id, match_confidence) is still preserved.
+        - `participants == []` is an explicit "no participants" — it does NOT
+          fall back to calendar attendees. Distinct from `None`.
 
         Args:
             tenant_id: Tenant UUID string.
@@ -96,6 +118,21 @@ class TranscriptEnrichmentService:
             tenant_internal_domains: Per-tenant connected-provider domains.
                 Defaults to empty (no internal-domain matches). Wiring this
                 from provider_connections is a follow-up.
+            participants: Caller-provided participants from the request body.
+                See "Attendee-source semantics" above. `None` means "no signal,
+                use calendar"; empty list means "explicit no participants,
+                do not fall back". Trust note: this is a semi-trusted client
+                signal (callers can claim arbitrary participants the same way
+                they can fake a calendar invite); it does NOT override the
+                authenticated account_id anchor.
+            interaction_id: The request's interaction_id (per the ingress
+                route's RequestContext / UploadJob / WS session). Used as the
+                queue-signal anchor when no calendar event matched: the source
+                of the signal IS the interaction itself in the manual-notes
+                flow. Without this, `discovered_from_interaction_id` and
+                `SignalProposal.interaction_id` would be NULL, which breaks
+                `pending_signal_dedup` (SQL NULL != NULL) and lets retries
+                duplicate rows. (Codex Round 4 P2 fix.)
 
         Returns:
             EnrichmentResult with resolved contacts, front-matter, and metadata.
@@ -112,42 +149,85 @@ class TranscriptEnrichmentService:
                 conference_url=conference_url,
             )
 
-            if not event:
+            # Step 1b: Determine attendee source (Task 1.26.6 — caller-wins).
+            # See docstring "Attendee-source semantics".
+            event_id: Optional[str] = None
+            meeting_title: Optional[str] = None
+            match_method: str = "none"
+            match_confidence: str = "none"
+            enrichment_source: str = "none"
+            attendees: list[dict] = []
+
+            if event:
+                event_id = str(event["id"])
+                meeting_title = event["title"]
+                match_method = event.get("_match_method", "time_window")
+                match_confidence = "high" if match_method == "conference_url" else "medium"
+                enrichment_source = "calendar_match"
+                logger.info(
+                    f"Calendar event matched: event_id={event_id[:8]}..., "
+                    f"title={meeting_title}, method={match_method}, "
+                    f"confidence={match_confidence}"
+                )
+            else:
                 logger.info(
                     f"No calendar event match: tenant_id={tenant_id[:8]}..., "
                     f"ts={transcript_timestamp.isoformat()}"
                 )
-                return EnrichmentResult()
+                if participants is None:
+                    # No calendar AND no caller-provided participants — nothing
+                    # to enrich. Unchanged pre-Task-1.26.6 behavior.
+                    return EnrichmentResult()
 
-            event_id = str(event["id"])
-            meeting_title = event["title"]
-            match_method = event.get("_match_method", "time_window")
-            match_confidence = "high" if match_method == "conference_url" else "medium"
-
-            logger.info(
-                f"Calendar event matched: event_id={event_id[:8]}..., "
-                f"title={meeting_title}, method={match_method}, "
-                f"confidence={match_confidence}"
-            )
-
-            # Step 2: Get attendees
-            attendees = await self._get_attendees(event_id, tenant_id)
+            # Caller-wins: if participants were provided (even an empty list),
+            # they REPLACE calendar attendees for the three-state loop.
+            # `None` means "no signal — use calendar".
+            if participants is not None:
+                attendees = [_participant_to_attendee(p) for p in participants]
+                if event_id:
+                    logger.info(
+                        f"Using caller-provided participants over calendar "
+                        f"attendees: event_id={event_id[:8]}..., "
+                        f"participant_count={len(attendees)}"
+                    )
+                else:
+                    enrichment_source = "manual_participants"
+                    logger.info(
+                        f"Using caller-provided participants (no calendar match): "
+                        f"tenant_id={tenant_id[:8]}..., "
+                        f"participant_count={len(attendees)}"
+                    )
+            elif event_id:
+                # Step 2: Get attendees from calendar (default path).
+                attendees = await self._get_attendees(event_id, tenant_id)
 
             if not attendees:
-                logger.info(f"No attendees for event: event_id={event_id[:8]}...")
-                return EnrichmentResult(
-                    meeting_title=meeting_title,
-                    calendar_event_id=event_id,
-                    match_confidence=match_confidence,
-                    match_method=match_method,
-                    enrichment_source="calendar_match",
+                # Either calendar had no attendees, or caller explicitly passed
+                # an empty participants list. Preserve calendar match metadata
+                # if we have it; otherwise return empty.
+                if event_id:
+                    logger.info(
+                        f"No attendees to process: event_id={event_id[:8]}..., "
+                        f"participants_provided={participants is not None}"
+                    )
+                    return EnrichmentResult(
+                        meeting_title=meeting_title,
+                        calendar_event_id=event_id,
+                        match_confidence=match_confidence,
+                        match_method=match_method,
+                        enrichment_source=enrichment_source,
+                    )
+                logger.info(
+                    f"No attendees and no calendar match — returning empty enrichment: "
+                    f"tenant_id={tenant_id[:8]}..."
                 )
+                return EnrichmentResult()
 
             # Cap attendees to prevent latency blowup
             if len(attendees) > ENRICHMENT_MAX_ATTENDEES:
                 logger.warning(
                     f"Attendee count {len(attendees)} exceeds max {ENRICHMENT_MAX_ATTENDEES}, "
-                    f"truncating for event_id={event_id[:8]}..."
+                    f"truncating (event_id={event_id[:8] + '...' if event_id else 'none'})"
                 )
                 attendees = attendees[:ENRICHMENT_MAX_ATTENDEES]
 
@@ -178,16 +258,17 @@ class TranscriptEnrichmentService:
                     continue
 
                 klass = classify_domain(domain, internal_domains=internal_domains)
+                event_id_log = f"{event_id[:8]}..." if event_id else "none"
                 if klass == DomainClass.PERSONAL:
                     logger.info(
                         f"Skipping personal-domain attendee: email={email}, "
-                        f"event_id={event_id[:8]}..."
+                        f"event_id={event_id_log}"
                     )
                     continue
                 if klass == DomainClass.INTERNAL:
                     logger.info(
                         f"Skipping internal-domain attendee (Phase 1 no-op): "
-                        f"email={email}, event_id={event_id[:8]}..."
+                        f"email={email}, event_id={event_id_log}"
                     )
                     # Phase 2 will wire internal-user contacts.
                     continue
@@ -234,6 +315,17 @@ class TranscriptEnrichmentService:
                         "user from the request context."
                     )
 
+                # Codex Round 4 P2: in the manual-notes flow there's no
+                # calendar event, so anchor the queue+signal rows to the
+                # request's interaction_id. Without this fallback both
+                # discovered_from_interaction_id and SignalProposal.interaction_id
+                # would be NULL when event_id is None, and pending_signal_dedup
+                # (unique on queue_id+contact_email+source_type+interaction_id+
+                # calendar_event_id) cannot dedupe NULLs — retries would
+                # accumulate duplicate signal rows. calendar_event_id stays
+                # bound to event_id only (NULL when no calendar match), which
+                # is the correct semantic for that column.
+                signal_anchor_id = event_id or interaction_id
                 async with get_async_session() as session:
                     reopened_id = await reopen_archived_entry(
                         session=session,
@@ -249,7 +341,7 @@ class TranscriptEnrichmentService:
                             domain=domain,
                             owner_user_id=recording_user_id,
                             discovered_from_type="transcript",
-                            discovered_from_interaction_id=event_id,
+                            discovered_from_interaction_id=signal_anchor_id,
                         )
 
                     await insert_signal(
@@ -259,7 +351,7 @@ class TranscriptEnrichmentService:
                         proposal=SignalProposal(
                             source_type="transcript",
                             source_user_id=recording_user_id,
-                            interaction_id=event_id,
+                            interaction_id=signal_anchor_id,
                             calendar_event_id=event_id,
                             contact_email=email,
                             contact_display_name=display_name or None,
@@ -277,7 +369,8 @@ class TranscriptEnrichmentService:
 
             logger.info(
                 f"Contact resolution complete: resolved={len(contacts)}, "
-                f"new={new_count}, event_id={event_id[:8]}..."
+                f"new={new_count}, "
+                f"event_id={(event_id[:8] + '...') if event_id else 'none'}"
             )
 
             # Step 4: Build front-matter
@@ -300,7 +393,7 @@ class TranscriptEnrichmentService:
                 match_confidence=match_confidence,
                 match_method=match_method,
                 new_contacts_created=new_count,
-                enrichment_source="calendar_match",
+                enrichment_source=enrichment_source,
             )
 
         except Exception as e:
@@ -761,3 +854,25 @@ def _build_full_name(first: Optional[str], last: Optional[str]) -> Optional[str]
     """Build a full name string from first and last, or None if both empty."""
     parts = [p for p in (first, last) if p]
     return " ".join(parts) if parts else None
+
+
+def _participant_to_attendee(p: ParticipantSpec) -> dict:
+    """Adapt a ParticipantSpec to the attendee-dict shape the three-state
+    branching loop already consumes.
+
+    The loop reads `email`, `display_name`, `is_organizer`, `is_optional`.
+    Calendar attendees include `response_status` and `is_resource` too, but
+    the loop ignores those.
+
+    ParticipantSpec.role is a richer enum (organizer/attendee/optional/
+    sender/recipient); we collapse it back to the two boolean flags the
+    loop expects. `sender`/`recipient` (email-context roles) fold to
+    `attendee` since this is the meeting-context branching loop.
+    """
+    role = p.role
+    return {
+        "email": str(p.email),
+        "display_name": p.display_name or "",
+        "is_organizer": role == "organizer",
+        "is_optional": role == "optional",
+    }

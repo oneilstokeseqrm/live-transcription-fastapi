@@ -210,6 +210,23 @@ Phase 1 of the Contact Quality Initiative tightened the contact-creation contrac
 
 **Reference:** `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` (canonical design doc).
 
+### 3.5 Auth Context: Ingestion vs Polling Helpers (Phase 1.5, since 2026-05-14)
+
+The auth-context layer (`utils/context_utils.py`) exposes TWO helpers that differ only in how they treat `X-Account-ID`:
+
+| Helper | X-Account-ID | Use for |
+|---|---|---|
+| `get_auth_context_ingestion(request)` | **Required.** Raises HTTP 400 if absent. | Mutating / write routes that persist account-anchored data: `POST /text/clean`, `POST /batch/process`, `POST /upload/init`, `POST /upload/complete`. WebSocket `/listen` enforces the same rule inline (closes upgrade with code 1008 if absent). |
+| `get_auth_context_polling(request)` | **Optional.** When absent, `context.account_id == ""` (sentinel). | Read-only routes that only check tenant ownership of an existing resource: `GET /upload/status/{job_id}`. |
+
+Both helpers run identical JWT verification (and identical legacy-header fallback when `ALLOW_LEGACY_HEADER_AUTH=true`). The split exists so polling clients holding a valid JWT but no `X-Account-ID` header are not rejected at the auth-context boundary before the route handler runs its tenant-ownership check.
+
+**Sentinel discipline.** When a route uses `get_auth_context_polling`, `context.account_id` is the empty string `""` if the header is absent. Empty string is intentionally invalid as a foreign key: any code path that tries to persist it will fail loudly at the database layer rather than silently corrupt account anchoring. Polling handlers MUST NOT pass `context.account_id` to any insert/update/upsert path.
+
+**Why not a parameter on a single helper?** A boolean parameter (`require_account_id=True`) couples the two contracts and would require every caller to remember to pass it. The two-helper split makes the contract self-documenting at every call site and gives reviewers an obvious anchor to flag if a polling helper appears in an ingestion code path.
+
+**Reference:** Task 1.26.4 in `tasks/downstream/codex-phase-1-findings.md`.
+
 ---
 
 ## 4. Contact Flow Through the Pipeline

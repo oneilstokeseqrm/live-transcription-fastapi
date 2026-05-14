@@ -4,25 +4,38 @@ Context Extraction Utilities
 This module provides utilities for extracting tenant, user, and account identity
 from request headers, internal JWTs, or environment variables.
 
-Three extraction modes are available:
+Four extraction modes are available:
 
 1. get_request_context() - Lenient extraction with fallbacks (backward compatible)
    - Falls back to environment variables and defaults
    - Never raises exceptions
 
-2. get_validated_context() - Strict validation for production endpoints (legacy)
-   - Requires X-Tenant-ID (valid UUID)
-   - Requires X-User-ID (non-empty string)
+2. get_validated_context() - Legacy-header strict path; accepts a
+   require_account_id flag for ingestion vs polling contracts. Called by
+   get_auth_context_ingestion and get_auth_context_polling.
+   - Requires X-Tenant-ID (valid UUID), X-User-ID (non-empty)
+   - Requires X-Account-ID when require_account_id=True (ingestion);
+     allows it to be absent when require_account_id=False (polling).
    - Optional X-Trace-Id (valid UUID if provided, generated if missing)
    - Raises HTTPException 400 on validation failure
 
-3. get_auth_context() - RECOMMENDED: Unified auth with JWT priority
+3. get_auth_context_ingestion() - Unified auth for INGESTION (writes/mutations).
    - Tries JWT from Authorization header first (gateway requests)
    - Falls back to header-based auth when ALLOW_LEGACY_HEADER_AUTH=true
-   - Raises HTTPException 401 for invalid JWT, 400 for invalid headers
+   - REQUIRES X-Account-ID and raises HTTPException 400 if absent
+   - Raises HTTPException 401 for invalid JWT
+   - Use for: /text/clean, /batch/process, /upload/init, /upload/complete
 
-For new endpoints, use get_auth_context() to support both the frontend gateway
-and legacy testing scenarios.
+4. get_auth_context_polling() - Unified auth for POLLING / read-only routes.
+   - Same JWT/header verification as get_auth_context_ingestion
+   - DOES NOT require X-Account-ID; returns RequestContext.account_id = ""
+   - Callers MUST NOT use context.account_id for any write/persist operation
+     (the sentinel empty-string makes accidental writes loud rather than silent)
+   - Use for: GET /upload/status/{job_id}, any other non-mutating route
+
+The ingestion/polling split (T1.26.4, 2026-05-14) replaces the legacy
+get_auth_context() helper. The split is documented in
+docs/contacts-architecture.md Section 3.5.
 """
 
 import os
@@ -96,57 +109,66 @@ def get_request_context(request: Request) -> RequestContext:
     )
 
 
-def get_validated_context(request: Request) -> RequestContext:
+def get_validated_context(
+    request: Request,
+    require_account_id: bool = True,
+) -> RequestContext:
     """
     Extract and validate context from request headers with strict validation.
-    
+
     This function enforces required headers and validates their formats.
-    Use this for production endpoints that require proper identity context.
-    
+    Use this for legacy header-auth endpoints that require proper identity
+    context. New endpoints should prefer get_auth_context_ingestion() /
+    get_auth_context_polling().
+
     Required Headers:
     - X-Tenant-ID: Must be a valid UUID
     - X-User-ID: Must be a non-empty string
-    
+    - X-Account-ID: Required when require_account_id is True (ingestion routes)
+
     Optional Headers:
     - X-Trace-Id: If provided, must be a valid UUID; generated if missing
-    - X-Account-ID: Optional, no validation
-    
+
     Args:
         request: FastAPI Request object containing headers
-        
+        require_account_id: When True (default), missing X-Account-ID raises 400.
+            When False, the missing header is allowed and the returned
+            RequestContext.account_id is the empty string. Polling/read-only
+            routes should pass require_account_id=False.
+
     Returns:
-        RequestContext with all identity fields populated
-        
+        RequestContext with all identity fields populated. When
+        require_account_id is False and the header is absent, account_id is "".
+
     Raises:
         HTTPException: 400 if required headers are missing or invalid
     """
     # Generate interaction_id for this request
     interaction_id = str(uuid.uuid4())
-    
+
     # Validate X-Tenant-ID (required, must be valid UUID)
     tenant_id = _validate_tenant_id(request)
-    
+
     # Validate X-User-ID (required, non-empty string)
     user_id = _validate_user_id(request)
-    
+
     # Validate X-Trace-Id (optional, generate if missing)
     trace_id = _validate_trace_id(request, interaction_id)
 
-    # Account anchor is required for ingestion endpoints; backend rejects when absent.
-    account_id = request.headers.get("X-Account-ID")
-    if not account_id:
-        raise HTTPException(
-            status_code=400,
-            detail="X-Account-ID header is required for this endpoint"
-        )
+    # Account anchor contract: required for ingestion (raises 400 when missing
+    # or whitespace-only); relaxed to "" sentinel for polling/read-only routes.
+    # Callers MUST NOT persist the "" sentinel.
+    account_id = _require_or_relax_account_id_header(
+        request, required=require_account_id
+    )
 
     # Log extracted context
     logger.info(
         f"Validated context: interaction_id={interaction_id}, "
         f"tenant_id={tenant_id}, user_id={user_id}, "
-        f"account_id={account_id}, trace_id={trace_id}"
+        f"account_id={account_id or '<polling-no-account>'}, trace_id={trace_id}"
     )
-    
+
     return RequestContext(
         tenant_id=tenant_id,
         user_id=user_id,
@@ -156,27 +178,28 @@ def get_validated_context(request: Request) -> RequestContext:
     )
 
 
-def get_auth_context(request: Request) -> RequestContext:
+def get_auth_context_ingestion(request: Request) -> RequestContext:
     """
-    Extract and validate context using JWT or legacy headers.
+    Extract auth context for INGESTION (mutating / write) routes.
 
-    This is the RECOMMENDED function for new endpoints. It implements a dual-mode
-    authentication strategy:
+    Use this for endpoints that persist data tied to an account anchor:
+    /text/clean, /batch/process, /upload/init, /upload/complete.
 
-    1. If Authorization header contains a Bearer token:
-       - Verify the internal JWT (signature, issuer, audience, expiration)
-       - Extract tenant_id and user_id from verified claims
-       - Raise 401 Unauthorized on any JWT validation failure
+    Behavior is identical to get_auth_context_polling() except that the
+    X-Account-ID header is REQUIRED. Missing X-Account-ID raises HTTP 400
+    BEFORE any business logic executes.
 
-    2. If no JWT present and ALLOW_LEGACY_HEADER_AUTH is true:
-       - Fall back to header-based auth (X-Tenant-ID, X-User-ID)
-       - Raise 400 Bad Request on missing/invalid headers
-
-    3. If no JWT present and ALLOW_LEGACY_HEADER_AUTH is false:
-       - Raise 401 Unauthorized (JWT required)
+    Authentication strategy (same as polling variant):
+    1. If Authorization header contains a Bearer token, verify it as an
+       internal JWT (signature, issuer, audience, expiration). On any
+       verification failure raise 401.
+    2. If no JWT present and ALLOW_LEGACY_HEADER_AUTH=true, fall back to
+       header-based auth (X-Tenant-ID, X-User-ID). On missing/invalid
+       headers raise 400.
+    3. If no JWT present and ALLOW_LEGACY_HEADER_AUTH=false, raise 401.
 
     Environment Variables:
-    - ALLOW_LEGACY_HEADER_AUTH: Set to "true" to enable header fallback (default: false)
+    - ALLOW_LEGACY_HEADER_AUTH: "true" enables header fallback (default: false)
     - INTERNAL_JWT_SECRET: Required for JWT verification
     - INTERNAL_JWT_ISSUER: Expected JWT issuer (default: "eq-frontend")
     - INTERNAL_JWT_AUDIENCE: Expected JWT audience (default: "eq-backend")
@@ -185,10 +208,64 @@ def get_auth_context(request: Request) -> RequestContext:
         request: FastAPI Request object
 
     Returns:
-        RequestContext with validated identity fields
+        RequestContext with validated identity fields. account_id is always
+        a non-empty string (the X-Account-ID header value).
 
     Raises:
-        HTTPException: 401 for JWT failures, 400 for header validation failures
+        HTTPException: 401 for JWT failures, 400 for missing X-Account-ID or
+        invalid headers.
+    """
+    return _resolve_auth_context(request, require_account_id=True)
+
+
+def get_auth_context_polling(request: Request) -> RequestContext:
+    """
+    Extract auth context for POLLING / read-only routes.
+
+    Use this for endpoints that read but do NOT mutate account-anchored
+    data, e.g. GET /upload/status/{job_id}. The handler is still expected
+    to enforce tenant ownership on the resource it returns.
+
+    Behavior is identical to get_auth_context_ingestion() except that the
+    X-Account-ID header is OPTIONAL. When absent, the returned
+    RequestContext.account_id is the empty string (sentinel). Callers MUST
+    NOT use that field for any persist/write operation — the sentinel is
+    intentionally invalid as a foreign key so accidental writes fail loudly.
+
+    Args:
+        request: FastAPI Request object
+
+    Returns:
+        RequestContext with validated identity fields. account_id may be ""
+        (when X-Account-ID is absent) or the header value if supplied.
+
+    Raises:
+        HTTPException: 401 for JWT failures, 400 for invalid headers (other
+        than X-Account-ID).
+    """
+    return _resolve_auth_context(request, require_account_id=False)
+
+
+def _resolve_auth_context(
+    request: Request,
+    *,
+    require_account_id: bool,
+) -> RequestContext:
+    """
+    Shared implementation behind get_auth_context_ingestion / _polling.
+
+    Performs JWT or legacy-header auth and either enforces or relaxes the
+    X-Account-ID requirement based on `require_account_id`.
+
+    Args:
+        request: FastAPI Request object
+        require_account_id: True for ingestion routes; False for polling.
+
+    Returns:
+        RequestContext with validated identity fields.
+
+    Raises:
+        HTTPException: 401 for JWT failures, 400 for header validation failures.
     """
     # Generate interaction_id for this request
     interaction_id = str(uuid.uuid4())
@@ -199,7 +276,12 @@ def get_auth_context(request: Request) -> RequestContext:
 
     if token:
         # JWT present - verify it
-        return _extract_context_from_jwt(request, token, interaction_id)
+        return _extract_context_from_jwt(
+            request,
+            token,
+            interaction_id,
+            require_account_id=require_account_id,
+        )
 
     # No JWT - check if legacy header auth is allowed
     allow_legacy = os.getenv("ALLOW_LEGACY_HEADER_AUTH", "false").lower() == "true"
@@ -220,13 +302,15 @@ def get_auth_context(request: Request) -> RequestContext:
         f"Using legacy header auth (ALLOW_LEGACY_HEADER_AUTH=true). "
         f"interaction_id={interaction_id}"
     )
-    return get_validated_context(request)
+    return get_validated_context(request, require_account_id=require_account_id)
 
 
 def _extract_context_from_jwt(
     request: Request,
     token: str,
-    interaction_id: str
+    interaction_id: str,
+    *,
+    require_account_id: bool = True,
 ) -> RequestContext:
     """
     Extract RequestContext from a verified JWT.
@@ -235,12 +319,18 @@ def _extract_context_from_jwt(
         request: FastAPI Request object (for additional headers like trace_id)
         token: The JWT string (without Bearer prefix)
         interaction_id: Generated interaction ID for this request
+        require_account_id: When True (default), missing X-Account-ID raises
+            HTTP 400 (ingestion contract). When False, the missing header is
+            allowed and the returned RequestContext.account_id is "".
 
     Returns:
-        RequestContext with JWT-derived tenant_id and user_id
+        RequestContext with JWT-derived tenant_id and user_id. account_id is
+        the X-Account-ID header value, or "" when require_account_id is False
+        and the header is absent.
 
     Raises:
-        HTTPException: 401 on any JWT verification failure
+        HTTPException: 401 on JWT verification failure, 400 on missing
+        X-Account-ID when require_account_id is True.
     """
     try:
         claims = verify_internal_jwt(token)
@@ -257,18 +347,17 @@ def _extract_context_from_jwt(
     # Extract trace_id from header or generate
     trace_id = _validate_trace_id(request, interaction_id)
 
-    # Account anchor is required for ingestion endpoints; backend rejects when absent.
-    account_id = request.headers.get("X-Account-ID")
-    if not account_id:
-        raise HTTPException(
-            status_code=400,
-            detail="X-Account-ID header is required for this endpoint"
-        )
+    # Account anchor contract: required for ingestion (raises 400 when missing
+    # or whitespace-only); relaxed to "" sentinel for polling/read-only routes.
+    # Callers MUST NOT persist the "" sentinel.
+    account_id = _require_or_relax_account_id_header(
+        request, required=require_account_id
+    )
 
     logger.info(
         f"JWT auth context: interaction_id={interaction_id}, "
         f"tenant_id={claims.tenant_id[:8]}..., user_id={claims.user_id[:20]}..., "
-        f"account_id={account_id}, trace_id={trace_id}"
+        f"account_id={account_id or '<polling-no-account>'}, trace_id={trace_id}"
     )
 
     return RequestContext(
@@ -280,6 +369,41 @@ def _extract_context_from_jwt(
         pg_user_id=claims.pg_user_id,
         user_name=claims.user_name,
     )
+
+
+def _require_or_relax_account_id_header(request: Request, *, required: bool) -> str:
+    """Resolve X-Account-ID per the ingestion-vs-polling contract.
+
+    Centralizes the contract for the X-Account-ID header so the JWT path
+    (`_extract_context_from_jwt`) and the legacy-header path
+    (`get_validated_context`) stay in lockstep. Whitespace-only values are
+    treated as missing — a whitespace string is functionally the same as
+    absent for FK/account-anchor purposes and would otherwise propagate
+    invalid identifiers to the DB layer.
+
+    Args:
+        request: FastAPI Request object
+        required: True for ingestion routes (missing/whitespace raises 400);
+            False for polling routes (missing returns "" sentinel).
+
+    Returns:
+        The trimmed header value when present and non-whitespace; "" when
+        absent or whitespace-only AND required is False.
+
+    Raises:
+        HTTPException: 400 when required is True and the header is missing
+        or whitespace-only.
+    """
+    header_account_id = request.headers.get("X-Account-ID")
+    trimmed = header_account_id.strip() if header_account_id else ""
+    if not trimmed:
+        if required:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Account-ID header is required for this endpoint",
+            )
+        return ""
+    return trimmed
 
 
 def _validate_tenant_id(request: Request) -> str:
