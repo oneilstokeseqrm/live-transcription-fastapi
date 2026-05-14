@@ -74,6 +74,70 @@ Automated unit + integration tests + Codex review catch ~90% of issues. The last
 
 Manual workflow validation (e.g., Task 1.5.24 in that plan) is COMPLEMENTARY, not a replacement. The automated suite catches regressions fast; the manual workflow catches integration gaps the automated suite couldn't have anticipated.
 
+## TRUNCATE CASCADE blast radius hides cascading wipes (2026-05-14)
+
+A subagent ran `TRUNCATE TABLE ... RESTART IDENTITY CASCADE` against 11 explicit tables to enable a Phase 1.5 `NOT NULL` migration. The CASCADE silently followed FK references and also wiped ~6 additional tables that hold FKs into the listed ones: `opportunities`, `opportunity_pipeline`, `pipeline_forecast`, `forecast_snapshots`, `deal_events`, `emails`, and several `opportunity_*` analytic tables. The subagent's own success report mentioned only the 11 it explicitly listed; the cascade impact was invisible from the report.
+
+The user's pipeline page demo briefly appeared broken because the cascaded tables held the demo's deals/opportunities data — technically "test data" but functionally what made the product look alive.
+
+**Rule:** Before any TRUNCATE/CASCADE/DROP/DELETE-without-WHERE operation, even on test data:
+
+1. **Query FK topology first.** `SELECT conname, conrelid::regclass, confrelid::regclass FROM pg_constraint WHERE contype='f' AND confrelid IN (<target tables>);` enumerates the cascade chain.
+2. **Surface the full blast radius BEFORE the operation, not after.** "TRUNCATE here will also cascade-wipe X, Y, Z — proceed?" costs 30 seconds.
+3. **Prefer narrower alternatives.** `DELETE FROM table WHERE col IS NULL` (only nulls, one table). `UPDATE ... WHERE col IS NULL SET col = <sentinel>` (preserves rows). `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID; VALIDATE CONSTRAINT` (no data wipe). Per-tenant `DELETE` with `WHERE tenant_id = ...` (bounded).
+4. **"Authorized for test data" ≠ "authorized to destroy with surprise side effects."** Scope is bound to what was envisioned.
+5. **TRUNCATE ignores tenant_id.** All tenant-isolation discipline goes out the window.
+
+See also: `~/.claude/projects/.../memory/feedback_destructive_ops_blast_radius.md`.
+
+## SQLAlchemy 2.0 AsyncSession.execute() autobegins a transaction (2026-05-14)
+
+Discovered during Codex Round 1 of Phase 1.5 main-scope worker:
+
+```python
+async with session_factory() as session:
+    rows = (await session.execute(SELECT_SQL, ...)).all()  # AUTOBEGINS a txn
+    async with session.begin():                            # FAILS: already in txn
+        ...
+```
+
+SQLAlchemy 2.0's `AsyncSession.execute()` autobegins a transaction on first read. The next explicit `async with session.begin():` raises `InvalidRequestError: A transaction is already begun on this Session`. Pre-2.0 sessions were implicit-begin-on-flush; the 2.0 change is easy to miss.
+
+**Rule:** For workers that do `SELECT batch + per-entry transaction`, use a **fresh session per entry**:
+
+```python
+async with session_factory() as poll_session:
+    async with poll_session.begin():
+        rows = (await poll_session.execute(SELECT_SQL, ...)).all()
+# poll_session closed here; transaction committed
+
+for row in rows:
+    async with session_factory() as session:
+        async with session.begin():
+            await process_one(session=session, row=row)
+```
+
+This pattern was forced by P1 Codex feedback on `workers/account_provisioning_worker.py` at line 138-143.
+
+## Codex's static analysis can't see live schema state (2026-05-14)
+
+Discovered during Codex Rounds 2 and 6 of Phase 1.5 main-scope worker:
+
+Codex reported "ON CONFLICT (tenant_id, email) requires unique constraint; this repo's schema does not add one" — as a P1 in TWO separate rounds. Verification via Neon MCP showed `contacts_tenant_id_email_key` IS a UNIQUE INDEX on `(tenant_id, email)`. PostgreSQL's ON CONFLICT inference works with unique indexes (per docs), not only unique constraints. The index is declared in eq-frontend's Prisma schema via `@@unique([tenant_id, email])` and rendered as a unique index by Prisma. Codex looks at this repo's `migrations/` directory only and misses the Prisma-managed constraint.
+
+**Rule:** Before accepting any schema-related Codex P1, verify against the live schema via Neon MCP. Run both `pg_indexes` AND `pg_constraint` queries — `ON CONFLICT` inference matches against either.
+
+```sql
+-- Check constraints
+SELECT conname, contype, pg_get_constraintdef(oid)
+FROM pg_constraint WHERE conrelid = 'tablename'::regclass;
+
+-- Check unique indexes (also valid for ON CONFLICT inference)
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'tablename';
+```
+
+If Codex repeats the same false positive across rounds, document it in the PR description as a verified false positive and do NOT act on it. This is one of the "stop the spiral" signals.
+
 ## When to stop the Codex review spiral (2026-05-14)
 
 Codex finds the next-deepest issue every round. After ~3 rounds of code-correctness P2 fixes, remaining findings tend to drift into operational/documentation concerns rather than algorithmic defects. The user's "GATE: PASS with 0 P1 AND 0 P2" bar isn't always literally achievable in finite Codex rounds — it's a quality SIGNAL, not an immutable rule.
