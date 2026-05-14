@@ -56,6 +56,13 @@ SELECT_STATUS_SQL = text("""
 """)
 
 
+BUMP_UPDATED_AT_SQL = text("""
+    UPDATE pending_account_mappings
+    SET updated_at = NOW()
+    WHERE id = :queue_id
+""")
+
+
 SELECT_INFO_SQL = text("""
     SELECT tenant_id::text AS tenant_id, domain
     FROM pending_account_mappings
@@ -160,6 +167,23 @@ async def run_worker_loop(
                     logger.exception(
                         "Worker failed processing queue_id=%s", row.id,
                     )
+                    # Bump updated_at in a separate transaction so this failed
+                    # row rotates to the back of the queue. Without this, the
+                    # row keeps its old updated_at (the failed txn rolled back
+                    # SET_CREATING's NOW()) and re-selects first every poll,
+                    # starving newer approved entries.
+                    try:
+                        async with session_factory() as bump_session:
+                            async with bump_session.begin():
+                                await bump_session.execute(
+                                    BUMP_UPDATED_AT_SQL, {"queue_id": row.id},
+                                )
+                    except Exception:
+                        logger.exception(
+                            "Failed to bump updated_at for queue_id=%s after "
+                            "processing failure; row may starve newer entries "
+                            "until next manual intervention", row.id,
+                        )
         except Exception:
             logger.exception("Worker loop error")
         await asyncio.sleep(interval_seconds)
