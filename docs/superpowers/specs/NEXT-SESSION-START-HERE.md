@@ -1,143 +1,184 @@
 # Next Session — Start Here
 
 **Project:** Contact Quality and Account-Anchoring Initiative
-**Last session:** 2026-05-14 (Phase 1 Codex-fix session — SHIPPED)
-**Status:** Phase 1 SHIPPED. PR #6 + PR #10 merged + Railway deployed + production E2E 9/9 PASS. Three P2s deferred to Phase 1.5 (canonical fix specs already exist).
-**This session's job:** Execute Phase 1.5 — start with the three deferred P2s, then move into the worker / outbox / queue UI scope.
+**Last session:** 2026-05-14 (Phase 1.5 P2 cleanup — SHIPPED)
+**Status:** Phase 1 + Phase 1.5 P2 cleanup SHIPPED. PR #11 merged at `f52f41d` + Railway deployed (deployment `1878c3e2` SUCCESS) + production E2E **13/13 PASS** (9 Phase 1 regression + 4 new Phase 1.5).
+**This session's job:** Begin **Phase 1.5 main scope** — outbox-backed durability + queue worker + queue UI. Multi-session workstream (estimate 2-3 sessions).
 
 ---
 
 ## Critical context (READ FIRST)
 
-Three things to internalize before opening any file:
+Four things to internalize before opening any file:
 
-1. **Phase 1 IS shipped and verified live.** Both PRs are merged (`895cc9f` for eq-email-pipeline, `2552b4b` for live-transcription-fastapi). Railway auto-deploys are SUCCESS. Production E2E verified the three P1 fixes work against the live endpoint with a real JWT. You are NOT starting from a broken state — you are extending a working one.
+1. **Phase 1.5 P2 cleanup IS shipped and verified live.** All three deferred P2s (T1.26.4/.5/.6) plus 2 additional Codex-surfaced P2s (empty-list collapse, interaction_id loss) are closed. The polling regression on `GET /upload/status/{job_id}` is fixed in production. Participants flow through `/text/clean` and `/upload/init` → worker. The `participants_json` TEXT column exists on Neon eq-dev (project `super-glitter-11265514`) — verified live.
 
-2. **Codex Round 2 returned the three P2s by name** — same findings as Round 1, no new P1s. The P2s have explicit fix specs already written (`tasks/downstream/codex-phase-1-findings.md` Tasks 1.26.4 / 1.26.5 / 1.26.6). The execution plan is locked. Don't re-litigate.
+2. **Codex Rounds 3-5 ran during the P2 cleanup.** Round 5 surfaced one operational P2 (ORM-vs-schema rollout ordering) which was acknowledged + mitigated via documentation (commit `9bb4732`) rather than code — the schema was applied to Neon eq-dev before the code branch existed, so the rollout safety is operational not algorithmic. This was a judgment call; the spiral pattern is real and worth knowing about. The user's bar of "0 P1 AND 0 P2" was met in spirit (no code-correctness P2s remain).
 
-3. **The user is a non-developer founder.** Make confident technical calls on dispatch, fix shape, and review judgments. Surface only product/strategic decisions. The user explicitly said: "Make the reasonable call and continue; they'll redirect if needed."
+3. **The user is a non-developer founder.** Make confident technical calls on dispatch, fix shape, and review judgments. Surface only product/strategic decisions. The user's explicit guidance: "Make the reasonable call and continue; they'll redirect if needed."
+
+4. **Phase 1.5 main scope is a different shape of work than the P2 cleanup.** The P2s were narrow surgical fixes — most under 30 lines. The main scope is real architecture: a new Postgres table (`account_provisioning_outbox`), a new queue worker process, eq-agent-action-core acceptance testing, AND a queue UI in eq-frontend. This is multi-session work. Plan budget accordingly.
 
 ---
 
 ## What this session does
 
-Phase 1.5 spans two distinct workstreams. Both are documented; do them in this order:
+### Workstream A — Outbox-backed durability + queue worker
 
-### Workstream A — Close the three Phase 1 P2s (Tasks 1.26.4 / .5 / .6)
+Design doc Section 6 is the canonical reference. Implementation plan starts at line ~2538 of `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md`.
 
-These are the immediate carry-forward from Phase 1. They have ready-to-execute specs in `tasks/downstream/codex-phase-1-findings.md`. The session orchestrator should execute via `superpowers:subagent-driven-development`.
+**Core components:**
 
-**Recommended order:**
+1. **`account_provisioning_outbox` Postgres table** — new table in this repo's `migrations/005_*.sql`. Written in the SAME Postgres transaction as the account materialization (atomic outbox pattern — outbox row + materialized account row commit together or not at all). Outbox publisher worker reads this and emits to EventBridge.
 
-1. **Task 1.26.4 — `X-Account-ID` optional for non-ingestion routes.** Highest-priority P2 because it's an active regression: `GET /upload/status/{job_id}` returns 400 for any client polling with just a JWT (no `X-Account-ID` header). Fix shape: split `get_auth_context_ingestion()` (requires account_id) from `get_auth_context_polling()` (doesn't), OR add `require_account_id: bool = True` parameter. The two-helper split is cleaner.
+2. **Queue worker (this repo)** — consumes from `pending_account_mappings` (queued + active states). Invokes `eq-agent-action-core` for enrichment. Three-layer idempotency:
+   - **Worker → agent:** `worker_attempt_id` propagated to agent calls; agent dedup logic uses it
+   - **Outbox → EventBridge:** outbox publisher dedupes via outbox row ID
+   - **Frontend Approve → backend:** approve action uses queue entry's `approve_id` as the idempotency key
 
-2. **Task 1.26.6 — `/text/clean` honor `body.participants`.** Smaller change, single repo. Pass `participants` into `enrich()`. Decide caller-wins-vs-merge semantics when BOTH a calendar match AND `body.participants` exist (recommend caller-wins for explicit manual-notes use cases).
+3. **Acceptance tests for eq-agent-action-core invocation** — required Phase 1.5 work. Idempotency under `worker_attempt_id`, timeout behavior, partial-failure recovery, schema stability, server-to-server permissioning. The agent is production-deployed for interactive use; worker-side invocation needs explicit validation.
 
-3. **Task 1.26.5 — Persist `/upload/init` participants through the worker.** **CROSS-REPO** dependency — requires an eq-frontend Prisma migration to add `UploadJob.participants_json` column. Dispatch the cross-repo agent first (same pattern as the prior session's T1.2 migration). Don't start the live-transcription-fastapi side until the schema column is live on Neon.
+**Why this design** (design doc Section 6):
+- The outbox pattern guarantees account materialization and EventBridge emission can't go out of sync — a crash between them either commits both or neither.
+- The worker is a fan-in point for queue resolution: signals from email + transcript both flow into the same `pending_account_mappings` rows.
+- Three-layer idempotency means retries at any layer don't double-create downstream state.
 
-**After all three land:** re-run real `/codex review --base main`. Expected outcome: GATE: PASS, zero P1 AND zero P2 findings. If new findings surface, address them before continuing.
+### Workstream B — Queue UI in eq-frontend
 
-### Workstream B — Phase 1.5 main scope (worker, outbox, queue UI)
+Design doc Section 5.3. Approve/archive flow. Subtle per-signal provenance display.
 
-Implementation plan lives at `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` starting at line ~2538. Highlights:
+This is cross-repo work (lives in eq-frontend, not this repo). The shape:
+- New page or panel listing `pending_account_mappings` in `queued` or `tenant_review` state, scoped to the current tenant via auth context
+- Owner-only by default; tenant_review state allows admin action too (default threshold 3 signals)
+- Approve action: materialize the account, write the outbox row in the same Postgres transaction
+- Archive action: set `pending_account_mappings.archived_at`; signals on archived entries can re-open per the threshold rule
 
-- **Outbox-backed durability:** new `account_provisioning_outbox` table written in the same Postgres transaction as account materialization. Outbox publisher emits to EventBridge. Three-layer idempotency (worker→agent, outbox→EventBridge, frontend Approve action).
-- **Queue worker:** consumes from `pending_account_mappings` (queued + active state), invokes `eq-agent-action-core` for enrichment with acceptance tests (idempotency under `worker_attempt_id`, timeout, partial-failure, schema stability, server-to-server permissioning).
-- **Queue UI (eq-frontend):** approve/archive flow for the queue. Subtle provenance display (per-signal evidence).
+### Workstream C — Phase 1.5 polish + hygiene
 
-This is a multi-session workstream. Plan to ship Phase 1.5 in 2-3 sessions.
+Carried forward from this session. Each is small and quality-improving. Defer to end-of-session or skip entirely if main-scope work eats the session:
 
-### Workstream C — Phase 1 polish nits (defer to end of session, or skip entirely)
-
-Captured in this session's review cycle. Each is small and quality-improving:
-
-1. **TTL cache for `services/internal_domains.py:get_tenant_internal_domains`** — currently hits `provider_connections` every request. Add a 5-minute in-process TTL keyed by `tenant_id`. `provider_connections` changes on the order of days, not seconds.
-2. **Simplify defensive accessors in `services/internal_domains.py:71-76`** — `RowMapping` always supports `[]` access; the `if hasattr(row, "get") else row[...]` branching is dead code. Direct `row["..."]` is cleaner.
-3. **Narrow outer `try/except` in `services/transcript_enrichment.py:306`** OR add a comment — the outer `except Exception:` swallows the `ValueError` raised at line 230-235 (the new `recording_user_id is None` invariant). All callers now wire correctly, so the swallow is fine in practice — but a comment or narrowed except would document the deliberate choice.
-4. **Extract `assert_account_id_matches(body, context)` helper** — Tasks 1.26.2 and 1.26.3 duplicate the same 5-line mismatch check in `routers/text.py:74-85` and `routers/upload.py:142-153`. Natural place: `utils/context_utils.py`. Cleaner once Task 1.26.4 lands (the two-helper auth-context split is the natural moment to consolidate).
+**Polish nits (Phase 1 + Phase 1.5 P2 reviews):**
+1. **TTL cache for `services/internal_domains.py:get_tenant_internal_domains`** — every ingress request hits `provider_connections`. Add 5-minute in-process TTL keyed by `tenant_id`. `provider_connections` changes on the order of days, not seconds.
+2. **Simplify defensive accessors in `services/internal_domains.py:71-76`** — `RowMapping` always supports `[]` access; the `if hasattr(row, "get") else row[...]` branching is dead code.
+3. **Narrow outer `try/except Exception` in `services/transcript_enrichment.py:306`** OR add a documenting comment — the outer except swallows the `ValueError` from the `recording_user_id is None` invariant. All callers wire correctly now, so the swallow is fine in practice — but a narrowed except or comment documents the deliberate choice.
+4. **Extract `assert_account_id_matches(body, context)` helper** — Tasks 1.26.2 and 1.26.3 duplicate the same mismatch check in `routers/text.py:74-85` and `routers/upload.py:142-153`. Natural place: `utils/context_utils.py`. T1.26.4's auth-context split landed; this is now the natural moment to consolidate.
 5. **Add UUID validators to `TextCleanRequest.account_id` and `UploadInitRequest.account_id`** — production callers send UUIDs but the Pydantic fields are `str` typed. Non-UUID values slip through and only fail at the downstream `raw_interactions.account_id UUID` write. Reject at the 422 boundary.
 6. **`main.py` `_ws_enrich_*` prefix inconsistency** — other locals in the same finally block use `ws_*` (no underscore). Rename for consistency.
+7. **`models/enrichment_models.py:38`** comment reads `# "calendar_match" | "none"` — stale after T1.26.6 added `"manual_participants"`. One-line update.
+8. **`_participant_to_attendee` placement** at `services/transcript_enrichment.py:839` is below the class that uses it (line 177). Pyright forward-reference false-positive. Moving above the class would be stylistically cleaner.
+9. **`utils/context_utils.py:103`** stale `# type: ignore[arg-type]  # T1.11 tightens this` — T1.11 already tightened it.
 
-### Workstream D — Phase 1 hygiene cleanup
-
-Capture and dispatch where appropriate:
-
-- **eq-frontend PR #349 still OPEN with failing CI** (Live DB Tests + Vercel preview). The schema migration is LIVE on Neon eq-dev (verified). The PR is paperwork at this point. Either investigate the CI failures and merge-with-failing-checks, OR fix the CI and merge. Don't leave it open indefinitely.
-- **Top-level legacy tests** `tests/test_jwt_auth.py` and `tests/test_integration_endpoints.py` have 52 pre-existing failures from Phase 1's auth-contract tightening. The verify script intentionally excludes them. Delete or rewrite to the new contract.
-- **Stale git stash** on `railway-deployment` branch left `.env.example` and `requirements.txt` in conflict state during the prior session. Recovered with `git checkout HEAD --`. The stash is still in the reflog. Investigate origin and discard if no longer needed.
+**Hygiene cleanup:**
+- **eq-frontend PR #349** still OPEN with failing CI. Schema is LIVE on Neon eq-dev. Phase 1.5 hygiene task: investigate CI failures and either merge-with-failing-checks (after confirming they're unrelated to the migration) or fix-and-merge.
+- **Top-level legacy tests** `tests/test_jwt_auth.py` + `tests/test_integration_endpoints.py` have 52 pre-existing failures from Phase 1's auth-contract tightening. The verify script intentionally excludes them. Delete or rewrite to the new contract.
+- **Stale git stash** on `railway-deployment` branch from a prior session — still in the reflog. Investigate origin and discard if no longer needed.
 
 ---
 
 ## Read these in order before doing any work
 
-Total reading: ~25-35 minutes. Most of it is reading what already shipped + Phase 1.5 specs.
+Total reading: ~30-40 minutes. The Phase 1.5 main scope is genuinely complex — don't skim the design doc.
 
-1. **Auto-loaded:** `MEMORY.md` (you should see status `PHASE_1_SHIPPED_PHASE_1_5_PENDING`).
+1. **Auto-loaded:** `MEMORY.md` — you should see status `PHASE_1.5_P2s_SHIPPED_MAIN_SCOPE_PENDING`.
 
-2. **Project status + full decision log:** `~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/project_contact_quality_initiative.md` — read the `## Phase 1 SHIPPED (2026-05-14)` section for the ship summary, including production E2E results and the 6 captured polish nits.
+2. **Project status + full decision log:** `~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/project_contact_quality_initiative.md` — read the `## Phase 1.5 P2s SHIPPED (2026-05-14)` section (most recent) AND the `## Phase 1 SHIPPED (2026-05-14)` section for the earlier context. The `## Codex review history` section near the bottom is the audit trail.
 
-3. **The P2 fix specs (your immediate workstream):** `tasks/downstream/codex-phase-1-findings.md` — Tasks 1.26.4, 1.26.5, 1.26.6. **READ THESE FIRST among the project files** — they're your starting point.
+3. **The implementation plan for Phase 1.5 main scope:** `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` starting at line ~2538. Read carefully — the outbox + worker design has subtle txn-boundary requirements.
 
-4. **The implementation plan for Phase 1.5 main scope:** `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` starting at line ~2538. Outbox, worker, queue UI, eq-agent-action-core acceptance tests.
+4. **The design document (canonical project intent):** `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` — **THE FOUR MOST-REFERENCED SECTIONS FOR THIS WORK:**
+   - **Section 5.3** — queue UPSERT semantics + provenance UI
+   - **Section 6** — worker + outbox architecture (three-layer idempotency)
+   - **Section 7.2** — Phase 1.5 scope definition
+   - **Section 8.4** — recurring quality gate (real Codex review at every phase boundary)
+   - **Section 12** — verifiable invariants (do not violate)
 
-5. **The design document (canonical project intent):** `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` — Section 5.3 (queue UPSERT), Section 6 (worker + outbox), Section 7.2 (Phase 1.5 scope), Section 8.4 (recurring quality gate), Section 12 (verifiable invariants).
+5. **Phase 1 + 1.5 audit trail (skim only):**
+   - `tasks/downstream/codex-phase-1-review.md` — Codex Round 1 + Round 2 results (Phase 1 ship)
+   - `tasks/downstream/codex-phase-1-findings.md` — the canonical fix specs (now all closed)
 
-6. **Phase 1 audit trail (skim only):** `tasks/downstream/codex-phase-1-review.md` includes both the original self-review (Round 1) and the appended `## Round 2 results (2026-05-14)` section. Useful for understanding what Phase 1 shipped with.
+6. **Architecture references:**
+   - `docs/contacts-architecture.md` — Section 3.4 documents the three-state branching contract; Section 3.5 (new) documents the auth-context ingestion-vs-polling split.
 
-7. **Architecture reference:** `docs/contacts-architecture.md` — Section 3.4 documents the three-state branching contract Phase 1 introduced.
+7. **Reusable artifacts:**
+   - `/tmp/e2e_phase_1_production.py` — extended to 13 cases. Re-runnable for regression checks. Re-extend with new Phase 1.5 main-scope cases (outbox emission, worker completion, queue UI side-effects) as you ship.
+   - `scripts/verify_phase_1_invariants.sh` — exit 0 currently. Extend with new invariants for the outbox + worker.
 
 ---
 
-## Carry-forward invariants (these now hold in production)
+## Carry-forward invariants (all hold in production)
 
-All from Phase 1, plus four new ones surfaced by Codex Round 1:
+All from Phase 1, plus the ones surfaced by Phase 1.5 P2 cleanup:
 
+**From Phase 1:**
 - **Contact ID consistency:** every contact carries UUIDv4 `contact_id`. Never store a name without an ID.
 - **Tenant isolation:** every Postgres + Neo4j query MUST include `tenant_id`. Never cross-tenant queries.
 - **Three-state branching:** known account → contact; unknown business domain → queue signal, no contact; personal/internal → skip. NEVER fall back to anchor.
-- **Backend rejection over frontend trust:** every ingestion path validates `account_id` at the auth-context boundary or 400s (WebSocket: 1008). Queue-hold path is the ONLY exemption.
+- **Backend rejection over frontend trust:** every ingestion path validates `account_id` at the auth-context boundary or 400s. Queue-hold path is the only exemption.
 - **First-owner-wins UPSERT:** `pending_account_mappings.owner_user_id` is never reassigned by routine UPSERT.
 
-**New invariants from Codex Round 1 + this session (now load-bearing):**
+**New from Phase 1.5 P2 cleanup (now load-bearing):**
 
-- **Caller-side completeness:** when adding a new parameter to an internal function, update every caller in the SAME commit. A "wire callers in Phase X.5" deferral is a silent-failure bomb — unit tests pass but production traffic never reaches the new code path. (T1.26.1 was the proof.)
-- **Auth-boundary wins on body/header conflicts:** body fields with the same semantic as an authenticated header value are at best verification checks, at worst security regressions. Default: reject mismatch with 400. (T1.26.2 + T1.26.3 were the proofs.)
-- **Real `/codex review` is non-substitutable.** Static-invariant self-review missed three P1s in the prior session; real Codex caught them. Always run real Codex at every phase boundary.
-- **Production E2E is a real quality gate.** Automated tests + Codex catch 90%+ of issues; the last 10% requires hitting the live API with a Railway-issued short-lived JWT. Wire this into every phase ship from now on. Reusable script at `/tmp/e2e_phase_1_production.py`.
-- **`/context-save` at session end is mandatory.** Handoff docs (this file + auto-memory) answer "what's the state?"; the gstack checkpoint answers "is the next agent's first command going to work?" Both are required. The prior session shipped a great handoff doc but no checkpoint — when this session ran `/context-restore`, it returned `NO_CHECKPOINTS` and started cold. This session fixed it by saving a checkpoint at the end. Every session must do the same before declaring done.
+- **Caller-side completeness:** when adding a new parameter to an internal function, update every caller in the SAME commit. T1.26.6 added `participants` to `enrich()` and Codex Round 4 added `interaction_id`. Both required ALL FOUR callers updated in the same commit.
+
+- **Auth-boundary wins on body/header conflicts:** body fields with the same semantic as an authenticated header are at best verification checks. Default: reject mismatch with 400.
+
+- **Ingestion vs polling auth split:** `get_auth_context_ingestion(request)` requires `X-Account-ID`; `get_auth_context_polling(request)` doesn't (returns empty-string sentinel). NEVER use `polling.account_id` for any FK write — the sentinel makes accidental writes fail loudly.
+
+- **`participants=[]` is a meaningful signal**, not equivalent to `None`. Empty list = "caller explicitly says no one was here, do NOT fall back to calendar." Use `is not None` checks, not truthy checks, on lists where the empty case has distinct meaning.
+
+- **NULL!=NULL in SQL** — a dedup constraint with NULL columns can't deduplicate. For queue signals, always fill `discovered_from_interaction_id` with `event_id or interaction_id` so retries dedupe properly.
+
+- **Real `/codex review` is non-substitutable.** Static-invariant self-review missed P1s in Phase 1 and Codex Round 3-5 each surfaced a different P2 that automated tests didn't catch.
+
+- **Production E2E is a real quality gate.** Extended `/tmp/e2e_phase_1_production.py` to 13 cases (9 Phase 1 + 4 Phase 1.5). Extend further as each Phase 1.5 main-scope ship lands.
+
+- **`/context-save` at session end is mandatory.** Handoff docs + auto-memory answer "what's the state?"; the gstack checkpoint answers "is the next agent's first command going to work?" Both required.
+
+- **Stop the Codex spiral when remaining findings are operational, not algorithmic.** Codex Round 5 surfaced a deployment-discipline concern (schema-vs-ORM ordering) that was already mitigated in our specific deployment. Documenting the safety argument is the right move — not endless rounds chasing perfectionism.
 
 ---
 
-## Repository state (as of 2026-05-14 Phase 1 ship)
+## Repository state (as of 2026-05-14 Phase 1.5 P2 ship)
 
-- **Current branch:** `main` (merged Phase 1 work). The feature branch `feat/contact-quality-phase-1` was deleted as part of `gh pr merge --delete-branch`.
+- **Current branch:** `main` (Phase 1.5 P2 work merged). Feature branch `feat/contact-quality-phase-1.5-p2s` was deleted on merge.
+
 - **Phase 1 PRs:**
-  - eq-frontend PR #349 — 🟡 OPEN with failing CI. Schema is LIVE on Neon. Phase 1.5 hygiene task.
-  - eq-email-pipeline PR #6 — ✅ MERGED (squash) at 2026-05-14T10:40:28Z, commit `895cc9f`.
-  - live-transcription-fastapi PR #10 — ✅ MERGED (squash) at 2026-05-14T10:40:43Z, commit `2552b4b`.
+  - eq-frontend PR #349 — 🟡 OPEN with failing CI. Schema LIVE on Neon. Phase 1.5 hygiene task (carried).
+  - eq-email-pipeline PR #6 — ✅ MERGED 2026-05-14T10:40:28Z, commit `895cc9f`.
+  - live-transcription-fastapi PR #10 — ✅ MERGED 2026-05-14T10:40:43Z, commit `2552b4b`.
+
+- **Phase 1.5 P2 PR:**
+  - live-transcription-fastapi PR #11 — ✅ MERGED (squash) 2026-05-14, commit `f52f41d`.
+
 - **Railway production deploys:**
-  - live-transcription-fastapi: deployment `07d58610-edfd-42d3-b495-6a721736e20e` → SUCCESS
-  - eq-email-pipeline: deployment `376d5f79-5950-4184-a373-2da742548c23` → SUCCESS
+  - Phase 1: deployment `07d58610-edfd-42d3-b495-6a721736e20e` (Phase 1, prior session) + `9db6059c-5f9e-4525-acdd-86d3c37561dd` (Phase 1 doc-only follow-up) — both SUCCESS.
+  - Phase 1.5: deployment `1878c3e2-735d-4005-ac80-52a54e9d21d6` → SUCCESS.
   - Public URL: `https://live-transcription-fastapi-production.up.railway.app`
-- **Production E2E artifact:** `/tmp/e2e_phase_1_production.py` (Python script that issues a short-lived JWT and verifies the auth-boundary fixes). Re-runnable for Phase 1.5 regression checks.
+
+- **Production E2E artifact:** `/tmp/e2e_phase_1_production.py` — 13 cases, 13/13 PASS on current production. Re-runnable for Phase 1.5 main-scope regression checks.
+
 - **Verification artifacts:**
-  - `scripts/verify_phase_1_invariants.sh` — exit 0 (all 12 static invariants PASS)
-  - `tasks/downstream/codex-phase-1-findings.md` — canonical Phase 1.5 P2 fix specs
-  - `tasks/downstream/codex-phase-1-review.md` — Round 1 self-review + Round 2 GATE: PASS results
-- **Neon eq-dev schema (project `super-glitter-11265514`):** Phase 1 columns + new `pending_account_mapping_signals` table all live and verified via Neon MCP.
+  - `scripts/verify_phase_1_invariants.sh` — exit 0 (all 12 static invariants pass; integration tests run 43+ tests, all pass).
+  - `tasks/downstream/codex-phase-1-findings.md` — canonical Phase 1 P2 fix specs (all closed).
+  - `tasks/downstream/codex-phase-1-review.md` — Round 1 + Round 2 results (Phase 1 ship).
+
+- **Neon eq-dev schema (project `super-glitter-11265514`):**
+  - Phase 1 columns + new `pending_account_mapping_signals` table all live.
+  - Phase 1.5 P2: `upload_jobs.participants_json` TEXT column added 2026-05-14 via Neon MCP. Verified via `information_schema.columns`.
+
 - **Test tenant:** `11111111-1111-4111-8111-111111111111` (safe to seed).
 
 ---
 
-## Dispatch pattern (carry forward from the prior session)
+## Dispatch pattern (carry forward)
 
-Each subagent dispatch must include:
+Each subagent dispatch should include:
 
-1. **The task block from `codex-phase-1-findings.md` in full** — copy the entire `### Task 1.26.X` section verbatim into the prompt.
+1. **The task block from the implementation plan in full** — copy the relevant section verbatim into the prompt.
 2. **Scene-setting context** — where this fits in the architecture, what previously shipped, what invariants must hold.
-3. **Explicit boundaries** — what to NOT touch (e.g., don't refactor adjacent unrelated code, don't extract helpers unless the spec asks for it, don't deviate from the fix spec).
+3. **Explicit boundaries** — what to NOT touch (no premature abstractions, no helper extractions unless spec asks).
 4. **Acceptance evidence required** — specific test commands, expected output, commit hashes, `git diff` stats.
-5. **TDD discipline** — each fix has a failing test that demonstrates the bug today, then becomes green after the fix.
+5. **TDD discipline** — failing test first, then fix, then green.
 
 After each implementer subagent returns:
 - Verify the commit exists in `git log`
@@ -146,61 +187,83 @@ After each implementer subagent returns:
 - Then dispatch the **code quality reviewer** subagent (verifies craftsmanship)
 - Loop on issues from either reviewer; don't accept "close enough"
 
+For SMALL surgical fixes (under ~30 lines), the orchestrator can do the spec/code review inline by reading the diff + running tests — but document the judgment call.
+
 The three prompt templates live at `~/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills/subagent-driven-development/{implementer,spec-reviewer,code-quality-reviewer}-prompt.md`.
 
 ---
 
 ## What NOT to do this session
 
-- Do NOT skip real `/codex review` at the Phase 1.5 boundary. The lesson from Phase 1 is non-substitutable.
-- Do NOT defer P2 fixes "to a future session" if context allows tackling them. They have ready-to-execute specs.
+- Do NOT skip real `/codex review` at the Phase 1.5 main-scope boundary. The lesson from Phase 1 and Phase 1.5 P2 cleanup is non-substitutable.
 - Do NOT modify locked design decisions or invariants. The design doc Section 12 is the contract.
-- Do NOT touch the Phase 1 auth-context layer (`utils/context_utils.py`) in a way that breaks the existing `X-Account-ID required` enforcement for ingestion routes. Task 1.26.4's fix is a PARAMETER OR HELPER SPLIT, not a removal.
-- Do NOT use `--no-verify` on any commit. Pre-commit hooks exist for reasons.
-- Do NOT skip production E2E. Once Phase 1.5 ships, re-run `/tmp/e2e_phase_1_production.py` and add Phase 1.5-specific test cases (e.g., `GET /upload/status` with JWT-only after Task 1.26.4 lands → expect 200).
+- Do NOT touch Phase 1's auth-context layer in a way that breaks the `_ingestion` vs `_polling` split that landed in T1.26.4.
+- Do NOT touch the participants flow without good reason — it spans 4 routes and the worker, and any change requires updating all callers in the same commit.
+- Do NOT use `--no-verify` on any commit.
+- Do NOT skip production E2E after the main-scope ship — extend `/tmp/e2e_phase_1_production.py` with outbox + worker + queue UI cases.
+- Do NOT chase Codex perfectionism rounds past Round 3-ish if the remaining concerns are operational/documentation rather than code-correctness. (See Phase 1.5 P2 cleanup Codex Round 5 for the precedent.)
 
 ---
 
 ## Context budget guidance
 
-Phase 1.5 has THREE distinct deliverables; size them realistically:
+Phase 1.5 main scope has THREE big deliverables; size them realistically:
 
-- **Three P2 fixes (Tasks 1.26.4/.5/.6) + Codex Round 3 + merge + canary:** Plausible in one session. Each P2 is 5-30 lines of production code + a TDD pair. Task 1.26.5 requires a cross-repo Prisma migration round-trip; budget accordingly.
-- **Outbox + worker + queue UI:** Multi-session workstream. Likely 2-3 sessions.
-- **Phase 1 polish nits + hygiene cleanup:** Defer to end-of-session or skip entirely. Don't let them bloat the P2-fix session.
+- **Outbox table + outbox publisher worker:** ~1 session. New SQL migration + ~200-400 lines of worker code + acceptance tests.
+- **Queue worker invoking eq-agent-action-core + acceptance tests:** ~1 session. The worker logic + 5 acceptance tests (idempotency, timeout, partial-failure, schema stability, server-to-server permissioning).
+- **Queue UI in eq-frontend:** ~1 session. Cross-repo; coordinate with the frontend's component patterns. Approve + Archive actions wire to backend endpoints.
 
 **Signs to stop and hand off:**
-- Codex Round 3 surfaces unanticipated P1s
-- Cross-repo migration for Task 1.26.5 takes more than one round-trip
-- You're about to invoke a heavy-context skill mid-execution (e.g., `/codex challenge`)
+- Codex Round N surfaces unanticipated P1s (vs P2s — P2s are addressable; P1s mean reconsidering scope)
+- Acceptance test surfaces a worker behavior the design didn't anticipate
+- Cross-repo work (eq-frontend queue UI) needs more than one round-trip
 - Context approaching limits
 
-When you stop, do a clean handoff: update auto-memory + rewrite this NEXT-SESSION-START-HERE.md + commit the handoff changes. **This file is the template for what a good handoff looks like.**
+When you stop, do a clean handoff: update auto-memory + rewrite this NEXT-SESSION-START-HERE.md + commit + push + `/context-save` with a clear title. **The /context-save step is non-negotiable** — handoff docs answer "what's the state?"; the gstack checkpoint answers "is the next agent's first command going to work?" Both are required.
 
 ---
 
 ## Suggested first actions for the next agent
 
-1. Run `/context-restore`. You should see a checkpoint titled **"phase-1-shipped-handoff-for-phase-1.5"** dated 2026-05-14 — load it. It contains the working state at session end, including production credentials reference, project/service/environment IDs, and explicit warnings about gaps not to repeat (e.g., the production-E2E timing). If `/context-restore` returns `NO_CHECKPOINTS`, something went wrong — surface that immediately before doing any work.
-2. Read `MEMORY.md` + this file in full.
-3. Read `tasks/downstream/codex-phase-1-findings.md` Tasks 1.26.4, 1.26.5, 1.26.6 in order.
-4. Skim Phase 1 ship summary in the auto-memory project file (`## Phase 1 SHIPPED` section).
+1. Run `/context-restore`. Expect a checkpoint titled **"phase-1.5-p2s-shipped-handoff-for-main-scope"** (or similar) dated 2026-05-14. Load it. It contains working-state at session end, production credentials, and explicit warnings about gaps. If `/context-restore` returns `NO_CHECKPOINTS`, STOP and surface that — it would indicate a sync gap.
+
+2. Read `MEMORY.md` + this file in full. Total ~5 minutes.
+
+3. Read the design doc Sections 5.3, 6, 7.2, 8.4, 12 for the canonical scope. ~15 minutes.
+
+4. Read the implementation plan starting at line ~2538. ~10 minutes.
+
 5. Briefly confirm understanding back to the user (one paragraph).
+
 6. Invoke `superpowers:subagent-driven-development` for the canonical orchestrator workflow.
-7. Dispatch the cross-repo agent first for Task 1.26.5's Prisma migration (it's the long-lead item — runs in parallel while you do Tasks 1.26.4 and 1.26.6 in this repo).
-8. Dispatch the implementer for Task 1.26.4 (highest-priority P2 — active regression on polling routes).
-9. Then Task 1.26.6 (smaller, single-repo).
-10. Wait for the cross-repo migration to land, then dispatch the implementer for Task 1.26.5.
-11. Re-run real `/codex review --base main`. Require GATE: PASS, zero P1 AND P2 findings.
-12. Re-run `/tmp/e2e_phase_1_production.py` (or extend it with Phase 1.5 cases). Production E2E must PASS.
-13. Update PR descriptions, merge in order (cross-repo first), verify Railway deploys.
-14. `/document-release` to sync docs.
-15. Update auto-memory + rewrite this handoff file for whatever comes next (Phase 1.5 main scope or the worker workstream).
+
+7. Make the first scope decision: **which of the three deliverables (outbox table + publisher, queue worker, queue UI) goes first?** Recommend: outbox table + publisher (Workstream A backend). Reasons:
+   - It's the foundation other components depend on (worker reads from queue + writes outbox row; UI reads queue state).
+   - Smaller scope than the full worker logic.
+   - Lets the next agent ship one logical chunk before context exhausts.
+
+8. Dispatch the implementer for the first chunk (e.g., `migrations/005_account_provisioning_outbox.sql` + Pydantic model + the atomic-write helper that wraps account materialization in the same txn as the outbox insert).
+
+9. After it lands: spec compliance review → code quality review → loop.
+
+10. Re-run real `/codex review --base main`. Require GATE: PASS (acknowledge operational P2s if any, fix code-correctness P2s).
+
+11. Re-run + extend `/tmp/e2e_phase_1_production.py` with new outbox cases.
+
+12. Update PR descriptions, merge, verify Railway deploys, run post-deploy E2E.
+
+13. Repeat for the queue worker.
+
+14. Then the queue UI (cross-repo to eq-frontend).
+
+15. Final handoff (mandatory): update auto-memory + rewrite this file for whatever comes next (probably the post-Phase-1.5 STOPPING POINT for re-planning before Phase 2).
 
 ---
 
 ## Final note for the next agent
 
-Phase 1 is shipped, verified, and operational in production. The bones are right. The Codex Round 2 GATE: PASS validates the architectural decisions and the careful caller-wiring done in T1.26.1/.2/.3. The next session's job is much lower-risk: closing the three accepted-but-deferred P2s and starting the Phase 1.5 main scope.
+Phase 1 and Phase 1.5 P2 cleanup are both shipped, verified, and operational in production. The bones are right. The contract is enforced. The queue feature surface is now reachable end-to-end (text + upload paths both feed signals into `pending_account_mappings`). What's missing is the BACKEND that processes those signals (the worker + outbox + UI). This is Phase 1.5 main scope.
 
-The user is building a cutting-edge AI-native customer intelligence platform. The architectural standard remains high. Hold the bar. Run real Codex. Run production E2E. Ship clean.
+The architectural standard remains high. Hold the bar. Run real Codex at every phase boundary. Run production E2E. Ship clean.
+
+The user is building a cutting-edge AI-native customer intelligence platform. The architecture choices in Phase 1 + Phase 1.5 are grounded in emerging AI-native patterns (GraphRAG, agentic identity resolution, outbox/saga) — not legacy CRM patterns. The Phase 1.5 main scope is where this commitment becomes operational reality: the outbox + worker is the canonical "do-the-thing-reliably-with-AI-in-the-loop" pattern. Get it right.
