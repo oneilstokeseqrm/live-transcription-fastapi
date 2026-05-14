@@ -40,5 +40,5 @@ async def test_enrich_sends_worker_attempt_id_header():
 
     with patch.object(client._client, "post", side_effect=fake_post):
         await client.enrich(tenant_id="t1", domain="acme.com", worker_attempt_id="abc")
-    assert captured["headers"].get("X-Idempotency-Key") == "abc" \
-        or captured["json"].get("worker_attempt_id") == "abc"
+    assert captured["headers"].get("X-Idempotency-Key") == "abc"
+    assert captured["json"].get("worker_attempt_id") == "abc"

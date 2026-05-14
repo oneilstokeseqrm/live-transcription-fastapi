@@ -36,7 +36,6 @@ class AgentActionCoreClient:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "X-Idempotency-Key": worker_attempt_id,
-                "Content-Type": "application/json",
             },
             json={
                 "tenant_id": tenant_id,
