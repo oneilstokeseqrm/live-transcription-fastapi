@@ -42,8 +42,15 @@ INSERT_LINK_SQL = text("""
     SELECT gen_random_uuid(), s.summary_id, :contact_id
     FROM interaction_summaries s
     WHERE s.interaction_id = :raw_interaction_id
+    ORDER BY s.created_at DESC
+    LIMIT 1
     ON CONFLICT DO NOTHING
 """)
+# Best-effort link: a raw_interaction_id may have 0 or N summaries (summaries
+# are produced async). We pick the most-recent summary deterministically.
+# When no summary exists yet, no link is inserted; the outbox payload's
+# interaction_ids list remains the durable source of truth for downstream
+# Neo4j consumers, which MERGE the edges from the AccountCreated event.
 
 
 UPDATE_QUEUE_SQL = text("""

@@ -45,7 +45,7 @@ SET_CREATING_SQL = text("""
     SET status = 'creating',
         creation_started_at = COALESCE(creation_started_at, NOW()),
         updated_at = NOW()
-    WHERE id = :queue_id AND status = 'approved'
+    WHERE id = :queue_id AND status IN ('approved', 'creating')
 """)
 
 
@@ -120,36 +120,46 @@ async def run_worker_loop(
 ) -> None:
     """Main worker loop — polls for approved entries and processes them.
 
-    Per-entry transactional isolation: each queue entry runs in its OWN
-    session.begin() block. One entry's failure (agent timeout, DB constraint,
-    etc.) does NOT roll back successful entries' materialization. This is
-    architecturally required — the agent's account-creation commits to its
-    own DB on HTTP success, independently of our Postgres transaction; a
-    batched rollback would leave our outbox row in inconsistent state with
+    Fresh session per entry: each queue entry runs in its OWN session with
+    its OWN begin()/commit() block. One entry's failure (agent timeout, DB
+    constraint, etc.) does NOT roll back successful entries' materialization.
+    This is architecturally required — the agent's account-creation commits
+    to its own DB on HTTP success, independently of our Postgres transaction;
+    a batched rollback would leave our outbox row in inconsistent state with
     the agent's already-committed account.
 
-    The poll SELECT itself runs outside any transaction (it's a snapshot read).
+    Fresh session per entry (NOT just per-entry txn on a shared session):
+    SQLAlchemy 2.0's AsyncSession.execute() autobegins a transaction, so
+    a shared session that runs the poll SELECT cannot then enter another
+    explicit `session.begin()` block — it raises InvalidRequestError.
+    Each entry gets its own session lifecycle; the poll itself uses a
+    short-lived session that closes before the per-entry sessions start.
+
     Advisory locks are transaction-scoped, so each entry's lock auto-releases
     on its own txn commit/rollback.
     """
     while True:
         try:
-            async with session_factory() as session:
-                rows = (await session.execute(
-                    SELECT_APPROVED_SQL, {"limit": batch_size},
-                )).all()
-                for row in rows:
-                    try:
+            async with session_factory() as poll_session:
+                async with poll_session.begin():
+                    rows = (await poll_session.execute(
+                        SELECT_APPROVED_SQL, {"limit": batch_size},
+                    )).all()
+            # poll_session is closed; transaction committed.
+
+            for row in rows:
+                try:
+                    async with session_factory() as session:
                         async with session.begin():
                             await process_one_approved_entry(
                                 session=session,
                                 queue_id=row.id,
                                 agent_client=agent_client,
                             )
-                    except Exception:
-                        logger.exception(
-                            "Worker failed processing queue_id=%s", row.id,
-                        )
+                except Exception:
+                    logger.exception(
+                        "Worker failed processing queue_id=%s", row.id,
+                    )
         except Exception:
             logger.exception("Worker loop error")
         await asyncio.sleep(interval_seconds)
