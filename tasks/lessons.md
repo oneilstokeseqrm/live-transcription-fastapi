@@ -150,3 +150,44 @@ Codex finds the next-deepest issue every round. After ~3 rounds of code-correctn
 **Rule:** Address code-correctness P2s aggressively. When remaining findings are about deployment discipline, documentation, or theoretical safety concerns that are already mitigated operationally, stop the spiral and document the judgment call (commit message + handoff doc). Future sessions should treat this as the precedent.
 
 If a session finds itself on Round 5+ with no new code-correctness findings, ship.
+
+## Codex spiral discipline — defer-by-design vs keep fixing (2026-05-14)
+
+PR #13 ran 6 rounds of Codex review with the publisher + queue actions diff,
+closing 14 P1 and 8 P2 findings with permanent regression tests. Round 7
+surfaced 2 more findings, both real bugs but **forward-looking**:
+
+- P1: stale `approval_attempt_id` survives archive+reopen — triggers only
+  when the reopen path is wired up (Task 1.5.12, separate PR)
+- P2: EventBridge 256KB Detail cap not enforced — bounded by scale we
+  won't hit at 1 replica (typical ~1KB, cap requires ~250 signals/entry)
+
+**Decision:** STOP the spiral. Document both as inline TODO comments
+pointing at the responsible follow-up phase. Ship Phase 1.5 main scope
+without fixing them in this PR.
+
+**Why this isn't slop:**
+
+1. Each Round 1-6 finding was a real bug Codex caught that the implementer
+   missed. The TDD regression test density per fix means those bugs can
+   never silently regress.
+2. Round 7's findings are real but their **triggers don't ship in this PR**.
+   The P1 needs the reopen flow (Task 1.5.12); the P2 needs payload sizes
+   we won't hit at Phase 1.5 scale.
+3. Documenting deferred bugs as inline TODOs is more honest than fixing
+   them prematurely and shipping unused defensive code.
+4. The user's pattern at every prior phase boundary (Phase 1, Phase 1.5 P2)
+   was to ship clean after Codex finding categories stabilized into
+   operational/phasing concerns. Round 7 hit that pattern.
+
+**Rule:** at the phase boundary, the cost-benefit shifts. Real code-correctness
+bugs with reachable triggers must be fixed before ship. Real bugs with triggers
+gated by NOT-yet-shipped code should be documented in code (TODO comments)
+and ticketed against the PR that will exercise the trigger. Cost: 30 seconds
+of TODO writing. Benefit: the next session author sees the deferral the
+moment they touch that file. This is the inline equivalent of "Stop the
+Codex spiral when remaining findings are operational/phasing decisions"
+from the prior Phase 1.5 P2 session lesson — applied to phasing-conditional
+findings specifically.
+
+The judgment: don't ship UNREACHABLE-bug fixes. Ship the documented deferral.
