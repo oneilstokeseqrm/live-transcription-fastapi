@@ -33,12 +33,36 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 
+# Codex Round 3 P2 #3: ORDER BY publish_attempts ASC, created_at ASC.
+#
+# Pre-fix ordering was `created_at ASC` only — repeatedly-failing rows at
+# the front of the queue (low created_at, failing on every poll) would
+# starve newer events forever. With batch_size=10, 10 poison rows blocked
+# all subsequent events indefinitely. MARK_FAILED only bumps
+# publish_attempts; nothing rotates failed rows toward the back.
+#
+# Post-fix: publish_attempts ASC ensures all publish_attempts=0 rows
+# process first (newest never-attempted rows), then publish_attempts=1, 2,
+# .... Failed rows naturally cycle to the back; newer events at the front
+# always get a turn. created_at ASC remains the tiebreaker within an
+# attempts level, preserving FIFO semantics for the common case where
+# nothing fails.
+#
+# Mirrors the failed-row-rotation pattern from
+# workers/account_provisioning_worker.py (queue worker bumps updated_at on
+# a failed row in a separate session to push it to the back of the queue
+# ORDER BY — same conceptual fix, different mechanism here because the
+# publisher doesn't have an updated_at column on outbox rows).
+#
+# Note: at very high publish_attempts (100+), a dead-letter mechanism or a
+# max_attempts ceiling becomes valuable. That's a Phase 2 concern; this
+# ORDER BY change resolves the immediate starvation pattern.
 SELECT_UNPUBLISHED_SQL = text("""
     SELECT id::text, tenant_id::text, queue_id::text, event_type,
            account_id::text, payload_json, publish_attempts
     FROM account_provisioning_outbox
     WHERE published_at IS NULL
-    ORDER BY created_at ASC
+    ORDER BY publish_attempts ASC, created_at ASC
     LIMIT :limit
 """)
 

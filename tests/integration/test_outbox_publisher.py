@@ -747,7 +747,12 @@ async def test_run_publisher_loop_empty_batch_sleeps_and_loops():
 def test_select_unpublished_filters_by_null_published_at():
     sql = str(SELECT_UNPUBLISHED_SQL)
     assert "published_at IS NULL" in sql
-    assert "ORDER BY created_at ASC" in sql
+    # Codex Round 3 P2 #3: ORDER BY must favor fresh attempts first to prevent
+    # poison rows from starving the queue head. publish_attempts ASC rotates
+    # repeatedly-failing rows to the back of the batch so newer events at
+    # publish_attempts=0 always get a turn. created_at ASC remains the
+    # tiebreaker for rows at the same attempts count.
+    assert "ORDER BY publish_attempts ASC, created_at ASC" in sql
     assert ":limit" in sql
 
 

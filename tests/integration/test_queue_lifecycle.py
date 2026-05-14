@@ -861,6 +861,10 @@ def test_ignore_happy_path(client: TestClient):
     identifier (pg_user_id), reflecting the production insert pattern
     where owner_user_id stores a UUID. This test uses the production
     shape: JWT carries pg_user_id; queue row owner_user_id is that UUID.
+
+    Codex Round 3 P2 #2 — IGNORE_SQL now uses RETURNING; the handler reads
+    .one_or_none() to detect 0-row noops. The success path returns the
+    queue id row.
     """
     queue_id = str(uuid.uuid4())
 
@@ -868,7 +872,9 @@ def test_ignore_happy_path(client: TestClient):
         _execute_result(one_or_none=_fake_queue_row(
             queue_id=queue_id, owner_user_id=PG_USER_UUID,
         )),
-        _execute_result(rowcount=1),  # UPDATE succeeded
+        # Codex Round 3: IGNORE_SQL returns id::text via RETURNING; handler
+        # consumes .one_or_none().
+        _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
     ])
 
     with _patch_session(session):
@@ -1017,6 +1023,8 @@ def test_ignore_owner_with_pg_user_id_returns_200(client: TestClient):
     Combined with P1 #2: the IGNORE_SQL `:user_id::uuid` cast must receive
     a UUID. Post-fix, the route passes _effective_user_id(ctx) which is
     the pg_user_id UUID here → cast succeeds.
+
+    Codex Round 3 P2 #2 — IGNORE_SQL has RETURNING; handler reads .one_or_none().
     """
     queue_id = str(uuid.uuid4())
 
@@ -1025,7 +1033,7 @@ def test_ignore_owner_with_pg_user_id_returns_200(client: TestClient):
             queue_id=queue_id,
             owner_user_id=PG_USER_UUID,
         )),
-        _execute_result(rowcount=1),  # UPDATE succeeded
+        _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
     ])
 
     with _patch_session(session):
@@ -1174,14 +1182,20 @@ def test_approve_sql_filters_archived_and_terminal_status():
 def test_map_sql_filters_mapped_creating_ignored():
     """MAP_RESERVE_SQL must exclude rows in terminal/in-flight states.
 
-    Pre-fix: a same-attempt_id replay on a 'mapped' row would re-reserve
-    → handler would call materialize_account_approval again → duplicate
-    outbox + duplicate interaction_contact_links.
+    Pre-fix Round 2: a same-attempt_id replay on a 'mapped' row would
+    re-reserve → handler would call materialize_account_approval again →
+    duplicate outbox + duplicate interaction_contact_links.
+
+    Codex Round 3 P1 #1: tightened further from a negative list to the
+    positive list `status = 'pending'` so /map does not race the worker
+    on status='approved' rows. The pending-only filter still excludes
+    ('mapped', 'creating', 'ignored') by construction.
     """
     from routers.queue_actions import MAP_RESERVE_SQL
     sql_text = str(MAP_RESERVE_SQL)
     assert "archived_at IS NULL" in sql_text
-    assert "status NOT IN ('mapped', 'creating', 'ignored')" in sql_text
+    # Round 3 narrowed this from `status NOT IN (...)` to `status = 'pending'`.
+    assert "status = 'pending'" in sql_text
 
 
 def test_map_replay_with_same_attempt_id_skips_materialization(client: TestClient):
@@ -1235,3 +1249,224 @@ def test_map_replay_with_same_attempt_id_skips_materialization(client: TestClien
     assert body["account_id"] == account_id
     # CRITICAL: materialize NOT called on replay.
     materialize_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 3 fixes
+# ---------------------------------------------------------------------------
+
+# P1 #1 — /map must NOT race the worker on status='approved' rows.
+#
+# Pre-fix, MAP_RESERVE_SQL only excluded ('mapped', 'creating', 'ignored') —
+# so a row in status='approved' (worker-owned via advisory lock) was still
+# reservable by /map. The route does NOT take the advisory lock, so /map +
+# worker could both call materialize_account_approval on the same row →
+# duplicate outbox rows + duplicate links.
+#
+# Fix: restrict MAP_RESERVE_SQL to status='pending'. Approved rows are
+# worker-owned and terminal-from-/map's-perspective; mapped rows are
+# terminal.
+
+
+def test_map_sql_restricts_to_pending_only():
+    """MAP_RESERVE_SQL must filter status='pending' (not status NOT IN ...).
+
+    Pre-fix the negative filter allowed 'approved', 'tenant_review',
+    'failed' to pass. Post-fix only 'pending' rows can be /map-reserved
+    so the worker (which processes status='approved') is the sole owner
+    of post-approval materialization.
+    """
+    from routers.queue_actions import MAP_RESERVE_SQL
+    sql_text = str(MAP_RESERVE_SQL)
+    assert "archived_at IS NULL" in sql_text
+    assert "status = 'pending'" in sql_text
+    # Negative-list filter must be gone — replace with positive list.
+    assert "status NOT IN" not in sql_text
+
+
+def test_map_on_approved_row_returns_409_does_not_race_worker(client: TestClient):
+    """Round 3 P1 #1: /map on a row in status='approved' → 409, materialize NOT called.
+
+    The worker (workers/account_provisioning_worker.process_one_approved_entry)
+    takes an advisory lock and materializes approved rows. /map does NOT
+    take that lock. Allowing /map on status='approved' would race the worker
+    on the same row → duplicate outbox + duplicate links + possibly different
+    resolved accounts.
+
+    Fix: MAP_RESERVE_SQL filters status='pending'. The UPDATE noops on an
+    approved row → re-SELECT shows status='approved' (not replay-success because
+    status != 'mapped') → 409 Conflict.
+    """
+    queue_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    existing_attempt = str(uuid.uuid4())
+    new_attempt = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        # SELECT_QUEUE: row is APPROVED (worker territory)
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="approved",
+            approval_attempt_id=existing_attempt,
+        )),
+        # SELECT_ACCOUNT: account exists in tenant
+        _execute_result(one_or_none=_fake_account_row(account_id)),
+        # MAP_RESERVE: 0 rows — status filter excludes 'approved'
+        _execute_result(one_or_none=None),
+        # Re-SELECT: still 'approved' (not 'mapped'), so NOT replay-success → 409
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="approved",
+            approval_attempt_id=existing_attempt,
+        )),
+    ])
+
+    materialize_mock = AsyncMock()
+    with _patch_session(session), \
+         patch("routers.queue_actions.materialize_account_approval", new=materialize_mock):
+        response = client.post(
+            f"/queue/{queue_id}/map",
+            json={"account_id": account_id, "approval_attempt_id": new_attempt},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    materialize_mock.assert_not_awaited()
+    # The error message names the conflicting status for operator clarity.
+    assert "approved" in response.json()["detail"].lower()
+
+
+# P2 #2 — /ignore must NOT overwrite successfully-mapped or in-flight rows.
+
+
+def test_ignore_sql_filters_terminal_status():
+    """IGNORE_SQL must exclude ('mapped', 'creating', 'ignored') and have RETURNING.
+
+    Pre-fix IGNORE_SQL had no status filter, so a stale or crafted POST
+    /queue/{id}/ignore after /map would overwrite status='mapped' to 'ignored'.
+    The contacts + outbox rows from materialization stay; the queue state
+    lies.
+    """
+    from routers.queue_actions import IGNORE_SQL
+    sql_text = str(IGNORE_SQL)
+    assert "status NOT IN ('mapped', 'creating', 'ignored')" in sql_text
+    # RETURNING required so the handler can detect 0-row noops.
+    assert "RETURNING" in sql_text
+
+
+def test_ignore_on_mapped_row_returns_409(client: TestClient):
+    """Round 3 P2 #2: /ignore on status='mapped' → 409, NOT 200.
+
+    Pre-fix the UPDATE silently flipped status to 'ignored' while the
+    contacts + outbox rows stayed materialized — queue state lies.
+    Post-fix IGNORE_SQL noops (RETURNING 0 rows) → handler re-SELECTs →
+    sees status='mapped' → 409.
+    """
+    queue_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        # SELECT_QUEUE (_load_and_authorize, actionable_only=False so mapped passes)
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            resolved_account_id=str(uuid.uuid4()),
+        )),
+        # IGNORE_SQL — 0 rows (status filter excludes 'mapped')
+        _execute_result(one_or_none=None),
+        # Re-SELECT to discriminate — still 'mapped' → 409
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="mapped",
+            resolved_account_id=str(uuid.uuid4()),
+        )),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    assert "mapped" in response.json()["detail"].lower()
+
+
+def test_ignore_on_creating_row_returns_409(client: TestClient):
+    """Round 3 P2 #2: /ignore on status='creating' (worker in flight) → 409.
+
+    The worker's atomic materialization is in-flight; ignoring would lie
+    about the queue state once the worker commits status='mapped'.
+    """
+    queue_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="creating",
+        )),
+        # IGNORE_SQL — 0 rows
+        _execute_result(one_or_none=None),
+        # Re-SELECT — still 'creating'
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="creating",
+        )),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    assert "creating" in response.json()["detail"].lower()
+
+
+def test_ignore_on_pending_row_still_succeeds(client: TestClient):
+    """Round 3 P2 #2 regression: the new status filter must NOT break the
+    happy-path /ignore on a status='pending' row."""
+    queue_id = str(uuid.uuid4())
+
+    session = _SessionStub(execute_results=[
+        _execute_result(one_or_none=_fake_queue_row(
+            queue_id=queue_id,
+            owner_user_id=PG_USER_UUID,
+            status="pending",
+        )),
+        # IGNORE_SQL — 1 row (RETURNING)
+        _execute_result(one_or_none=MagicMock(id=queue_id), rowcount=1),
+    ])
+
+    with _patch_session(session):
+        response = client.post(
+            f"/queue/{queue_id}/ignore",
+            json={},
+            headers={
+                "Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ignored"
+    assert body["queue_id"] == queue_id
+
+
+# Existing test_ignore_on_already_archived_returns_200_idempotent at line 629
+# already covers /ignore on status='ignored' → 200 idempotent (the
+# short-circuit fires before IGNORE_SQL runs).

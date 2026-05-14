@@ -173,6 +173,18 @@ APPROVE_SQL = text("""
 """)
 
 
+# Codex Round 3 P2 #2: status filter prevents /ignore from overwriting
+# successfully-mapped or in-flight rows. Pre-fix, a stale or crafted POST
+# /queue/{id}/ignore after /map (status='mapped') or while the worker was
+# processing (status='creating') silently flipped status to 'ignored' — the
+# contacts + outbox rows from materialization stayed put, so queue state
+# lied. Post-fix: terminal/in-flight rows noop (RETURNING 0 rows), and the
+# handler re-SELECTs to return 409 for mapped/creating or fall through to
+# the idempotent 200 for already-ignored.
+#
+# RETURNING id::text is required so the handler can detect 0-row noops via
+# .one_or_none() without depending on result.rowcount (which has varying
+# semantics across async drivers).
 IGNORE_SQL = text("""
     UPDATE pending_account_mappings
     SET status = 'ignored',
@@ -182,6 +194,8 @@ IGNORE_SQL = text("""
         archive_reason = 'owner_ignored',
         updated_at = NOW()
     WHERE id = :queue_id
+      AND status NOT IN ('mapped', 'creating', 'ignored')
+    RETURNING id::text
 """)
 
 
@@ -205,17 +219,26 @@ SELECT_ACCOUNT_FOR_TENANT_SQL = text("""
 # approval_attempt_id=<id>. A retry with the SAME attempt_id would
 # otherwise re-match WHERE → return 1 row → handler calls
 # materialize_account_approval AGAIN → duplicate outbox + duplicate
-# interaction_contact_links. Excluding ('mapped', 'creating', 'ignored')
-# routes the replay through the 0-row branch in map_entry, which
-# re-SELECTs and returns 200 without re-materializing when status='mapped'
-# and resolved_account_id matches.
+# interaction_contact_links.
+#
+# Codex Round 3 P1 #1: tighten to status='pending' (positive list) rather
+# than a negative list. Pre-fix the negative list allowed 'approved' to pass,
+# but worker (workers/account_provisioning_worker.process_one_approved_entry)
+# takes an advisory lock and processes status='approved' rows — /map does NOT
+# take that lock. Concurrent /map + worker on the same approved row → two
+# parallel materialize_account_approval calls → duplicate outbox rows +
+# duplicate links + possibly different resolved accounts. /map is the
+# "I know the account, skip the AI worker" path; once a row is /approve'd,
+# the worker owns it. The 0-row branch in map_entry handles the conflict
+# via re-SELECT → returns replay-success 200 if status='mapped' with matching
+# resolved_account_id, else 409.
 MAP_RESERVE_SQL = text("""
     UPDATE pending_account_mappings
     SET approval_attempt_id = :attempt_id::uuid,
         updated_at = NOW()
     WHERE id = :queue_id
       AND archived_at IS NULL
-      AND status NOT IN ('mapped', 'creating', 'ignored')
+      AND status = 'pending'
       AND (approval_attempt_id IS NULL OR approval_attempt_id = :attempt_id::uuid)
     RETURNING id::text
 """)
@@ -475,11 +498,17 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
                         "account_id": body.account_id,
                     }
 
+                # Codex Round 3 P1 #1: explicit conflict messaging — /map
+                # only operates on pending entries. Approved entries are
+                # owned by the worker (advisory-lock isolation); mapped
+                # entries are terminal. The message names the conflicting
+                # status so operators can diagnose without re-querying.
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        f"Map conflict: queue entry is in status='{current.status}' "
-                        f"with approval_attempt_id already recorded. Reload and retry."
+                        f"Map conflict: queue entry is in status='{current.status}'. "
+                        f"/map only operates on pending entries. Approved entries are "
+                        f"owned by the worker; mapped entries are terminal."
                     ),
                 )
 
@@ -550,9 +579,43 @@ async def ignore_entry(queue_id: str, request: Request):
                 )
                 return {"status": "ignored", "queue_id": queue_id}
 
-            await session.execute(
+            # Codex Round 3 P2 #2: IGNORE_SQL now filters
+            # `status NOT IN ('mapped', 'creating', 'ignored')` and uses
+            # RETURNING. If the UPDATE matches 0 rows, the entry is in a
+            # terminal/in-flight state we must NOT silently overwrite:
+            # materialization has succeeded ('mapped') or is in progress
+            # ('creating'). Re-SELECT to discriminate the cases.
+            ignore_result = await session.execute(
                 IGNORE_SQL,
                 {"queue_id": queue_id, "user_id": effective_id},
             )
+            if ignore_result.one_or_none() is None:
+                # 0 rows — either status is mapped/creating/ignored, or the
+                # row vanished mid-flight. The idempotent short-circuit
+                # above already handles status='ignored', so getting here
+                # with status='ignored' is a benign race — return 200.
+                current = (await session.execute(
+                    SELECT_QUEUE_SQL, {"queue_id": queue_id},
+                )).one_or_none()
+                if current is None:
+                    raise HTTPException(
+                        status_code=404, detail="Queue entry not found",
+                    )
+                if current.status in ("mapped", "creating"):
+                    logger.info(
+                        "Ignore blocked on terminal/in-flight entry: "
+                        "queue_id=%s, status=%s",
+                        queue_id, current.status,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Cannot ignore queue entry in status='{current.status}'; "
+                            f"materialization already succeeded or is in progress."
+                        ),
+                    )
+                # status='ignored' — race with the idempotent short-circuit
+                # above; treat as 200 (defensive).
+                return {"status": "ignored", "queue_id": queue_id}
 
     return {"status": "ignored", "queue_id": queue_id}
