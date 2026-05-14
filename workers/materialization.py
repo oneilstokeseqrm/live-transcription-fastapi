@@ -48,11 +48,23 @@ INSERT_CONTACT_SQL = text("""
 
 UPSERT_RAW_INTERACTION_SQL = text("""
     INSERT INTO raw_interactions (
-        interaction_id, tenant_id, interaction_type, updated_at
+        interaction_id, tenant_id, account_id, interaction_type, updated_at
     ) VALUES (
-        :interaction_id, :tenant_id, :interaction_type, NOW()
+        :interaction_id, :tenant_id, :account_id, :interaction_type, NOW()
     )
     ON CONFLICT (interaction_id) DO NOTHING
+""")
+# account_id is included because raw_interactions.account_id is NOT NULL
+# (enforced in Phase 1.5 schema). For backfill cases (the queue's signal
+# references an interaction that doesn't have a raw_interactions row yet),
+# we use the materialization's account_id as the anchor.
+
+
+SELECT_EXISTING_SUMMARY_SQL = text("""
+    SELECT summary_id::text AS summary_id
+    FROM interaction_summaries
+    WHERE interaction_id = :interaction_id
+    LIMIT 1
 """)
 
 
@@ -63,6 +75,10 @@ INSERT_PLACEHOLDER_SUMMARY_SQL = text("""
         :summary_id, :tenant_id, :interaction_id, :summary_type, NOW(), NOW()
     )
 """)
+# interaction_summaries.interaction_id has a UNIQUE INDEX
+# (interaction_summaries_interaction_id_key). The materialization code first
+# SELECTs an existing summary; only if none exists does it INSERT a placeholder.
+# Blind INSERT would fail with a unique-constraint violation.
 
 
 INSERT_LINK_SQL = text("""
@@ -183,20 +199,31 @@ async def materialize_account_approval(
                     {
                         "interaction_id": s.interaction_id,
                         "tenant_id": tenant_id,
+                        "account_id": account_id,
                         "interaction_type": "meeting",
                     },
                 )
-                # Create placeholder summary so FK is satisfied.
-                summary_id = str(uuid.uuid4())
-                await session.execute(
-                    INSERT_PLACEHOLDER_SUMMARY_SQL,
-                    {
-                        "summary_id": summary_id,
-                        "tenant_id": tenant_id,
-                        "interaction_id": s.interaction_id,
-                        "summary_type": "meeting",
-                    },
-                )
+                # Reuse existing summary if the summaries-writer already wrote
+                # one; otherwise insert a placeholder. interaction_summaries
+                # has a UNIQUE constraint on interaction_id, so we must check
+                # before inserting.
+                existing = (await session.execute(
+                    SELECT_EXISTING_SUMMARY_SQL,
+                    {"interaction_id": s.interaction_id},
+                )).one_or_none()
+                if existing is not None:
+                    summary_id = existing.summary_id
+                else:
+                    summary_id = str(uuid.uuid4())
+                    await session.execute(
+                        INSERT_PLACEHOLDER_SUMMARY_SQL,
+                        {
+                            "summary_id": summary_id,
+                            "tenant_id": tenant_id,
+                            "interaction_id": s.interaction_id,
+                            "summary_type": "meeting",
+                        },
+                    )
                 summary_id_by_raw_id[raw_id] = summary_id
 
             pair = (summary_id, contact_id)
