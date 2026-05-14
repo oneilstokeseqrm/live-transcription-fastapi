@@ -83,7 +83,7 @@ Total reading: ~30-40 minutes. The Phase 1.5 main scope is genuinely complex —
 
 2. **Project status + full decision log:** `~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/project_contact_quality_initiative.md` — read the `## Phase 1.5 P2s SHIPPED (2026-05-14)` section (most recent) AND the `## Phase 1 SHIPPED (2026-05-14)` section for the earlier context. The `## Codex review history` section near the bottom is the audit trail.
 
-3. **The implementation plan for Phase 1.5 main scope:** `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` starting at line ~2538. Read carefully — the outbox + worker design has subtle txn-boundary requirements.
+3. **The implementation plan for Phase 1.5 main scope:** `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` starting at line ~2540. Read carefully — the outbox + worker design has subtle txn-boundary requirements. **The newly-added "Phase 1.5 Production E2E Discipline" section (right after Task 1.5.1) is REQUIRED reading and is now load-bearing for this workstream — it defines when/what/how to extend `/tmp/e2e_phase_1_production.py` at each shipping gate.**
 
 4. **The design document (canonical project intent):** `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` — **THE FOUR MOST-REFERENCED SECTIONS FOR THIS WORK:**
    - **Section 5.3** — queue UPSERT semantics + provenance UI
@@ -130,7 +130,7 @@ All from Phase 1, plus the ones surfaced by Phase 1.5 P2 cleanup:
 
 - **Real `/codex review` is non-substitutable.** Static-invariant self-review missed P1s in Phase 1 and Codex Round 3-5 each surfaced a different P2 that automated tests didn't catch.
 
-- **Production E2E is a real quality gate.** Extended `/tmp/e2e_phase_1_production.py` to 13 cases (9 Phase 1 + 4 Phase 1.5). Extend further as each Phase 1.5 main-scope ship lands.
+- **Production E2E is a real quality gate AT EVERY SHIPPING GATE, not just the end.** Extended `/tmp/e2e_phase_1_production.py` to 13 cases (9 Phase 1 + 4 Phase 1.5 P2). The plan's "Phase 1.5 Production E2E Discipline" section now specifies exactly when to extend (after Task 1.5.6+1.5.7, 1.5.9, 1.5.11; re-run after 1.5.16) and what the case shapes look like. Treat this discipline as non-substitutable: every PR merge re-runs the suite as a regression check; every new endpoint or worker behavior gets a new case; the script update commits in the SAME PR as the code change. This goes beyond what the original plan called for (the original called for one manual production validation at the end via Task 1.5.24) — the discipline came from Phase 1 + Phase 1.5 P2 ship lessons and is now codified in plan + lessons.md.
 
 - **`/context-save` at session end is mandatory.** Handoff docs + auto-memory answer "what's the state?"; the gstack checkpoint answers "is the next agent's first command going to work?" Both required.
 
@@ -200,7 +200,7 @@ The three prompt templates live at `~/.claude/plugins/cache/claude-plugins-offic
 - Do NOT touch Phase 1's auth-context layer in a way that breaks the `_ingestion` vs `_polling` split that landed in T1.26.4.
 - Do NOT touch the participants flow without good reason — it spans 4 routes and the worker, and any change requires updating all callers in the same commit.
 - Do NOT use `--no-verify` on any commit.
-- Do NOT skip production E2E after the main-scope ship — extend `/tmp/e2e_phase_1_production.py` with outbox + worker + queue UI cases.
+- Do NOT skip production E2E at each shipping gate — the plan's "Phase 1.5 Production E2E Discipline" section spells out where to extend `/tmp/e2e_phase_1_production.py`. Skipping it would repeat the Phase 1 mistake the prior session almost made (declaring "done" without live-API verification).
 - Do NOT chase Codex perfectionism rounds past Round 3-ish if the remaining concerns are operational/documentation rather than code-correctness. (See Phase 1.5 P2 cleanup Codex Round 5 for the precedent.)
 
 ---

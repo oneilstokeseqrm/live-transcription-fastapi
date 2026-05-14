@@ -2580,6 +2580,54 @@ git checkout -b feat/contact-quality-phase-1-5
 
 ---
 
+## Phase 1.5 Production E2E Discipline
+
+**Added 2026-05-14 post-Phase-1.5-P2-ship as a carry-forward invariant.** Real production E2E with a Railway-issued short-lived JWT is the final, non-substitutable quality gate. Automated tests + Codex review catch roughly 90% of issues; the last 10% requires hitting the live API. Wire this into every gate in Phase 1.5 main scope — do not defer to Task 1.5.24 alone.
+
+### The artifact
+
+Production E2E lives at `/tmp/e2e_phase_1_production.py` (carried forward from Phase 1 + Phase 1.5 P2 ships; 13 cases as of 2026-05-14, 13/13 PASS on current production). The script:
+
+- Pulls `INTERNAL_JWT_SECRET` from Railway via MCP — project `847cfa5a-b77c-4fb0-95e4-b20e8773c23e`, service `59a69f3d-9a24-4041-942a-891c4a81c5fb`, environment `e4c5ec15-1931-4632-9e58-92d9c6be4261`
+- Issues a 5-minute JWT signed with the production secret (issuer `eq-frontend`, audience `eq-backend`)
+- Hits the live endpoint `https://live-transcription-fastapi-production.up.railway.app`
+- Asserts on response status codes + bodies for each test case
+- Uses test tenant `11111111-1111-4111-8111-111111111111` (safe to seed)
+
+### When to run + extend (NON-OPTIONAL gates)
+
+1. **Before every Phase 1.5 main-scope PR merges:** re-run the existing suite. Expected: all current cases PASS. Any regression is a stop-the-line.
+
+2. **After each significant new endpoint or worker behavior ships, EXTEND the script:**
+   - **After Task 1.5.6 + 1.5.7** (atomic materialization txn + worker poll loop): add a case that seeds a test-tenant queue entry pre-approved, exercises the worker (either via a test endpoint that runs `process_one_approved_entry` synchronously OR by waiting for the worker's poll interval), and asserts the materialized account + outbox row exist. The check is reachable via the existing `/upload/status` JSON pattern — read the materialized row's ID from the seeded queue entry.
+   - **After Task 1.5.9** (outbox publisher): add a case that asserts the outbox row reaches `published_at IS NOT NULL` after the publisher runs.
+   - **After Task 1.5.11** (Approve/Map/Ignore routes): add three cases — one per route — covering the auth boundary (rejects missing JWT / wrong tenant) AND a happy path each.
+   - **After Task 1.5.15** (eq-structured-graph-core AccountCreated consumer): no new HTTP cases from this repo, but document the Neo4j-side smoke check (via the `neo4j_structured` MCP) as a paired step in the suite run.
+   - **After Task 1.5.16** (queue UI cross-repo): no new backend cases (UI hits existing API). Re-run the full suite post-deploy.
+
+3. **Post-merge:** every Railway auto-deploy that reaches SUCCESS triggers a re-run of the suite. Any regression = roll back or follow-up immediately.
+
+4. **Document each extension** in the script itself (top docstring) with the task number and what the case validates. Commit the script alongside the code change in the same PR (use `/tmp/` only as the scratch location; copy into `tests/e2e/production_smoke.py` if it ever needs durability beyond `/tmp/`).
+
+### Why this discipline is non-substitutable
+
+- **Phase 1 ship (prior session):** Three P1 findings were caught by Codex review that automated unit + integration tests missed — all three were caller-side wiring gaps or body/header trust-boundary violations that looked correct in isolation. The live-API check caught regression mode #4 that even Codex review didn't flag (a clientele polling pattern with JWT-only auth that broke when `X-Account-ID` became universally mandatory).
+
+- **Phase 1.5 P2 cleanup (this session):** The live-API regression check immediately surfaced the `/upload/status` polling 400 → 404 transition. Without the production E2E gate, that regression would have shipped and a real client would have hit it before we knew.
+
+- **Phase 1.5 main scope:** The worker + outbox + queue UI involve more moving parts than Phase 1 + P2 cleanup combined (cross-process state via the outbox, async retries with idempotency keys, eventual consistency to Neo4j). The probability that automated tests miss something real is higher, not lower. The discipline scales with complexity.
+
+### Manual production validation (Task 1.5.24) is COMPLEMENTARY, not a replacement
+
+Task 1.5.24's manual workflow (trigger transcript → see queue entry → approve via UI → watch worker → verify Neo4j) tests things the automated script cannot:
+- UI interaction (button clicks, form submissions, visual confirmation)
+- Multi-system visual observation (a human can spot "the queue entry never appeared" or "the Neo4j node is missing edges" faster than asserts)
+- Cross-service eventual consistency (transcript → queue → worker → Neo4j edges) end-to-end with realistic timing
+
+Both gates are required. The automated suite catches regressions fast; the manual workflow catches integration gaps the automated suite couldn't have anticipated.
+
+---
+
 ## Phase 1.5 Schema Coordination (eq-frontend)
 
 ### Task 1.5.2: Document Phase 1.5 schema changes for the eq-frontend agent
@@ -3385,6 +3433,14 @@ git add workers/__main__.py
 git commit -m "chore(worker): entrypoint for Railway deployment"
 ```
 
+- [ ] **Step 4: Extend production E2E for the worker**
+
+Per the **Phase 1.5 Production E2E Discipline** section (above), the worker is a significant new behavior — extend `/tmp/e2e_phase_1_production.py`:
+- Add a case that seeds a queue entry in `approved` state (via direct Neon MCP write to `pending_account_mappings` with test tenant `11111111-1111-4111-8111-111111111111`).
+- Either wait for the worker's poll interval, OR invoke `process_one_approved_entry` synchronously via a test endpoint, OR assert from outside that the materialized account row exists in `accounts` and the outbox row exists in `account_provisioning_outbox` within a bounded time window.
+- Re-run the full 14+ case suite; expected all PASS.
+- Commit the script update in the same PR as the worker code.
+
 ---
 
 ## Phase 1.5 Outbox Publisher
@@ -3573,6 +3629,13 @@ pytest tests/integration/test_outbox_publisher.py -v
 git add workers/outbox_publisher.py tests/integration/test_outbox_publisher.py
 git commit -m "feat(outbox): publisher with retry-on-failure semantics"
 ```
+
+- [ ] **Step 5: Extend production E2E for the outbox publisher**
+
+Per the **Phase 1.5 Production E2E Discipline** section (above):
+- Add a case that asserts an `account_provisioning_outbox` row with `published_at IS NULL` reaches `published_at IS NOT NULL` within the publisher's poll interval (read via Neon MCP).
+- Re-run the full suite; expected all PASS.
+- Commit the script update in the same PR as the publisher code.
 
 ---
 
@@ -3850,6 +3913,16 @@ pytest tests/integration/test_queue_lifecycle.py -v
 git add routers/queue_actions.py main.py tests/integration/test_queue_lifecycle.py
 git commit -m "feat(queue-routes): approve/map/ignore actions with idempotency"
 ```
+
+- [ ] **Step 6: Extend production E2E for the queue actions**
+
+Per the **Phase 1.5 Production E2E Discipline** section (above) — this is the largest extension since three new HTTP routes ship at once:
+- **Approve route:** seed a queue entry, POST `/queue/{id}/approve` with a valid JWT → 200; verify materialized account row + outbox row via Neon MCP. Then POST again with the SAME body (idempotency check) → 200 (no duplicate writes).
+- **Map route:** seed a queue entry, POST `/queue/{id}/map` with a pre-existing account_id → 200; verify the agent client was NOT called (no new account materialized) but the queue entry is mapped.
+- **Ignore route:** seed a queue entry, POST `/queue/{id}/ignore` → 200; verify `archived_at IS NOT NULL`.
+- **Auth boundary for each route:** missing JWT → 401; wrong tenant → 403; missing/wrong owner → 403 unless `is_admin` and status is `tenant_review`.
+- Re-run the full suite; expected all PASS.
+- Commit the script update in the same PR as the queue actions code.
 
 ---
 
@@ -4139,6 +4212,12 @@ git add tasks/downstream/eq-frontend-phase-1-5-queue-ui.md
 git commit -m "docs: eq-frontend queue UI brief"
 ```
 
+- [ ] **Step 3: Re-run production E2E post-deploy**
+
+Per the **Phase 1.5 Production E2E Discipline** section (above): the queue UI doesn't add new backend cases (it hits the existing Approve/Map/Ignore routes already covered by Task 1.5.11's E2E extensions). But after the eq-frontend deploy reaches the production target:
+- Re-run the full suite from this repo's `/tmp/e2e_phase_1_production.py`; expected all PASS.
+- Note the eq-frontend deploy URL + commit SHA in the suite run log (paste into the orchestrator session for the merge record).
+
 ---
 
 ## Phase 1.5 eq-agent-action-core Acceptance Tests
@@ -4333,6 +4412,17 @@ chmod +x scripts/verify_phase_1_5_invariants.sh
 git add scripts/verify_phase_1_5_invariants.sh
 git commit -m "chore: phase 1.5 invariant verification script"
 ```
+
+- [ ] **Step 3: Run the full production E2E suite as the LAST step of acceptance verification**
+
+Per the **Phase 1.5 Production E2E Discipline** section (above): the invariant verification script covers static schema + test-suite assertions, but the final acceptance gate before merge is the production E2E suite. By the time Phase 1.5 main scope ships, the suite should have grown from the 13 cases at Phase 1.5 P2 ship to roughly 18-22 cases (the exact count depends on how the per-task extensions in 1.5.8 / 1.5.9 / 1.5.11 land — but the count should ONLY grow, never shrink).
+
+```bash
+python3 /tmp/e2e_phase_1_production.py
+# Expected: ALL PASS, 0 FAIL. Any FAIL is a stop-the-line.
+```
+
+If a case is intentionally moved from the script (e.g., because a refactor changed the API surface), document the move in the script's top docstring with the task number and rationale. Never silently delete cases.
 
 ### Task 1.5.23: Codex consult on Phase 1.5 diff
 
