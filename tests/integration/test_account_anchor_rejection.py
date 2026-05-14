@@ -97,7 +97,7 @@ def test_text_clean_does_not_400_when_account_id_present(client: TestClient):
     token = _make_jwt()
     response = client.post(
         "/text/clean",
-        json={"text": "hello world"},
+        json={"text": "hello world", "account_id": "acct-1"},
         headers={
             "Authorization": f"Bearer {token}",
             "X-Account-ID": "acct-1",
@@ -105,4 +105,41 @@ def test_text_clean_does_not_400_when_account_id_present(client: TestClient):
     )
     # 200 (happy path) is fine; 4xx for downstream reasons is also fine. The
     # auth-context layer must not have rejected us for a missing account_id.
+    assert "x-account-id header is required" not in response.text.lower()
+
+
+def test_text_clean_rejects_account_id_mismatch(client: TestClient):
+    """Backend rejects requests where body.account_id != X-Account-ID header.
+
+    The auth-context account_id is the source of truth. A mismatch indicates
+    inconsistent client behavior or a tampering attempt; we 400 loudly rather
+    than silently picking one source.
+    """
+    token = _make_jwt()
+    response = client.post(
+        "/text/clean",
+        json={"text": "hello world", "account_id": "acct-A"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": "acct-B",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "account_id mismatch" in response.text.lower()
+
+
+@pytest.mark.usefixtures("mock_services")
+def test_text_clean_accepts_matching_account_id(client: TestClient):
+    """When body.account_id matches X-Account-ID header, request proceeds normally."""
+    token = _make_jwt()
+    response = client.post(
+        "/text/clean",
+        json={"text": "hello world", "account_id": "acct-1"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Account-ID": "acct-1",
+        },
+    )
+    # The auth-context boundary must NOT 400, and the mismatch check must NOT 400.
+    assert "account_id mismatch" not in response.text.lower()
     assert "x-account-id header is required" not in response.text.lower()

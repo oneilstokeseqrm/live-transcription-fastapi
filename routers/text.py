@@ -66,7 +66,24 @@ async def clean_text(body: TextCleanRequest, request: Request):
             status_code=400,
             detail="text field cannot contain only whitespace"
         )
-    
+
+    # Reject body/header account_id mismatch. The auth-context account_id
+    # (X-Account-ID header) is the source of truth; a mismatch indicates
+    # inconsistent client behavior or a tampering attempt — 400 loudly rather
+    # than silently picking one source. (Phase 1 / T1.26.2)
+    if body.account_id != context.account_id:
+        logger.warning(
+            f"account_id mismatch: interaction_id={context.interaction_id}, "
+            f"body.account_id={body.account_id}, context.account_id={context.account_id}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "account_id mismatch: body.account_id and X-Account-ID header must agree. "
+                "The authenticated account_id is the source of truth."
+            ),
+        )
+
     # Enrich transcript with calendar event contacts + front-matter
     enrichment_service = TranscriptEnrichmentService()
     transcript_ts = datetime.now(timezone.utc)
@@ -130,7 +147,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
         extras=extras,
         interaction_id=UUID(context.interaction_id),
         trace_id=context.trace_id,
-        account_id=body.account_id,
+        account_id=context.account_id,
         pg_user_id=context.pg_user_id,
     )
     
@@ -156,7 +173,7 @@ async def clean_text(body: TextCleanRequest, request: Request):
                 tenant_id=context.tenant_id,
                 trace_id=context.trace_id,
                 interaction_type=body.interaction_type,
-                account_id=body.account_id,
+                account_id=context.account_id,
                 contact_ids=enrichment.contact_ids or None,
                 calendar_event_id=enrichment.calendar_event_id,
                 enrichment_confidence=enrichment.match_confidence,
