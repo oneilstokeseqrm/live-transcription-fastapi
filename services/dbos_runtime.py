@@ -27,10 +27,17 @@ logger = logging.getLogger(__name__)
 def build_dbos_config() -> DBOSConfig:
     """Construct ``DBOSConfig`` from environment.
 
-    ``DBOS_SYSTEM_DATABASE_URL`` must be a direct (non-pooler) Postgres
-    connection in production; Neon's pooler interferes with DBOS workflow
-    state and locking. If unset (local dev / pytest), DBOS falls back to
-    a SQLite system database file.
+    ``DBOS_SYSTEM_DATABASE_URL`` is REQUIRED. It must be a direct
+    (non-pooler) Postgres connection in production; Neon's pooler
+    interferes with DBOS workflow state and locking. Tests that exercise
+    lifespan must set this env var to a test-safe connection (Phase 1.5
+    uses production with test-tenant scoping; M3 tests will set it
+    explicitly).
+
+    If the env var is unset, DBOS would silently fall back to a local
+    SQLite file that gets blown away on every container restart —
+    defeating the durability guarantee Phase 1.5 is buying. Fail fast
+    with a clear error instead.
 
     ``RAILWAY_REPLICA_ID`` is auto-injected by Railway. Locally it is
     unset and DBOS picks its own executor identity. When ``None`` is
@@ -38,9 +45,19 @@ def build_dbos_config() -> DBOSConfig:
     ``"executor_id" in config and config["executor_id"] is not None``
     guard (see ``dbos/_dbos.py:445``).
     """
+    system_database_url = os.environ.get("DBOS_SYSTEM_DATABASE_URL")
+    if not system_database_url:
+        raise RuntimeError(
+            "DBOS_SYSTEM_DATABASE_URL is required for the DBOS workflow "
+            "runtime but is unset. In production this env var must point "
+            "at a direct (non-pooler) Postgres connection — see Railway "
+            "service config for live-transcription-fastapi. For tests, "
+            "set the variable in your fixture or environment before "
+            "importing the app."
+        )
     return DBOSConfig(
         name="live-transcription-fastapi",
-        system_database_url=os.environ.get("DBOS_SYSTEM_DATABASE_URL"),
+        system_database_url=system_database_url,
         executor_id=os.environ.get("RAILWAY_REPLICA_ID"),
         # Phase 1.5 does not need the admin server; revisit when adding
         # operator tooling that benefits from it.
