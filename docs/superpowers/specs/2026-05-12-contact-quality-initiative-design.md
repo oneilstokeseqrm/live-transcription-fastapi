@@ -454,6 +454,7 @@ When per-attendee domain resolution runs against an attendee's email domain, the
 - Workflow + step state is checkpointed to the existing Neon Postgres database under a `dbos.*` schema (created automatically by DBOS on first launch).
 - Workflow-level idempotency is provided by application-controlled IDs via the `SetWorkflowID` context manager; per-step retry semantics are configured explicitly per step.
 - DBOS provides the Phase 2/3 primitives we'll need (durable sleep, queues, HITL via send/recv/set_event/get_event) without re-architecting.
+- V1 ships with one Railway replica running `uvicorn --workers 1`, AND is multi-replica-ready by configuration (`executor_id=os.environ.get("RAILWAY_REPLICA_ID")` in `DBOS.DBOSConfig`). Scaling from 1 → N replicas later is a Railway dashboard change plus shipping the orphan-workflow detector (design + trigger rules in `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`).
 
 **Technical scope:**
 

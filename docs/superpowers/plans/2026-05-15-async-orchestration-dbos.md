@@ -1,6 +1,6 @@
 # Phase 1.5 Implementation Plan — Async Orchestration on DBOS
 
-**Status:** DRAFT v2 — Codex consult REVISE folded in; substrate decision (DBOS) unchanged.
+**Status:** DRAFT v3 — multi-replica scaling design baked in (per user 2026-05-15 strategy decision); substrate (DBOS) unchanged from v2.
 **Date:** 2026-05-15
 **Branch baseline:** `main` @ `7b12b89`
 **Supersedes:** Polling-worker + outbox-publisher architecture from `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` Phase 1.5 main scope (Tasks 1.5.6–1.5.21). Phase 1 and Phase 1.5 P2 cleanup remain shipped; this plan only revises the durability machinery.
@@ -251,7 +251,11 @@ class EnvelopeV1(BaseModel):
 
 **Workflow recovery model:**
 
-DBOS workflows persist state to `dbos.workflow_status` on each step. On process restart, DBOS resumes in-progress workflows. In multi-instance setups, `executor_id` distinguishes instances; without explicit configuration, **the safest default for V1 is single-instance.** Plan-v2 ships V1 with `uvicorn --workers 1` (one OS process, async concurrency only). The multi-worker story is a Phase 2 scale concern with a dedicated design (see §4.3).
+DBOS workflows persist state to `dbos.workflow_status` on each step. On process restart, DBOS resumes in-progress workflows. In multi-instance setups, `executor_id` distinguishes instances so each only resumes the workflows it owns. **V1 ships with a single Railway replica running `uvicorn --workers 1`** — one OS process, async concurrency only. But V1 ALSO sets `executor_id = os.environ.get("RAILWAY_REPLICA_ID")` so the deploy is **multi-replica-ready by configuration**: scaling Railway replicas count from 1 → N at any future point is a dashboard change, not a code change.
+
+What V1 deliberately does NOT include: the **orphan-workflow detector**. When a replica dies permanently (container replaced after a deploy crash; replica count is decreased), workflows tagged with its executor_id can become orphaned because no other replica claims them. DBOS Cloud's Conductor handles this automatically; self-hosted, we'd write a periodic sweep that finds workflows with stale executor_ids and reassigns them. For single-replica V1, no orphan situation can arise (only one executor exists; on restart the same `RAILWAY_REPLICA_ID` is reassigned to the new container if the replica slot persists — confirm at execution time).
+
+The orphan-detector design + Phase-2-trigger logic is captured in a dedicated spec: `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`. Plans for Phase 2 that introduce sustained workload (e.g., periodic re-enrichment sweeps) must explicitly include the orphan-detector in scope before multiplying replicas.
 
 **Operational mode for this plan:** library only. No `dbos start`. The workflow definitions live in the FastAPI process; `DBOS.launch()` is called once at FastAPI startup; workflows execute in the same event loop as HTTP handlers.
 
@@ -311,15 +315,19 @@ with SetWorkflowID(f"queue-{queue_id}:approval-{approval_attempt_id}"):
 - Steps 4-5 (database writes) are in the same workflow scope so workflow status reflects "did we materialize?" cleanly. Splitting would push idempotency complexity to the caller.
 - The workflow ID (`SetWorkflowID(f"queue-{queue_id}:approval-{approval_attempt_id}")`) is stable across replays of the SAME approval attempt. Reopen of a queue row (which increments `re_open_count` and produces a new `approval_attempt_id` per `services/pending_account_mappings.py:61` semantics) produces a DISTINCT workflow ID. Codex's reopen-collision finding is closed.
 
-### 4.3 In-process, single Uvicorn worker (V1)
+### 4.3 In-process, single Railway replica, single Uvicorn worker (V1) — multi-replica-ready
 
-V1 ships with `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1` (changed from `--workers 2`). Rationale:
+V1 ships with `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1` and **one Railway replica**. Each replica is one OS process; concurrency is async-only within the process; the DBOS Queue caps concurrent workflows at 5 (§6.7).
 
-- DBOS recovery in a multi-process deployment requires explicit `executor_id` design; without it, two processes both `DBOS.launch()`-ing against the same Postgres can compete for in-progress workflow resumption.
-- Our HTTP concurrency need is modest (~100-1000 approvals/day per the volume target in checkpoint `phase-1.5-rethink-decided-dbos` D2). A single Uvicorn worker handles that with async concurrency only.
-- If FastAPI request throughput becomes a bottleneck independently of the workflow, we scale horizontally with Railway replicas and assign distinct `executor_id`s. That design is documented as a Phase 2 scale concern in §15.
+Rationale (decided 2026-05-15 by user; full record in `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`):
 
-**FastAPI lifespan integration:** `DBOS.launch_async()` is called from the FastAPI lifespan handler. Each Uvicorn worker process (V1: only one) calls launch independently.
+- **Cutting-edge 2026 pattern for DBOS deployment is horizontal scaling via container replicas, NOT multi-worker Uvicorn within one container.** Each replica is its own process with its own executor identity, its own lifecycle, and its own crash isolation.
+- **Phase 1.5 traffic (100-1000 approvals/day, capped at 5 concurrent workflows) is well below what one replica can handle.** Theoretical throughput at 5 concurrent workflows × ~1 workflow/minute = 7,200/day — 7x our upper-bound traffic estimate. Multi-replica gains nothing for Phase 1.5 capacity.
+- **The architecture stays multi-replica-ready** via `executor_id = os.environ.get("RAILWAY_REPLICA_ID")` in `DBOS.DBOSConfig`. Railway populates `RAILWAY_REPLICA_ID` automatically; in production each replica gets a distinct stable ID. Locally it's None (DBOS picks a default). Scaling from 1 → N replicas later is: bump Railway's replica count + ship the orphan-detector (estimated half- to one-day of work; deferred to Phase 2 scale work per scaling-decisions spec).
+
+**FastAPI lifespan integration:** `DBOS.launch_async()` is called from the FastAPI lifespan handler. Each Uvicorn worker process (V1: one) calls launch independently. With `executor_id` baked in, multiple replicas in the future each launch their own DBOS instance correctly without contention.
+
+**What V1 does NOT include:** the orphan-workflow detector. See §3.5 for why and `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md` for the design sketch + Phase-2-trigger rules.
 
 ### 4.4 Streaming UX (the "watch the AI reason" affordance)
 
@@ -423,7 +431,12 @@ The client polls a status endpoint (`GET /queue/{id}` returns the current row in
   _CONFIG = DBOSConfig(
       name="live-transcription-fastapi",
       system_database_url=os.environ["DBOS_SYSTEM_DATABASE_URL"],
-      # executor_id intentionally unset — V1 is single-instance.
+      # executor_id derives from RAILWAY_REPLICA_ID in production. None locally
+      # (DBOS picks a default). This keeps V1's single-replica deploy correct
+      # AND makes the deploy multi-replica-ready without code changes — bumping
+      # Railway's replica count is the entire "scale out" change (plus the
+      # orphan-detector, see docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md).
+      executor_id=os.environ.get("RAILWAY_REPLICA_ID"),
   )
 
   @asynccontextmanager
@@ -807,6 +820,8 @@ Both migrations are tracked via the existing schema-ownership process (`referenc
 
 - `DBOS_SYSTEM_DATABASE_URL` env var — direct (non-pooler) Neon connection for DBOS's system database. Set in Railway BEFORE M1 deploy.
 - `--workers 1` change in the start command (from `--workers 2`). Set in Railway BEFORE M1 deploy.
+- `RAILWAY_REPLICA_ID` is provided automatically by Railway for each replica; no action needed. The DBOS config reads it via `os.environ.get("RAILWAY_REPLICA_ID")`. V1 runs **one replica**; the env var still gets set, and DBOS's executor identity is stable for that replica.
+- Replica count = 1 in V1. Increasing this is gated on shipping the orphan-detector first; see `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`.
 - DBOS admin port (default 3001) is NOT exposed externally; either bind to `127.0.0.1` or disable via DBOS config.
 
 ### 10.7 Dependency manifest
@@ -821,15 +836,22 @@ This repo uses `requirements.txt` (NOT `pyproject.toml`). Adding `dbos-transact-
 
 - Provision `DBOS_SYSTEM_DATABASE_URL` env var in Railway (direct Neon connection).
 - Change Railway start command to `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1`.
-- Verify both via Railway dashboard. No application change.
+- Confirm Railway replica count is 1 (the default; no change usually needed but verify in the dashboard).
+- Confirm `RAILWAY_REPLICA_ID` is being injected automatically into the runtime env (Railway documents this; spot-check via `echo $RAILWAY_REPLICA_ID` in the deploy logs after the next non-DBOS deploy).
+- Verify all of the above via Railway dashboard. No application change.
 
 ### Milestone 1 — Substrate install (1 PR)
 
 - Add `dbos-transact-py` to `requirements.txt` with a pinned version.
-- Add `services/dbos_runtime.py` with the `DBOS` singleton + FastAPI lifespan.
+- Add `services/dbos_runtime.py` with the `DBOS` singleton + FastAPI lifespan + `executor_id=os.environ.get("RAILWAY_REPLICA_ID")` (the multi-replica-ready config line).
 - Wire the lifespan into `main.py`. FastAPI boots with DBOS launched; no workflows defined.
 - Production deploy is safe (no behavior change).
-- Acceptance: `uvicorn` boots locally with no errors; `dbos.workflow_status` table exists in the Neon test branch; live deploy shows DBOS schema created in production Neon; `--workers 1` start command is in effect.
+- Acceptance:
+  - `uvicorn` boots locally with no errors.
+  - `dbos.workflow_status` table exists in the Neon test branch.
+  - Live deploy shows DBOS schema created in production Neon.
+  - `--workers 1` start command is in effect.
+  - Production Railway logs show DBOS launched with a non-null `executor_id` matching `RAILWAY_REPLICA_ID` (grep deploy logs for the DBOS launch banner).
 
 ### Milestone 2 — Prisma migrations (cross-repo PR in eq-frontend)
 
@@ -892,10 +914,14 @@ The "true rollback" (back to polling worker) is intentionally NOT supported — 
 ### Milestone 0
 - [ ] `DBOS_SYSTEM_DATABASE_URL` set in Railway with a direct Neon connection.
 - [ ] Railway start command is `--workers 1`.
+- [ ] Railway replica count is 1.
+- [ ] `RAILWAY_REPLICA_ID` confirmed to be injected automatically (visible in a deploy-log shell or via runtime env probe).
 
 ### Milestone 1
 - [ ] `dbos-transact-py` pinned in `requirements.txt`.
+- [ ] `services/dbos_runtime.py` reads `executor_id` from `RAILWAY_REPLICA_ID`.
 - [ ] FastAPI boots locally + in Railway production with `DBOS.launch_async()` succeeding.
+- [ ] Production Railway logs show DBOS launched with a non-null `executor_id` matching `RAILWAY_REPLICA_ID`.
 - [ ] `dbos.workflow_status` (and friends) visible in production Neon.
 - [ ] Existing 286-test suite still passes.
 
@@ -950,7 +976,7 @@ Items this plan does NOT decide; the executing session resolves and records:
 3. **Workflow-side AccountProfile validation.** Until §10.1 ships, `AccountProfile` is observed-not-declared. The contract-pinning test is the load-bearing guard; any agent-side change to the response fails it loudly.
 4. **DBOS admin port exposure.** Bound to `127.0.0.1` or disabled. Executing session picks; records in M1.
 5. **DBOS Queues concurrency cap.** §6.7 picks `concurrency=5`. Executing session validates against observed traffic and tunes if needed.
-6. **Multi-replica future plan.** Out of Phase 1.5 scope. When request throughput drives a scale-out, the executing session at that time designs `executor_id` allocation and recovery handoff.
+6. **Multi-replica scale-out** — DESIGN LOCKED in `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`. Per-replica `executor_id` is wired in M1 (multi-replica-ready). The orphan-detector that closes the loop on permanent replica death is deferred to Phase 2; the scaling-decisions spec records the exact trigger conditions that would pull it forward.
 7. **`tasks/lessons.md` Phase 2 `validation_status` schema-debt migration** (per design doc Section 7.4) — not Phase 1.5 scope; flagged for Phase 2 planning.
 
 ---
@@ -1004,6 +1030,20 @@ This document is the load-bearing artifact of session 2026-05-15. The executing 
 ---
 
 ## 20. Revision history
+
+### v3 — 2026-05-15 (post-user strategy decision on multi-replica scaling)
+
+User-driven update after surfacing the `--workers 1` versus `--workers 2` trade-off explicitly. Decision: ship V1 with one Railway replica running `uvicorn --workers 1`, AND make the deploy multi-replica-ready by configuration via `executor_id=os.environ.get("RAILWAY_REPLICA_ID")` in `DBOS.DBOSConfig`. Defer the orphan-workflow detector to Phase 2 scale work. Full decision record + Phase-2-trigger rules in `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`.
+
+Sections updated:
+- §3.5 — substrate self-check now describes the executor_id pattern + orphan-detector deferral + the link to the scaling-decisions spec.
+- §4.3 — single-replica section renamed and expanded to "single Railway replica, single Uvicorn worker — multi-replica-ready," with the cutting-edge-pattern rationale + scaling-decisions cross-reference.
+- §5.4 — `services/dbos_runtime.py` code snippet now includes `executor_id=os.environ.get("RAILWAY_REPLICA_ID")`.
+- §10.6 — Railway operational section calls out `RAILWAY_REPLICA_ID` + replica count = 1 + the scaling-decisions gate before increasing replica count.
+- §11 M0 — adds confirmation steps for replica count + `RAILWAY_REPLICA_ID` injection.
+- §11 M1 — adds the executor_id config line as part of M1's deliverable + the production-log verification step.
+- §13 — acceptance criteria for M0 + M1 extended for the multi-replica-ready posture.
+- §15 — item 6 (multi-replica) marked DESIGN LOCKED, points at the scaling-decisions spec.
 
 ### v2 — 2026-05-15 (post-Codex consult)
 
