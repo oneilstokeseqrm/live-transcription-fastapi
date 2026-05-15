@@ -1,19 +1,31 @@
-"""Atomic materialization for queue approval / mapping.
+"""Atomic materialization for queue approval / mapping (Phase 1.5 M3).
 
 Runs in a single Postgres transaction:
 1. INSERT contacts (one per distinct signal email) with the resolved account_id.
 2. INSERT interaction_contact_links for every signal that has interaction_id.
 3. UPDATE queue entry to status='mapped'.
-4. INSERT into account_provisioning_outbox (durable event log).
 
-Caller is responsible for opening the transaction and calling
-session.commit() / session.rollback().
+Moved from ``workers/materialization.py`` in M3. Two M3-required changes
+relative to the prior version:
+
+- The ``INSERT_OUTBOX_SQL`` write is REMOVED. ``account_provisioning_outbox``
+  is dropped post-M3 (M3.5) — DBOS ``workflow_status`` is the observability
+  surface going forward.
+- The in-memory ``linked_pairs`` set is REMOVED. The link INSERT uses
+  ``ON CONFLICT (interaction_id, contact_id) DO NOTHING`` against the
+  ``interaction_contact_links_interaction_id_contact_id_key`` UNIQUE INDEX
+  added by M2 — SQL-level dedup is the only correct replay-safety under
+  DBOS step retries.
+
+Caller (the workflow step OR the inline ``/map`` path) is responsible for
+opening the transaction and calling session.commit() / session.rollback().
 """
 
-import json
 import uuid
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from services.account_provisioning.types import MaterializationResult
 
 
 SELECT_SIGNALS_SQL = text("""
@@ -75,22 +87,23 @@ UPSERT_PLACEHOLDER_SUMMARY_SQL = text("""
 # this race-safe: if the summaries-writer service inserts a row between
 # our intent to insert and our actual write, the conflict path fires a
 # no-op UPDATE (preserving the existing updated_at) and RETURNING gives
-# us the existing summary_id. Eliminates the SELECT-then-INSERT race that
-# would otherwise abort the per-entry transaction.
+# us the existing summary_id.
 
 
 INSERT_LINK_SQL = text("""
     INSERT INTO interaction_contact_links (link_id, interaction_id, contact_id)
     VALUES (gen_random_uuid(), :summary_id, :contact_id)
+    ON CONFLICT (interaction_id, contact_id) DO NOTHING
 """)
-# Link strategy: matches services/intelligence_service.py:_persist_contact_links.
-# Each materialize call creates at most one placeholder interaction_summaries
-# row per raw_interaction_id (lazily, cached in `summary_id_by_raw_id`). All
-# contacts for that interaction link to the same placeholder summary, so
-# (summary_id, contact_id) pairs are unique within one materialize call.
-# The summaries-writer service may later create additional rows for the same
-# raw_interaction_id (no unique constraint on interaction_id); that is
-# expected per the existing pattern.
+# Phase 1.5 M2 added UNIQUE INDEX (interaction_id, contact_id), making this
+# INSERT replay-safe at the SQL layer. Previously the in-memory linked_pairs
+# set provided dedup within a single call; that was replay-broken across
+# DBOS step retries (each retry starts with a fresh set). ON CONFLICT
+# DO NOTHING is the canonical idempotency mechanism.
+#
+# Note: the column literally named ``interaction_id`` on this table stores
+# ``summary_id`` — Prisma naming artifact, documented in tasks/lessons.md.
+# We bind ``:summary_id`` to it for that reason.
 
 
 UPDATE_QUEUE_SQL = text("""
@@ -100,16 +113,6 @@ UPDATE_QUEUE_SQL = text("""
         mapped_at = NOW(),
         updated_at = NOW()
     WHERE id = :queue_id
-""")
-
-
-INSERT_OUTBOX_SQL = text("""
-    INSERT INTO account_provisioning_outbox
-        (id, tenant_id, queue_id, event_type, account_id, payload_json, created_at)
-    VALUES
-        (gen_random_uuid(), :tenant_id, :queue_id, :event_type, :account_id,
-         :payload_json::jsonb, NOW())
-    RETURNING id::text
 """)
 
 
@@ -130,7 +133,7 @@ async def materialize_account_approval(
     queue_id: str,
     account_id: str,
     event_type: str,  # "account_created" | "account_mapped"
-) -> None:
+) -> MaterializationResult:
     """Materialize all signals for a queue entry.
 
     IMPORTANT: Caller MUST open a transaction before calling this function and
@@ -138,11 +141,22 @@ async def materialize_account_approval(
     commit. If called outside a transaction, each statement autocommits and the
     atomic guarantee is lost.
 
+    The DBOS workflow step (M3) and the inline ``/map`` route both call this
+    function; both wrap it in ``async with session.begin():``. The workflow's
+    Step 6 (emit) consumes the returned ``MaterializationResult`` to fan out
+    per-interaction EnvelopeV1 events; ``/map`` ignores the return.
+
     Raises ValueError if no active signals exist for the queue_id — a queue
     entry being materialized with zero signals is architecturally wrong (signals
-    are what materialize into contacts) and would produce a malformed outbox
-    row with contact_ids: []. Fail loud so the worker logs + retries.
+    are what materialize into contacts) and would produce an empty result. Fail
+    loud so the caller logs + the workflow surfaces.
     """
+    # event_type is retained for signature parity with the prior worker call
+    # site; with the outbox removed, the workflow records lifecycle in
+    # dbos.workflow_status instead, and /map's local audit lives in the row's
+    # mapped_at + resolved_account_id stamps.
+    del event_type
+
     signals = (await session.execute(SELECT_SIGNALS_SQL, {"queue_id": queue_id})).all()
 
     if not signals:
@@ -155,10 +169,10 @@ async def materialize_account_approval(
     interaction_ids: list[str] = []
     # Lazy cache: at most one placeholder interaction_summaries row per
     # raw_interaction_id, created on first reference. All contacts for that
-    # interaction link to the same summary_id, so (summary_id, contact_id)
-    # pairs are unique within this materialize call (no link duplication).
+    # interaction link to the same summary_id; the link INSERT uses
+    # ON CONFLICT DO NOTHING against the (interaction_id, contact_id) unique
+    # index, so re-execution under DBOS replay is a no-op.
     summary_id_by_raw_id: dict[str, str] = {}
-    linked_pairs: set[tuple[str, str]] = set()
 
     for s in signals:
         first, last = _split_name(s.contact_display_name)
@@ -181,8 +195,8 @@ async def materialize_account_approval(
                 f"Contact {s.contact_email!r} already belongs to account "
                 f"{returned_account_id!r}; cannot materialize against account "
                 f"{account_id!r} for queue_id={queue_id!r}. Cross-account "
-                f"contact reassignment is Phase 3 scope; the worker fails "
-                f"loud so the operator can investigate."
+                f"contact reassignment is Phase 3 scope; materialization "
+                f"fails loud so the operator can investigate."
             )
         contact_ids.append(contact_id)
 
@@ -218,13 +232,10 @@ async def materialize_account_approval(
                 summary_id = result.scalar_one()
                 summary_id_by_raw_id[raw_id] = summary_id
 
-            pair = (summary_id, contact_id)
-            if pair not in linked_pairs:
-                await session.execute(
-                    INSERT_LINK_SQL,
-                    {"summary_id": summary_id, "contact_id": contact_id},
-                )
-                linked_pairs.add(pair)
+            await session.execute(
+                INSERT_LINK_SQL,
+                {"summary_id": summary_id, "contact_id": contact_id},
+            )
             interaction_ids.append(raw_id)
 
     await session.execute(
@@ -232,20 +243,12 @@ async def materialize_account_approval(
         {"queue_id": queue_id, "account_id": account_id},
     )
 
-    payload = {
-        "account_id": account_id,
-        "tenant_id": tenant_id,
-        "queue_id": queue_id,
-        "contact_ids": list(dict.fromkeys(contact_ids)),
-        "interaction_ids": list(dict.fromkeys(interaction_ids)),
-    }
-    await session.execute(
-        INSERT_OUTBOX_SQL,
-        {
-            "tenant_id": tenant_id,
-            "queue_id": queue_id,
-            "event_type": event_type,
-            "account_id": account_id,
-            "payload_json": json.dumps(payload),
-        },
+    # Dedupe via dict.fromkeys (preserves order; one contact per email,
+    # one interaction per raw_id, even if multiple signals share them).
+    return MaterializationResult(
+        queue_id=queue_id,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        contact_ids=list(dict.fromkeys(contact_ids)),
+        interaction_ids=list(dict.fromkeys(interaction_ids)),
     )

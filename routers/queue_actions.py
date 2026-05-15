@@ -55,7 +55,7 @@ from sqlalchemy import text
 from services.database import get_async_session
 from services.queue_authorization import can_act_on_queue_entry
 from utils.context_utils import get_auth_context_polling
-from workers.materialization import materialize_account_approval
+from services.account_provisioning.materialization import materialize_account_approval
 
 
 logger = logging.getLogger(__name__)
