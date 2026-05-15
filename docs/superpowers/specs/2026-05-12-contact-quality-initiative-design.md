@@ -1,7 +1,7 @@
 # Contact Quality and Account-Anchoring Initiative — Design
 
-**Date:** 2026-05-12 (revised 2026-05-13)
-**Status:** **Design approved** — revised per Codex review on 2026-05-13. All 5 CRITICAL, 7 IMPORTANT, and 3 NIT findings from `2026-05-12-contact-quality-initiative-codex-review.md` are integrated. Implementation plan to follow via `superpowers:writing-plans` for Phase 1 + Phase 1.5 scope.
+**Date:** 2026-05-12 (revised 2026-05-13; durability machinery re-revised 2026-05-15 to reflect DBOS substrate)
+**Status:** **Design approved** — revised per Codex review on 2026-05-13. All 5 CRITICAL, 7 IMPORTANT, and 3 NIT findings from `2026-05-12-contact-quality-initiative-codex-review.md` are integrated. **2026-05-15 update:** Phase 1.5's durability machinery (Sections 7.2 + 8.5) re-revised to reflect the DBOS substrate decision from the architecture rethink (see `docs/superpowers/specs/2026-05-15-async-orchestration-rethink-brief.md` + checkpoint `phase-1.5-rethink-decided-dbos`). Implementation plan: `docs/superpowers/plans/2026-05-15-async-orchestration-dbos.md` (supersedes the Phase 1.5 main scope of `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md`).
 **Phase 1 scope decision (2026-05-13):** Option A locked — Phase 1 stops creating unknown-domain contacts entirely. The hard rule on account anchoring is enforceable from Phase 1 ship. See Section 7.1 for the three-state branching contract.
 **Owner repos affected:** live-transcription-fastapi, eq-email-pipeline, eq-structured-graph-core, action-item-graph, eq-frontend, eq-agent-action-core
 **Primary reference doc:** `docs/contacts-architecture.md` (current-state architecture)
@@ -13,9 +13,9 @@
 
 This initiative imposes data-quality discipline on the contact and account layer of our AI-native customer intelligence platform. It enforces two hard rules (no contact or interaction without an account anchor), introduces two soft-requirement mechanisms (an identity state machine and progressive enrichment via async worker), and operationalizes the rules through a shared approval queue that spans both the email and transcript ingestion pipelines. The initiative leverages existing infrastructure where possible — most notably the `eq-agent-action-core` enrichment pipeline that already creates AI-researched accounts in production for the user's own org during onboarding.
 
-The work is structured as four phases. **Phase 1** tightens the account-anchoring contract end-to-end: every ingestion path either resolves `account_id` at the request boundary or rejects the request, per-attendee domain resolution replaces the current uniform-anchor-application behavior, unknown business domains are captured in the approval queue, and the schema/types/signatures across the codebase converge on `account_id` being required. **Phase 1.5** builds the worker that processes queue entries, the outbox-backed durability machinery that keeps Postgres and Neo4j in sync, the production queue UI, and the schema enforcement that makes hard rule 1 a database-level invariant. After Phase 1.5 ships and is validated in production, the project hits an explicit **stopping point** for comprehensive re-planning before any commitment to **Phase 2** (identity state machine and progressive enrichment) or **Phase 3** (advanced policies: conflict resolution, multi-account history, fuzzy matching). Phase 2 and 3 are documented in this design for architectural coherence and future planning, but are not committed scope.
+The work is structured as four phases. **Phase 1** tightens the account-anchoring contract end-to-end: every ingestion path either resolves `account_id` at the request boundary or rejects the request, per-attendee domain resolution replaces the current uniform-anchor-application behavior, unknown business domains are captured in the approval queue, and the schema/types/signatures across the codebase converge on `account_id` being required. **Phase 1.5** processes those queue entries asynchronously via a DBOS-orchestrated workflow (decided 2026-05-15 after an architecture rethink — see Section 7.2): when an approval comes in, the workflow calls `eq-agent-action-core` for company research, materializes the account + contacts atomically, and emits `EnvelopeV1.*` events to EventBridge for downstream consumers. DBOS's Postgres-as-durability log (workflow + step checkpoints in the `dbos.*` schema on our existing Neon database) replaces the polling-worker + outbox-publisher pattern, eliminating the separate worker container, the RabbitMQ-or-equivalent message bus, and the application-side outbox table. After Phase 1.5 ships and is validated in production, the project hits an explicit **stopping point** for comprehensive re-planning before any commitment to **Phase 2** (identity state machine and progressive enrichment) or **Phase 3** (advanced policies: conflict resolution, multi-account history, fuzzy matching). Phase 2 and 3 are documented for architectural coherence; they will be built on the same DBOS substrate.
 
-The committed scope (Phase 1 + 1.5) closes out the hard requirement on account anchoring end-to-end, fixes known correctness bugs in the transcript pipeline (including the silent-misattribution-to-anchor behavior), operationalizes the queue-based approval workflow, and lands the durability machinery needed for AI-native systems where Postgres and Neo4j must converge under failures. Throughout, the design is grounded in emerging AI-native patterns (GraphRAG-style account-centric graphs, agentic identity resolution, outbox/saga durability) rather than legacy CRM patterns.
+The committed scope (Phase 1 + 1.5) closes out the hard requirement on account anchoring end-to-end, fixes known correctness bugs in the transcript pipeline (including the silent-misattribution-to-anchor behavior), operationalizes the queue-based approval workflow, and lands the durability machinery needed for AI-native systems where Postgres and Neo4j must converge under failures. Throughout, the design is grounded in emerging AI-native patterns (GraphRAG-style account-centric graphs, agentic identity resolution, durable execution as the runtime for AI workflows) rather than legacy CRM patterns.
 
 ## 2. Background
 
@@ -442,30 +442,49 @@ When per-attendee domain resolution runs against an attendee's email domain, the
 
 **What Phase 1 does NOT yet enforce:** Hard rule 1 is enforced (no contact without account anchor). Hard rule 2 is enforced (no interaction without account anchor). What Phase 1 does NOT include is the worker that processes queue entries — that's Phase 1.5. Between Phase 1 ship and Phase 1.5 ship, queue entries accumulate but are not processed; unknown-domain attendees are recorded in the queue but not visible as contacts. This is acceptable because internal testing tenants are the only consumers during the gap, and the gap is intentional — it forces queue UX to be designed alongside the worker rather than retrofitted.
 
-### 7.2 Phase 1.5 — Worker, outbox, and queue UI (committed)
+### 7.2 Phase 1.5 — Async orchestration on DBOS (committed; durability machinery revised 2026-05-15)
 
-**Outcome (in product terms):** When the user opens the approval queue, they see entries from both email and transcript pipelines, scoped to their ownership. They can Approve, Map to an existing account, or Ignore. On Approve, the AI agent does company research and creates the account in seconds; all queued contacts for that domain materialize atomically. On Map, contacts materialize against the chosen pre-existing account. On Ignore, the entry is archived but re-openable by new signals. The participation graph stays complete; the hard rule on account anchoring is operationally enforced end-to-end.
+> **Revision note (2026-05-15):** Section 7.2 originally described a polling-worker + outbox-publisher + separate-publisher-process architecture. After Phase 1 silently regressed for 24h (see `tasks/lessons.md` "Four systemic quality gaps") and the downstream agent-contract gap was discovered (see "Stop and question dated architecture when integration reveals it"), the user paused Phase 1.5 deployment for an architecture rethink. The rethink completed 2026-05-15 with a substrate decision (DBOS) recorded across `docs/superpowers/specs/2026-05-15-async-orchestration-rethink-brief.md`, the durable-execution landscape research, and the checkpoint `phase-1.5-rethink-decided-dbos`. This section now reflects the DBOS architecture; the implementation plan lives at `docs/superpowers/plans/2026-05-15-async-orchestration-dbos.md`.
+
+**Outcome (in product terms — unchanged from the original 2026-05-12 design):** When the user opens the approval queue, they see entries from both email and transcript pipelines, scoped to their ownership. They can Approve, Map to an existing account, or Ignore. On Approve, the AI agent does company research and creates the account in seconds; all queued contacts for that domain materialize atomically. On Map, contacts materialize against the chosen pre-existing account. On Ignore, the entry is archived but re-openable by new signals. The participation graph stays complete; the hard rule on account anchoring is operationally enforced end-to-end. The user watches the workflow's progress with streaming UX feedback (the "watch the AI reason" affordance).
+
+**Substrate (decided 2026-05-15):** **DBOS** (Apache 2.0 / MIT, library-only durable execution; Postgres as the durability layer). Rationale, eliminations, and the Hatchet → DBOS pivot are in the checkpoint and rethink brief; this section does not re-litigate the decision. The relevant operational facts:
+
+- DBOS is a library imported into the same FastAPI process. No new container, no new service, no RabbitMQ, no Helm, no separate worker daemon.
+- Workflow + step state is checkpointed to the existing Neon Postgres database under a `dbos.*` schema (created automatically by DBOS on first launch).
+- Workflow-level idempotency is provided by application-controlled IDs via the `SetWorkflowID` context manager; per-step retry semantics are configured explicitly per step.
+- DBOS provides the Phase 2/3 primitives we'll need (durable sleep, queues, HITL via send/recv/set_event/get_event) without re-architecting.
 
 **Technical scope:**
 
-- **Schema migration on `accounts`:** add `state` column with `active | archived` enum, NOT NULL, default `active`.
-- **Schema migration on `contacts`:** enforce `account_id` NOT NULL. Because Phase 1 already prevents orphan creation under Option A, this constraint is structurally safe — but the migration is still gated by a test-data wipe to clear any residual NULL rows that pre-date the project.
-- **Schema migration on `raw_interactions`:** add NOT NULL to the `account_id` column added in Phase 1. Same wipe gate.
-- **Create `account_provisioning_outbox` table** (Section 5.4 schema) — the durable event log that prevents Postgres/Neo4j divergence.
-- **Build the worker** (location TBD during plan-writing — likely a scheduled job in `eq-email-pipeline` or as a new lightweight service): polls `status='approved'` entries, takes advisory lock, transitions to `status='creating'`, calls `eq-agent-action-core POST /api/enrich`, performs the atomic materialization transaction (Section 5.6), updates queue status to `mapped`, writes outbox row. **Worker is replay-safe:** see idempotency contracts in Section 5.4.
-- **Build the outbox publisher** (worker subprocess or scheduled task): reads unpublished outbox rows, publishes to EventBridge, marks rows published. Retries on publish failure.
-- **Extend `eq-structured-graph-core`** to consume `AccountCreated` events and MERGE Neo4j Account nodes plus `WORKS_FOR`, `BELONGS_TO`, `ATTENDED`, `SENT`, `RECEIVED` edges for the backfilled contacts and interactions. Consumer is idempotent under duplicate delivery by virtue of MERGE-everywhere on canonical IDs.
-- **Build the production queue UI** (the existing `/dashboard/organization/email-pipeline` route is reference-only; the production surface is designed as part of the overall product UX, with per-owner scoping, source-type display, signal evidence breakdown, action context, and Approve/Map/Ignore actions).
-- **Implement the expiry sweep** (daily scheduled job): mark stale entries `archived` per Section 5.5 policy.
-- **Implement re-open trigger** in both ingestion pipelines: when a new signal arrives on an archived queue entry, transition it back to `pending` per Section 5.9.
-- **Authorization helper:** `can_act_on_queue_entry(user_id, queue_entry)` — owner-only V1, future-proofed for tier-based extension. Honors the `tenant_review` state transition.
-- **eq-agent-action-core integration acceptance tests** (closes Codex finding #11): blocking external dependency tests that verify (1) idempotent repeated calls with same `worker_attempt_id`, (2) timeout behavior and worker retry logic, (3) partial-failure contract (agent succeeded but worker crashed before commit — outbox replay must converge), (4) response schema stability under agent updates, (5) server-to-server authentication and permissioning. Interactive use is already proven via onboarding; backend-worker invocation is what these tests cover.
+- **Schema migration on `accounts`:** add `state` column with `active | archived` enum, NOT NULL, default `active`. (Unchanged from 2026-05-13 design; already applied to Neon eq-dev.)
+- **Schema migration on `contacts`:** enforce `account_id` NOT NULL. (Already applied.)
+- **Schema migration on `raw_interactions`:** NOT NULL on `account_id`. (Already applied.)
+- **NEW (2026-05-15) — schema migration on `interaction_contact_links`:** add UNIQUE INDEX on `(interaction_id, contact_id)`. This replaces the in-memory dedup that the original worker design depended on with SQL-layer replay safety, so the DBOS workflow's materialization step can use `ON CONFLICT DO NOTHING` and survive deterministic step replay. Tracked as a coordinated Prisma migration in `eq-frontend`.
+- **NEW (2026-05-15) — drop `account_provisioning_outbox` table.** The original design's outbox + polling publisher pattern is replaced by DBOS's workflow log. Operational observability migrates to `dbos.workflow_status` and `dbos.operation_outputs`. The table is dropped via a coordinated Prisma migration in `eq-frontend`.
+- **Build the DBOS workflow** (`services/account_provisioning/workflow.py` in this repo): one `@DBOS.workflow()` function with seven `@DBOS.step` substeps:
+  1. Read-only revalidation of queue state (idempotent guard against ignored / already-mapped rows).
+  2. SQL transition `pending_account_mappings.status` `'approved' → 'creating'` (idempotent via status filter; the route reserves `'approved'` synchronously before the workflow starts, preserving the HTTP-layer idempotency contract from PR #13).
+  3. Call `eq-agent-action-core POST /api/enrich?stream=false` → returns AccountProfile. Retries are explicit (`retries_allowed=True, max_attempts=5, backoff_rate=2.0`). The agent's returned `run_id` is cached via `DBOS.set_event`, so on workflow replay after a crash the step can call `GET /api/enrich/{run_id}` instead of re-running the expensive research (preserves correctness; minimizes duplicate spend; depends on cross-repo coordination — see §10.1 of the plan doc).
+  4. Resolve or create account, keyed on `account_domains.(tenant_id, domain)` — the canonical idempotency surface (Phase 1 invariant). If the domain already binds an account, use it; otherwise INSERT `accounts` + INSERT `account_domains` in one transaction with the unique-key conflict guard.
+  5. Atomic materialization (existing `materialize_account_approval()` logic, moved from `workers/materialization.py` to `services/account_provisioning/materialization.py`): contacts UPSERT, raw_interactions UPSERT, summaries UPSERT, links INSERT with `ON CONFLICT DO NOTHING` on the new unique index, queue status `→ 'mapped'`.
+  6. Emit one `EnvelopeV1.*` event per backfilled interaction to EventBridge. Source `com.yourapp.transcription`, DetailType from a CLOSED lookup table (`{transcript, meeting, note, email}` → `EnvelopeV1.<type>`) that fails loud on unknown types. Body includes `extras.contacts` per the downstream consumer change briefs (`tasks/downstream/action-item-graph.md`, `tasks/downstream/eq-structured-graph-core.md`). At-least-once delivery; consumer-side MERGE-on-canonical-IDs is the dedup mechanism. Retries explicit on transient EventBridge failures.
+  7. (No outbox audit row — the original design's outbox is dropped; observability lives in `dbos.workflow_status`.)
+- **Refactor `routers/queue_actions.py` `/approve`** to: (a) reserve the row synchronously (`status='approved' + approval_attempt_id` in one UPDATE — preserves Phase 1 invariants 25-30), (b) start the workflow via `SetWorkflowID(f"queue-{queue_id}:approval-{approval_attempt_id}")`. Reopen produces a new attempt_id → new workflow ID; no collision with prior approvals' DBOS state. `/map` and `/ignore` are unchanged.
+- **Delete** the polling worker, outbox publisher, advisory-lock helper, and worker entrypoint (`workers/__main__.py`, `workers/account_provisioning_worker.py`, `workers/outbox_publisher.py`, `workers/advisory_lock.py`). The `workers/` package is effectively retired; only the moved `materialization.py` survives, relocated to `services/account_provisioning/`.
+- **DBOS Queue** with concurrency cap (V1: 5) bounds simultaneous workflow execution against HTTP request handling.
+- **Extend `eq-structured-graph-core`** to consume the emitted `EnvelopeV1.*` events for backfilled interactions and MERGE Neo4j `Account` + `Contact` + edges. The consumer's existing pipeline already MERGE-on-canonical-IDs; the change is to read `extras.contacts` metadata to populate Contact node properties (per `tasks/downstream/eq-structured-graph-core.md`).
+- **Build the production queue UI** (the existing `/dashboard/organization/email-pipeline` route is reference-only; the production surface is designed as part of the overall product UX, with per-owner scoping, source-type display, signal evidence breakdown, action context, and Approve/Map/Ignore actions). Polling on `GET /queue/{id}` is the V1 status mechanism; an SSE endpoint for streaming agent-reasoning events is a follow-up refinement.
+- **Implement the expiry sweep** (daily scheduled workflow via DBOS queues with delayed enqueue; `@DBOS.scheduled` is flagged for Python deprecation per current docs): mark stale entries `archived` per Section 5.5 policy.
+- **Implement re-open trigger** in both ingestion pipelines: when a new signal arrives on an archived queue entry, transition it back to `pending` per Section 5.9. The TODO in `services/pending_account_mappings.py:55-62` (reset `approval_attempt_id`, `creation_started_at`, `mapped_at`, etc. on reopen) lands as part of this work.
+- **Authorization helper:** `can_act_on_queue_entry(user_id, queue_entry)` — owner-only V1, future-proofed for tier-based extension (unchanged).
+- **eq-agent-action-core integration acceptance tests** (closes Codex finding #11): (1) contract-pinning test that asserts on the live `?stream=false` response shape (the agent's OpenAPI declares response `{}` — the pinning test is the load-bearing contract guard; (2) crash-recovery tests that simulate worker death mid-agent-call and mid-EventBridge-emit and assert DBOS resumes correctly; (3) reopen-path E2E that exercises the distinct-workflow-ID semantics; (4) server-to-server authentication and per-request JWT scoping; (5) consumer Pydantic compatibility for the emitted envelopes via the `scripts/verify_consumer_contracts.py` tool that ships alongside this work.
 
-**Dependencies:** Phase 1 must ship first. The real dependency is not "wire-up provides account_id propagation" — it is that Phase 1 must have removed all orphan-contact code paths and stood up the queue-insertion semantics (closes Codex finding #13). Phase 1.5 builds on that foundation; it does not have to undo Phase 1 behavior.
+**Dependencies:** Phase 1 must ship first (already shipped 2026-05-14; silent regression fixed 2026-05-15 at commit `31f513f`). Two coordinated Prisma migrations (UNIQUE INDEX on `interaction_contact_links`; DROP `account_provisioning_outbox`) must land in `eq-frontend` before the workflow's first production run. Railway operational prep (set `DBOS_SYSTEM_DATABASE_URL` to a direct Neon connection; change start command to `--workers 1`) must precede the M1 deploy.
 
-**Estimated size:** 2-3 weeks of focused work.
+**Estimated size:** ~2 weeks of focused work, across ~5 milestones (substrate install → Prisma migrations → workflow definition + tests → queue route cutover → tooling + checklist updates). Detailed sequencing is in the implementation plan.
 
-**Validation against AI-native thought leadership** (per project principle): before plan-writing for Phase 1.5 starts, run targeted research on current cutting-edge identity-graph and AI-native CRM patterns. Specifically NOT looking at modern CRMs (Attio, etc.) — looking at agentic identity-resolution work, knowledge graph + LLM combinations from frontier labs, recent academic work (FastER, semantic entity resolution successors), Microsoft GraphRAG production patterns, and outbox/saga literature for the durability machinery.
+**Validation against AI-native thought leadership** (per project principle): research was redone 2026-05-15 (`docs/superpowers/research/2026-05-15-durable-execution-landscape.md`); the rethink brief and Codex consult are the audit trail for the DBOS pick.
 
 ### 7.3 Stopping point
 
@@ -575,33 +594,58 @@ Per project principle: codex (consult or review mode) is invoked at design check
 
 Documented in the implementation plan as recurring quality gates.
 
-### 8.5 Schema migration discipline and durability machinery
+### 8.5 Schema migration discipline and durability machinery (revised 2026-05-15)
+
+> **Revision note (2026-05-15):** Section 8.5 originally described an application-level outbox table + polling publisher pattern as the durability mechanism. After the architecture rethink (see Section 7.2 revision note), this responsibility shifts to DBOS's workflow log in the `dbos.*` schema. What was kept: the cross-service idempotency invariant (downstream consumer MERGE-on-canonical-IDs), the test-data wipe simplification, and the cross-repo Prisma schema ownership pattern. What changed: the `account_provisioning_outbox` table is dropped (replaced by `dbos.workflow_status`); the durability invariant is now provided by DBOS rather than an application-level outbox; two new coordinated Prisma migrations are required.
 
 Since all current data is test data and will be wiped, migrations are simpler than typical (no complex backfill or dual-write phases).
 
-- Each schema change is an explicit migration step with documented up/down behavior
-- Migration runs are documented in the implementation plan
-- Coordinated through `eq-frontend/schema.prisma` per existing ownership patterns (per `reference_prisma_schema_ownership.md` memory)
-- Memory files updated after migrations land
+- Each schema change is an explicit migration step with documented up/down behavior.
+- Migration runs are documented in the implementation plan.
+- Coordinated through `eq-frontend/schema.prisma` per existing ownership patterns (per `reference_prisma_schema_ownership.md` memory).
+- Memory files updated after migrations land.
 
-**New durability-related schema in this initiative (consolidated):**
+**Schema deltas across the initiative (consolidated, post-2026-05-15 revision):**
 
-- `pending_account_mappings` — column additions (Section 5.2)
-- `pending_account_mapping_signals` — new table (Section 5.2)
-- `account_provisioning_outbox` — new table (Section 5.4); the durable event log that prevents Postgres/Neo4j divergence under failures
-- `accounts.state` — column addition (Section 6)
-- `contacts.account_id` — NOT NULL after test-data wipe (Phase 1.5)
-- `raw_interactions.account_id` — column addition + NOT NULL after test-data wipe (Phase 1 adds column; Phase 1.5 enforces NOT NULL)
+- `pending_account_mappings` — column additions (Section 5.2; shipped in Phase 1).
+- `pending_account_mapping_signals` — new table (Section 5.2; shipped in Phase 1).
+- `accounts.state` — column addition (Section 6; shipped).
+- `contacts.account_id` — NOT NULL after test-data wipe (shipped in Phase 1.5 P2).
+- `raw_interactions.account_id` — NOT NULL after test-data wipe (shipped in Phase 1.5 P2).
+- **NEW (2026-05-15) — `interaction_contact_links` UNIQUE INDEX on `(interaction_id, contact_id)`** — replaces the in-memory dedup the original worker depended on; makes materialization replay-safe at the SQL layer for DBOS step re-execution.
+- **NEW (2026-05-15) — DROP `account_provisioning_outbox` table** — the polling-publisher pattern is replaced by DBOS's workflow log. The table was created during the original Phase 1.5 schema migration but never had its publisher deployed; operational observability migrates to `dbos.workflow_status`.
+- **NEW (2026-05-15) — `dbos.*` schema** — created automatically by DBOS on first `DBOS.launch()`. Tables: `dbos.workflow_status`, `dbos.workflow_inputs`, `dbos.operation_outputs`, `dbos.workflow_events`, etc. Lives outside Prisma's introspection scope (Prisma is scoped to `public`); no Prisma model is required.
 
-**Outbox semantics (the durability invariant):**
+**Durability invariant (the property that must hold across the cutover):**
 
-The `account_provisioning_outbox` is written in the **same transaction** as account materialization and contact backfill (Section 5.4 step 7). The outbox publisher emits to EventBridge after commit and marks rows `published_at`. This means:
+For every approved queue entry, the system must reach a terminal state where: (a) the `accounts` and `account_domains` rows exist for the resolved domain; (b) `contacts`, `raw_interactions`, `interaction_summaries`, `interaction_contact_links` rows are populated for every active signal; (c) `pending_account_mappings.status='mapped'`; (d) the downstream Neo4j graph has Account + Contact + edges merged for the materialized rows. No partial state can persist indefinitely under any reasonable failure mode (process crash, network partition, downstream consumer outage).
 
-- A worker crash after DB commit but before publish leaves an unpublished outbox row → publisher retries → consumer eventually receives the event.
-- A consumer crash after receiving the event but before MERGEing Neo4j is recovered by EventBridge redelivery → idempotent MERGE on canonical IDs converges.
-- Postgres and Neo4j cannot permanently diverge as long as the outbox publisher runs and EventBridge delivers at least once.
+**Pre-2026-05-15 mechanism:** application-level outbox table + polling publisher + EventBridge + consumer MERGE.
 
-This pattern is the standard outbox/saga durability mechanism; the implementation plan must include test cases for the failure-recovery scenarios above.
+**Post-2026-05-15 mechanism (the DBOS architecture):**
+
+The workflow's seven steps are checkpointed individually to `dbos.workflow_status` and `dbos.operation_outputs`. Crash recovery semantics:
+
+- A process crash mid-Step-3 (agent call) leaves the step uncommitted in DBOS state. On restart, DBOS resumes the workflow; the step re-executes against the cached `run_id` event (`DBOS.set_event` / `DBOS.get_event`), reusing the agent's prior research where possible.
+- A crash mid-Step-5 (materialization) leaves the SQL transaction either committed (DBOS step output is recorded) or rolled back (DBOS sees no output). On restart, DBOS re-executes; the step's SQL is idempotent via ON CONFLICT clauses + status filters + the new UNIQUE INDEX on `interaction_contact_links`.
+- A crash mid-Step-6 (EventBridge emit) leaves emissions potentially duplicated (the boto3 call returned, but DBOS hadn't recorded the step output). On restart, DBOS re-executes the step; EventBridge receives the events again. Consumer-side MERGE-on-canonical-IDs collapses duplicates — this is the load-bearing dedup surface.
+- A consumer crash after receiving the event but before MERGEing Neo4j is recovered by EventBridge redelivery + consumer-side MERGE idempotency. Same property as the original design.
+
+**Postgres and Neo4j cannot permanently diverge** as long as DBOS resumes the workflow (it does, on process restart) and the consumer's MERGE is idempotent (it is, by design — Phase 1 invariant).
+
+**Comparison with the original outbox-style design (preserved for audit-trail purposes):**
+
+| Property | Original (outbox + polling publisher) | Revised (DBOS workflow log) |
+|----------|---------------------------------------|------------------------------|
+| Durability layer | Application `account_provisioning_outbox` table | `dbos.workflow_status` + `dbos.operation_outputs` |
+| Replay safety | App-side advisory locks, ON CONFLICT, in-memory link dedup | DBOS step replay with cached outputs + SQL ON CONFLICT + unique index |
+| Failure-window between DB commit and EventBridge publish | Outbox row stays unpublished → publisher retries on next poll | DBOS step retries (explicit `retries_allowed=True` policy) |
+| Cross-service dedup | Consumer MERGE-on-canonical-IDs | Consumer MERGE-on-canonical-IDs (unchanged) |
+| Process model | Separate worker container + separate publisher | Single FastAPI process; workflows run in-process |
+| At-least-once guarantee | Yes (outbox publisher retries) | Yes (DBOS step retries; EventBridge delivery) |
+| Operational complexity | Two long-running processes; advisory locks; per-row publisher state | One process; DBOS state tables in Postgres; no separate publisher |
+
+The implementation plan (`docs/superpowers/plans/2026-05-15-async-orchestration-dbos.md`) includes test cases for each crash-recovery scenario above. The verified-contracts discipline ensures the schema deltas above are probed against the live Neon project before code is written (§7.1 of the plan; §3.1 of the plan's verified-contracts section).
 
 ### 8.6 Rollout discipline
 
