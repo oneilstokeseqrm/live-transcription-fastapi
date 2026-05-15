@@ -1,7 +1,8 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from typing import Dict, Callable, Optional, Any
+from typing import AsyncIterator, Dict, Callable, Optional, Any
 from deepgram import Deepgram
 from dotenv import load_dotenv
 import os
@@ -17,6 +18,7 @@ from services.aws_event_publisher import AWSEventPublisher
 from services.intelligence_service import IntelligenceService
 from services.transcript_enrichment import TranscriptEnrichmentService
 from services.internal_domains import get_tenant_internal_domains
+from services.dbos_runtime import dbos_lifespan
 from models.envelope import EnvelopeV1, ContentModel
 from models.request_context import RequestContext
 from middleware.jwt_auth import verify_internal_jwt, extract_bearer_token, JWTVerificationError
@@ -80,15 +82,23 @@ def validate_aws_credentials():
 validate_environment()
 validate_aws_credentials()
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Compose DBOS launch with existing app startup tasks.
+
+    DBOS owns the account-provisioning workflow's durability layer
+    (Phase 1.5 substrate). ``reap_stuck_jobs`` continues to recover from
+    crashed upload jobs on startup. Both run in sequence: DBOS first so
+    workflows are recoverable before any request lands.
+    """
+    async with dbos_lifespan(app):
+        logger.info("Running startup tasks...")
+        await reap_stuck_jobs()
+        logger.info("Startup tasks completed")
+        yield
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Run startup tasks including stuck job cleanup."""
-    logger.info("Running startup tasks...")
-    await reap_stuck_jobs()
-    logger.info("Startup tasks completed")
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
