@@ -1,150 +1,159 @@
 # Next Session — Start Here
 
-**Project:** Contact Quality and Account-Anchoring Initiative
-**Last session:** 2026-05-15 (Workstream D pre-deploy probe — BLOCKED)
-**Status:** 🛑 **PHASE_1.5_BLOCKED_AGENT_CONTRACT_MISMATCH** — worker code (PR #12) was scaffolded against an imagined eq-agent-action-core contract. Workstream D deployment STOPPED before any Railway changes were made. Architecture decision + code-change PR required before deployment can resume.
-**This session's job:** Decide the architectural path (recommendation: Path A in `tasks/downstream/blocker-agent-contract-mismatch.md`), then execute the code-change PR. After it ships, resume Workstream D (Railway worker deployment) + Workstream E (production E2E worker case).
+**Project:** Contact Quality and Account-Anchoring Initiative — part of a broader AI-native customer intelligence platform.
+**Last session:** 2026-05-15 (architecture rethink decision; no code changes).
+**Status:** 🛑 **PHASE_1.5_ASYNC_ORCHESTRATION_RETHINK_PENDING** — The Phase 1.5 worker's contract mismatch with eq-agent-action-core surfaced a deeper question: the polling-worker + outbox-publisher architecture is a 2018 pattern, not what a cutting-edge 2026 AI-native startup would build. Rather than patch the contract (the previous session's incorrect Path A recommendation), we're rethinking the async orchestration substrate at the right altitude.
+**This session's job:** Run the architecture rethink. **Do NOT write code.** Use `/office-hours` → `/plan-ceo-review` → `/plan-eng-review` → Codex consult → new implementation plan.
 
 ---
 
-## Critical context (READ FIRST)
+## CRITICAL — preserve full project context
 
-1. **The block is purely the worker↔agent contract.** Everything else verified GREEN:
-   - Test tenant exists in Neon eq-dev.
-   - Phase 1.5 schema intact (contacts.account_id NOT NULL, account_provisioning_outbox + all 10 cols, pending_account_mappings + all 8 lifecycle cols).
-   - `/tmp/e2e_phase_1_production.py` (486 lines) present.
-   - FastAPI production endpoint reachable.
-   - Railway projects + service IDs all located.
-   - INTERNAL_JWT_SECRET shared between FastAPI and agent services.
-   - JWT auth scheme verified working against the agent (HS256, iss=eq-frontend, aud=eq-backend).
+The Contact Quality Initiative is **multi-phase, multi-repo, and load-bearing for everything downstream in the AI-native customer intelligence platform**. The Phase 1.5 worker is one piece of a project that already shipped Phase 1 and has Phase 2 + Phase 3 in the pipeline. Decisions made for Phase 1.5 must compound to those phases.
 
-2. **What's wrong:** worker sends `{tenant_id, domain, worker_attempt_id}` to `POST /api/enrich` and expects synchronous `{account_id, domain}`. The agent service requires `{url, effort?}`, returns either SSE stream or AccountProfile after 30–90s blocking, and **never INSERTs into our `accounts` table** — it's a research-only service. The worker's `materialize_account_approval` requires a pre-existing account_id but no agent endpoint creates accounts.
+**Mandatory first read:**
 
-3. **The fix lives entirely in THIS repo.** Path A (recommended): update `services/agent_action_core_client.py` to call the actual contract, and add `INSERT INTO accounts ... ON CONFLICT` in the worker before materialize. No cross-repo work required.
+1. **`docs/superpowers/specs/2026-05-15-initiative-context-snapshot.md`** (~10 min). Standalone entry point for the whole initiative. A new agent should read this and understand the project cold before touching anything else.
 
-4. **The user is a non-developer founder.** Make confident technical decisions; surface only product/strategic decisions. Work without stopping for clarifying questions.
+After reading the snapshot, read in this order:
 
-5. **All prior shipped scope is intact.** PR #10 (Phase 1), PR #11 (Phase 1.5 P2), PR #12 (worker foundation), PR #13 (publisher + queue actions) all still merged. Production E2E 20/20 PASS valid for shipped routes. Only the worker's end-to-end materialization path is broken — the FastAPI service is unaffected.
+2. **This handoff** (~5 min).
+3. **`docs/superpowers/specs/2026-05-15-async-orchestration-rethink-brief.md`** (~10 min) — the canonical scope for this session's work. NEUTRAL framing — does not anchor on any option.
+4. **`docs/superpowers/research/2026-05-15-durable-execution-landscape.md`** (~10 min) — 2026 landscape of orchestration options. Honest about what AI-native startups are picking.
+5. **`tasks/lessons.md`** bottom entries — especially the 2026-05-15 lesson "Probe external service contracts at design time" and the older Codex-spiral discipline lessons.
 
----
-
-## What this session does
-
-### Workstream C (NEW — code-change PR to fix the contract)
-
-Per `tasks/downstream/blocker-agent-contract-mismatch.md`, Path A recommendation:
-
-1. **Read the blocker doc in full** (it has the full evidence, contract details, three options A/B/C analyzed, and a step-by-step execution plan).
-
-2. **Update `services/agent_action_core_client.py`:**
-   - Replace signature: `enrich(domain) -> AccountProfile` (or a typed subset of fields the worker needs).
-   - POST to `/api/enrich?stream=false` with `{url: domain, effort: "medium"}`.
-   - Per-tenant JWT minting in the client (since `tenant_id` is in the JWT claim, not body). JWT expiry: short (~5 min) since minted just-in-time per call.
-   - Constructor takes `internal_jwt_secret: str` instead of `api_key: str`.
-   - Remove `X-Idempotency-Key` header (agent doesn't support it).
-   - Parse AccountProfile response into a typed dataclass with the fields the accounts INSERT will need.
-
-3. **Add account creation in `workers/account_provisioning_worker.py`:**
-   - Before calling `materialize_account_approval`, INSERT into `accounts` table using AccountProfile data.
-   - Use `INSERT ... ON CONFLICT (tenant_id, domain) DO NOTHING RETURNING id` for idempotency under replays + concurrent workers.
-   - On conflict-no-return, SELECT to get the existing account_id.
-   - Pass that account_id to `materialize_account_approval`.
-
-4. **Update `workers/__main__.py`:**
-   - Drop `EQ_AGENT_ACTION_CORE_API_KEY` env var requirement.
-   - Add `INTERNAL_JWT_SECRET` env var requirement (same value as FastAPI service has).
-
-5. **Tests:**
-   - Update / write unit tests for the new client signature.
-   - Unit-test the "INSERT account before materialize" flow.
-   - Regression test: replay safety (same domain twice → one account row, two materializations both succeed).
-   - Test JWT minting per-tenant with the correct claims.
-
-6. **Codex review** on the diff (recurring quality-gate discipline).
-
-7. **Production E2E extension:** add a worker materialization case to `/tmp/e2e_phase_1_production.py` (the case the prior session deferred as Workstream E — now it can ship with this PR).
-
-8. **Ship the PR.** Once merged, Railway auto-deploys the FastAPI service (no harm — it doesn't run the worker).
-
-### Workstream D (after PR ships) — Railway worker deployment
-
-Per `tasks/downstream/railway-phase-1-5-worker.md` 6-step recipe, with TWO env var changes from the original recipe:
-
-- DROP: `EQ_AGENT_ACTION_CORE_API_KEY`
-- ADD: `INTERNAL_JWT_SECRET` (copy value from FastAPI service)
-- KEEP: `EQ_AGENT_ACTION_CORE_URL` = `https://eq-agent-action-core-production.up.railway.app`
-- KEEP: `DATABASE_URL`, `AWS_REGION`, `EVENTBRIDGE_BUS_NAME` (or use default `default`)
-
-Then deploy, verify worker + publisher startup logs, smoke-test with a seeded approved queue entry, watch for materialized account + outbox row + published_at within ~30-100 seconds (longer than original 15s estimate because agent enrichment takes 30–90+ seconds).
-
-### Workstream E — production E2E worker case
-
-If not shipped as part of Workstream C's PR, add it post-deploy. Re-run the full suite expecting 21/21 PASS.
+On-demand / as the work requires:
+- `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` Section 6 (durability machinery design — what problem the old architecture was solving).
+- `docs/superpowers/specs/2026-05-14-dispatch-patterns-research.md` (earlier dispatch research — useful complement to landscape doc).
+- `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` (current implementation plan — needs Phase 1.5 revision after rethink).
+- `tasks/downstream/blocker-agent-contract-mismatch.md` (audit-trail only — Path A tactical fix, superseded by this rethink).
 
 ---
 
-## Repository state (as of 2026-05-15 session end)
+## What this session does — the decision process
 
-- **Main HEAD:** `18d0907 docs(lessons): codify Codex spiral discipline for phasing-conditional bugs` (plus this session's docs commits if shipped)
+**The rethink is not "pick an option." The rethink is "run a real decision process."** Skip steps and we'll end up where we are now.
 
-- **All Phase 1 + Phase 1.5 P2 + Phase 1.5 worker foundation + publisher + queue action code lives in main.** None of it is broken in isolation. The break is only at the worker→agent integration layer.
+### Step 1 — `/office-hours` (product-level)
 
-- **Production state:**
-  - FastAPI Railway service (`59a69f3d-9a24-4041-942a-891c4a81c5fb`) running `uvicorn main:app` in project `inspiring-upliftment` (`847cfa5a-b77c-4fb0-95e4-b20e8773c23e`).
-  - Worker Railway service: **does not exist yet** (blocked).
-  - Production endpoint `https://live-transcription-fastapi-production.up.railway.app` health: ✅ (404 on /healthz, service up).
+Interrogate from first principles. The user is a non-developer founder; office-hours surfaces product intent. Specifically:
 
-- **eq-agent-action-core (in separate Railway project `421e079f-2e46-4c22-83c4-0fe6208e6aff`):**
-  - URL: `https://eq-agent-action-core-production.up.railway.app`
-  - Service ID: `3036ea0f-afc9-4bc4-889d-c98617d81e96`
-  - Auth: HS256 JWT signed with `INTERNAL_JWT_SECRET` (shared value), claims `iss=eq-frontend`, `aud=eq-backend`, `tenant_id` (UUID), `user_id`, `exp`, `iat`.
-  - Endpoints relevant to the worker: `POST /api/enrich?stream=false` body `{url, effort?}` returns AccountProfile.
-  - The agent does NOT write to our Postgres. It's a research-only service backed by Tavily + OpenAI.
+- What does the user EXPERIENCE when they click "Approve" on a queued domain?
+- What's the volume — approvals per day per tenant, bursty or steady?
+- Should the approval be undoable?
+- Should the agent's research progress stream to the UI?
+- What about Phase 2's progressive enrichment — visible or invisible?
 
-- **Neon eq-dev (`super-glitter-11265514`)** schema all Phase 1.5 columns present. Test tenant `11111111-1111-4111-8111-111111111111` present.
+Output: a one-page product brief.
 
-- **Production E2E artifact** at `/tmp/e2e_phase_1_production.py` — 20/20 PASS against production (as of 2026-05-14 post-merge).
+### Step 2 — `/plan-ceo-review` (scope challenge)
+
+Challenge whether we're solving the right problem. Is the queue itself the right product surface? Is agent enrichment the right user value? Should the architecture be ambitious or pragmatic? CEO-review surfaces 10-star-product thinking.
+
+### Step 3 — Read the landscape doc with the product brief in hand
+
+Eliminate options that don't fit. The viable short-list is usually 2-3 options, not 7.
+
+### Step 4 — `/plan-eng-review` (engineering tradeoffs)
+
+For the surviving short-list, evaluate engineering axes: operational burden, DX, observability, lock-in, cost, test story, upgrade story. Output: recommended architecture with explicit rationale.
+
+### Step 5 — Codex consult on the architecture decision
+
+Per the recurring quality-gate discipline ("Real /codex review is non-substitutable at every phase boundary"; "Run Codex consult BEFORE writing implementation plans for substantial designs"). This is design-time review, not implementation-time review.
+
+### Step 6 — Write the new implementation plan
+
+`docs/superpowers/plans/2026-05-XX-async-orchestration-revised.md`. Covers revised Phase 1.5 + considerations for Phase 2 + Phase 3.
+
+### Step 7 — Update the design doc
+
+`docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` Section 6 needs revision. Document what we kept, what we changed, why.
+
+### Step 8 — `/context-save`
+
+Checkpoint titled with the chosen architecture. Example: `phase-1.5-rethink-inngest-decided` or `phase-1.5-rethink-sync-in-route-decided`.
+
+**A subsequent session executes the new plan. This session does the DECISION.**
 
 ---
 
-## Reading order at session start
+## Anti-anchoring instructions (load-bearing)
 
-1. **Auto-loaded:** `MEMORY.md` — expect `PHASE_1.5_BLOCKED_AGENT_CONTRACT_MISMATCH`
-2. **This file** — handoff
-3. **`tasks/downstream/blocker-agent-contract-mismatch.md`** — THE EXECUTION PLAN. Full evidence + three options analyzed + step-by-step Path A plan.
-4. **Project memory:** `~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/project_contact_quality_initiative.md` — read the `## Phase 1.5 worker deployment BLOCKED — agent contract mismatch (2026-05-15)` section at the bottom.
-5. **Lessons:** `tasks/lessons.md` — read the new `## Probe external service contracts at design time, not deploy time (2026-05-15)` entry at the bottom.
-6. **Deployment recipe (for when Workstream D resumes):** `tasks/downstream/railway-phase-1-5-worker.md` — 6-step recipe (with the env var changes noted above).
+The previous session recommended Path A (patch the agent contract, keep the polling worker). That was wrong — it preserved a 2018 pattern. The next session must:
+
+- **NOT anchor on what's already shipped.** ~700-900 LoC of code is small relative to picking the right substrate for an 18-month build.
+- **NOT anchor on Path A.** The rethink brief does not recommend any option for this reason.
+- **NOT shortcut to "obviously Inngest."** Inngest is a strong candidate for AI-native 2026, but the rethink should genuinely evaluate sync-in-route + Temporal + Restate before picking.
+- **NOT anchor on existing infrastructure.** "We already use Postgres and EventBridge" is the legacy-pattern trap.
+
+**Right posture:** "If we were a 2026 AI-native startup starting today, knowing Phase 2 + Phase 3 are coming, what would we pick?"
+
+---
+
+## Repository state (as of 2026-05-15 end-of-session)
+
+- **Main HEAD:** docs-only commits from this session on top of `4b44898`. Working tree clean.
+- **All shipped code intact** — PR #10, #11, #12, #13 all merged in main. Production E2E still 20/20 PASS for shipped routes.
+- **Worker process not running in production.** Approved queue entries currently accumulate without being processed; this is by design until the rethink picks a substrate.
+- **FastAPI service** serving all ingestion + queue routes correctly.
+- **Neon eq-dev schema** all Phase 1.5 columns + tables present.
+- **Production E2E** at `/tmp/e2e_phase_1_production.py` (486 lines, 20/20 PASS). Will need updates after rethink picks substrate.
+
+## Production credentials + IDs
+
+Locked in across the initiative (also in `2026-05-15-initiative-context-snapshot.md` Section 10):
+
+- Neon: project `super-glitter-11265514`. Test tenant `11111111-1111-4111-8111-111111111111` (column is `tenants.id`).
+- Railway FastAPI: project `847cfa5a-b77c-4fb0-95e4-b20e8773c23e`, service `59a69f3d-9a24-4041-942a-891c4a81c5fb`, env `e4c5ec15-1931-4632-9e58-92d9c6be4261`, URL `https://live-transcription-fastapi-production.up.railway.app`.
+- Railway eq-agent-action-core: project `421e079f-2e46-4c22-83c4-0fe6208e6aff`, service `3036ea0f-afc9-4bc4-889d-c98617d81e96`, env `f2c0a13f-40c6-4514-9c02-acac2a22c05c`, URL `https://eq-agent-action-core-production.up.railway.app`.
+- Internal JWT: HS256, secret shared (`INTERNAL_JWT_SECRET`), `iss=eq-frontend`, `aud=eq-backend`, claims `tenant_id` (UUID), `user_id`, optional `pg_user_id`.
+
+---
+
+## The user
+
+A non-developer founder. Make confident technical decisions; surface only product / strategic decisions for the user to weigh in on. Work without stopping for clarifying questions; make the reasonable call and continue; the user redirects if needed.
+
+**The user explicitly cares about:** what a cutting-edge 2026 AI-native startup would actually build. Architectural correctness over short-term shortcuts. Maintaining full project context across sessions so any new agent can pick up where the prior left off.
+
+**The user does NOT care about:** preserving sunk-cost code, hitting an arbitrary deadline over correctness, or maintaining patterns that don't represent 2026 best practice.
+
+---
+
+## What's NOT in scope this session
+
+- **Writing code.** None. Zero. The rethink is a decision session.
+- **Migrating data.** Schema stays.
+- **Executing on the chosen architecture.** Separate session.
+- **Phase 2 / Phase 3 detailed design.** Pick a substrate that COMPOUNDS into them; don't design them.
+- **Cross-repo coordination work.** Identify what needs coordination; don't execute it.
 
 ---
 
 ## Suggested first actions
 
-1. Run `/context-restore`. Expect a checkpoint titled **"phase-1.5-blocked-agent-contract-mismatch"** dated 2026-05-15.
-2. Read `tasks/downstream/blocker-agent-contract-mismatch.md` in full.
-3. Confirm Path A (my recommendation) or pick B / C with rationale.
-4. Run pre-flight checks (test tenant + schema + e2e file + production endpoint) — they were GREEN this session; should still be GREEN.
-5. Open a feature branch. Execute Path A's 5 sub-steps (client update → account INSERT → __main__ env var swap → tests → Codex review).
-6. Ship the PR. Railway auto-deploys the FastAPI service.
-7. Resume Workstream D per `tasks/downstream/railway-phase-1-5-worker.md` with the env var changes documented above.
-8. Smoke-test materialization end-to-end.
-9. Extend `/tmp/e2e_phase_1_production.py` with the worker case (Workstream E).
-10. End with `/context-save` — mandatory load-bearing invariant.
+1. Run `/context-restore`. Expect a checkpoint titled "phase-1.5-async-orchestration-rethink-pending" dated 2026-05-15.
+2. Read `2026-05-15-initiative-context-snapshot.md` first (mandatory).
+3. Read this handoff.
+4. Read `2026-05-15-async-orchestration-rethink-brief.md`.
+5. Read `2026-05-15-durable-execution-landscape.md`.
+6. Run `/office-hours` to interrogate the product-level questions in the rethink brief Section 7.
+7. Run `/plan-ceo-review`.
+8. Run `/plan-eng-review` on the short-list.
+9. Run Codex consult on the recommended architecture.
+10. Write the new implementation plan.
+11. Update the design doc.
+12. Save checkpoint. End session.
 
----
-
-## Carry-forward invariants (all still load-bearing in main)
-
-Everything from prior sessions remains correct. Adding one for this session:
-
-- **External service contract verification at design time.** Before designing code against a live external service's contract, probe its `/openapi.json` (or equivalent — Swagger, GraphQL introspection, gRPC reflection, hand-written API doc). The cost of one curl is ~5 seconds. Phase 1.5's worker code was scaffolded against a contract that doesn't exist; the integration mismatch was first detectable at deploy time. Future plans calling external services must include a "Verified contract" section citing the actual request/response shape from the service's spec.
-
-All other invariants from prior phases unchanged. See the project memory file for the full list.
+A subsequent session executes the chosen plan.
 
 ---
 
 ## Final note for the next agent
 
-The work this session is a tightly-scoped code-change PR (Path A) followed by the Railway deployment work that was originally scheduled for this session. The blocker doc is comprehensive — read it first, follow its execution plan, and the work is one to two PRs of focused engineering. No re-design required; the architectural reset is small (the agent is a research service; the worker also owns account creation; that's it).
+The user is paying for thinking, not typing. The value of this session is in the decision quality, not the doc volume. Take time to actually run the workflow skills. Don't shortcut.
 
-After Workstream C ships and Workstream D deploys with a clean smoke test, the explicit Phase 1.5 STOPPING POINT per design Section 7.3 will kick in. Re-plan Phase 2 comprehensively before any further commitment.
+The reason this rethink exists: the previous session shortcut to "obviously keep the worker." Don't make the same mistake at a different level (e.g., "obviously Inngest").
+
+When you reach a decision, document the alternatives considered and why they lost. Future sessions need to know not just what we picked but what we explicitly rejected, so they don't re-litigate.

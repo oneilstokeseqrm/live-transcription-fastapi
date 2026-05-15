@@ -241,3 +241,71 @@ than verified (first was Phase 1's caller-side completeness gap; see
 "Multiple ingestion paths drop account_id" lesson). Different failure
 modes, same underlying cause: assumed contract without verification.
 
+## Stop and question dated architecture when integration reveals it (2026-05-15)
+
+The Phase 1.5 worker contract-mismatch blocker surfaced more than a tactical
+fix — it surfaced that the underlying architecture (polling worker + outbox
+table + separate publisher process) is a 2018 pattern. The prior-session
+response was Path A: patch the agent contract, keep the polling worker. The
+user correctly rejected Path A with: "you're also saying the architecture we
+chose was dated."
+
+**The lesson is not "rethink everything on every blocker."** Most blockers
+are tactical and warrant tactical fixes. The lesson is about the SPECIFIC
+moment when an integration-layer blocker reveals that the layer below it is
+itself obsolete relative to current best practice.
+
+**Signals to watch for:**
+
+1. The blocker is at a service boundary you control on one side and consume
+   on the other (e.g., worker calls external agent).
+2. The fix would preserve infrastructure that you'd describe as "dated" or
+   "what we'd have built in [N-years-ago]."
+3. Current best practice in your domain (AI-native, in our case) has
+   meaningfully diverged from what you have, and you're aware of the
+   divergence.
+4. The thing being rethought is load-bearing across future phases (not
+   just the current slice).
+5. Sunk cost feels heavy — you've already written hundreds or thousands of
+   LoC + dozens of regression tests on the current pattern.
+
+When all five signals are present: STOP. Do the rethink at the right
+altitude in a fresh session. Resist the urge to patch the contract and
+move on.
+
+**How to apply:**
+
+1. Surface the architectural question explicitly to the user. Frame it as
+   "is the underlying pattern still right, or has the field moved past
+   it?" Don't bury it under a tactical recommendation.
+
+2. If the answer is "rethink," write a NEUTRAL rethink brief that does not
+   recommend any option. Anchoring the brief to a recommendation defeats
+   the rethink (the prior session's instinct to scope Path A's execution
+   was exactly this anti-pattern).
+
+3. Build a comprehensive handoff: standalone project-context snapshot,
+   honest landscape scan of the alternatives, neutral scope brief,
+   anti-anchoring instructions, decision-process steps. The handoff is
+   the thing the rethink session inherits; its quality determines the
+   decision quality.
+
+4. Don't do the rethink in the same session that surfaced the blocker.
+   Context saturation biases toward incremental thinking. Fresh session,
+   fresh perspective, fresh /office-hours.
+
+5. Once the rethink is done, document what was considered AND rejected,
+   with reasons. Future sessions need to know not just what was picked
+   but what was explicitly ruled out, so they don't re-litigate.
+
+**Why this isn't analysis paralysis:** the trigger is specific
+(integration-layer blocker + dated underlying architecture + future-phase
+implications + cross-domain best-practice divergence). It's not "rethink
+everything on every blocker." It's "when an integration reveals you're
+patching a legacy pattern, stop patching."
+
+The cost: one session of rethink instead of one session of patching.
+The benefit: a substrate that compounds across the remaining 2-3 phases
+of the initiative, rather than another session like this one in 3 months
+when Phase 2 hits the same wall.
+

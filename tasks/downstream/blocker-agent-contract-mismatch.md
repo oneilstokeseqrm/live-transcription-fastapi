@@ -1,7 +1,29 @@
 # BLOCKER — Worker built against an agent contract that doesn't exist
 
+> **⚠️ SUPERSEDED 2026-05-15 — Path A rejected; architecture rethink in progress.**
+>
+> This document scoped a tactical fix (Path A — move account creation into the
+> worker, keep the polling architecture). After review with the user, Path A
+> was REJECTED because it would preserve a 2018-era polling-worker + outbox +
+> separate-publisher pattern that is not what a cutting-edge 2026 AI-native
+> startup would build. The blocker surfaced a deeper question: what's the
+> right async orchestration substrate for the Contact Quality Initiative as
+> a whole (Phase 1.5 + Phase 2 + Phase 3), not just patching this slice.
+>
+> **Next session does the rethink, NOT the work scoped in this document.**
+> See:
+> - `docs/superpowers/specs/2026-05-15-async-orchestration-rethink-brief.md` — neutral scope for the rethink
+> - `docs/superpowers/specs/2026-05-15-initiative-context-snapshot.md` — standalone project entry point
+> - `docs/superpowers/research/2026-05-15-durable-execution-landscape.md` — 2026 landscape of orchestration options
+> - `docs/superpowers/specs/NEXT-SESSION-START-HERE.md` — handoff
+>
+> This document is kept as **audit trail** of the tactical option considered
+> and rejected. The evidence below (contract probe results, OpenAPI inspection)
+> is still factually correct and useful for the rethink — read sections 1-4.
+> Do NOT execute the "Recommended path (A)" plan in section 5.
+
 **Surfaced:** 2026-05-14, during Workstream D (Railway worker service deployment)
-**Status:** ARCHITECTURE DECISION NEEDED before worker can be deployed
+**Status:** SUPERSEDED — architecture rethink in progress (see header above)
 
 ## What happened
 
