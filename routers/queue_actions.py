@@ -55,6 +55,9 @@ from sqlalchemy import text
 from services.database import get_async_session
 from services.queue_authorization import can_act_on_queue_entry
 from utils.context_utils import get_auth_context_polling
+from services.account_provisioning.eventbridge_emit import (
+    emit_for_materialization_result,
+)
 from services.account_provisioning.materialization import materialize_account_approval
 
 
@@ -577,13 +580,37 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
             # resolved_account_id. The context manager auto-commits on
             # clean exit (or rolls back if materialize_account_approval
             # raises).
-            await materialize_account_approval(
+            materialization = await materialize_account_approval(
                 session=session,
                 tenant_id=ctx.tenant_id,
                 queue_id=queue_id,
                 account_id=body.account_id,
                 event_type="account_mapped",
             )
+
+    # Emit downstream EnvelopeV1 events for the backfilled interactions
+    # AFTER the route's transaction commits (so emission failures cannot
+    # roll back the contacts + queue update). Plan §6.6 + Codex P1
+    # 2026-05-15: pre-fix /map skipped emission entirely because the
+    # outbox + publisher pair was deleted in M3. Without this call,
+    # downstream consumers (action-item-graph, eq-structured-graph-core)
+    # never learn about /map-materialized contacts.
+    #
+    # At-least-once emission; consumer-side MERGE-on-canonical-IDs is
+    # the dedup mechanism (same model as the workflow's Step 6). If
+    # emission fails after the DB commit, the row is in a consistent
+    # 'mapped' state and the operator can replay via a follow-up tool
+    # (M5 ships ``scripts/verify_consumer_contracts.py``).
+    try:
+        await emit_for_materialization_result(materialization=materialization)
+    except Exception:
+        logger.exception(
+            "Inline /map emission failed AFTER materialization committed; "
+            "queue_id=%s account_id=%s. The DB state is correct (status="
+            "'mapped', contacts created); downstream consumers may miss "
+            "this interaction until a replay tool fires.",
+            queue_id, body.account_id,
+        )
 
     return {
         "status": "mapped",

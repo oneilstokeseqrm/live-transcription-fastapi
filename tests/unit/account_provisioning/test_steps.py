@@ -134,6 +134,73 @@ async def test_revalidate_raises_on_tenant_drift(
 
 
 @pytest.mark.asyncio
+async def test_revalidate_raises_on_archived_row(
+    session: AsyncSession, test_tenant_id: str, test_user_id: str,
+):
+    """Codex P2 finding 2026-05-15: /ignore between /approve and Step 1.
+
+    If an operator archives the queue row via /ignore between the
+    /approve handler starting the workflow and Step 1 actually running,
+    Step 1 must fail loud — Step 5's UPDATE_QUEUE_SQL has no status
+    filter and would otherwise flip the ignored row back to 'mapped'.
+    """
+    attempt = str(uuid.uuid4())
+    queue_id = await _seed_pending_account_mapping(
+        session,
+        tenant_id=test_tenant_id,
+        user_id=test_user_id,
+        domain="archived.example.com",
+        status="ignored",
+        approval_attempt_id=attempt,
+    )
+    # Mark the row archived (simulates /ignore having fired).
+    async with session.begin():
+        await session.execute(
+            text("""
+                UPDATE pending_account_mappings
+                SET archived_at = NOW(), archive_reason = 'owner_ignored'
+                WHERE id = CAST(:q AS uuid)
+            """),
+            {"q": queue_id},
+        )
+
+    with pytest.raises(ValueError, match="archived"):
+        await revalidate_queue_state(
+            queue_id=queue_id,
+            tenant_id=test_tenant_id,
+            expected_approval_attempt_id=attempt,
+        )
+
+
+@pytest.mark.asyncio
+async def test_revalidate_raises_on_unexpected_status(
+    session: AsyncSession, test_tenant_id: str, test_user_id: str,
+):
+    """If status drifted to 'mapped' (a racing /map fired), workflow refuses.
+
+    Codex P2 finding 2026-05-15: revalidate must check status as well
+    as archived_at — a status='mapped' row from a racing /map call
+    shouldn't be re-materialized by the workflow.
+    """
+    attempt = str(uuid.uuid4())
+    queue_id = await _seed_pending_account_mapping(
+        session,
+        tenant_id=test_tenant_id,
+        user_id=test_user_id,
+        domain="raced.example.com",
+        status="mapped",
+        approval_attempt_id=attempt,
+    )
+
+    with pytest.raises(ValueError, match="status drift"):
+        await revalidate_queue_state(
+            queue_id=queue_id,
+            tenant_id=test_tenant_id,
+            expected_approval_attempt_id=attempt,
+        )
+
+
+@pytest.mark.asyncio
 async def test_revalidate_raises_on_attempt_id_drift(
     session: AsyncSession, test_tenant_id: str, test_user_id: str,
 ):

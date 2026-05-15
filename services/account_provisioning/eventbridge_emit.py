@@ -28,15 +28,18 @@ from typing import Any, Iterable
 from uuid import UUID
 
 import boto3
+from sqlalchemy import text
 
 from models.envelope import ContentModel, EnvelopeV1
 from services.account_provisioning.types import (
     EmissionRecord,
+    EmittedContact,
     EventBridgeEmissionError,
     InteractionForEmit,
     MaterializationResult,
     UnmappedInteractionTypeError,
 )
+from services.database import get_async_session
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +153,7 @@ async def emit_envelopes_for_materialization(
     materialization: MaterializationResult,
     interactions: Iterable[InteractionForEmit],
     boto3_factory: Any = _build_eventbridge_client,
-) -> list[EmissionRecord]:
+) -> list[EmissionRecord]:  # noqa: D401 — see emit_for_materialization for the higher-level entrypoint
     """Emit one ``EnvelopeV1`` per materialized interaction to EventBridge.
 
     Returns one ``EmissionRecord`` per successful emission. Raises
@@ -217,3 +220,130 @@ async def emit_envelopes_for_materialization(
         )
 
     return emissions
+
+
+# ---------------------------------------------------------------------------
+# Fetch helpers (shared by workflow Step 6 + /map inline path)
+# ---------------------------------------------------------------------------
+
+
+SELECT_INTERACTIONS_FOR_EMIT_SQL = text("""
+    SELECT interaction_id::text AS interaction_id,
+           interaction_type,
+           raw_text,
+           user_id::text AS user_id,
+           created_at
+    FROM raw_interactions
+    WHERE interaction_id = ANY(CAST(:interaction_ids AS uuid[]))
+      AND tenant_id = CAST(:tenant_id AS uuid)
+""")
+
+
+# Codex P2 finding 2026-05-15: the signal-role join was previously scoped
+# only to ``(queue_id, email)``. If the same contact appeared in multiple
+# signals (different interactions, same email — common for the meeting
+# organizer who has multiple touchpoints), the join produced one row per
+# signal. That duplicated ``extras.contacts`` entries AND could attach a
+# role from a different interaction to the emitted envelope. The
+# ``interaction_id`` join on ``s.interaction_id = :raw_interaction_id``
+# constrains the role to the interaction we're emitting for.
+SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
+    SELECT c.id::text AS contact_id,
+           c.email,
+           CASE
+             WHEN c.first_name IS NOT NULL AND c.last_name IS NOT NULL
+                  THEN c.first_name || ' ' || c.last_name
+             WHEN c.first_name IS NOT NULL THEN c.first_name
+             WHEN c.last_name IS NOT NULL THEN c.last_name
+             ELSE NULL
+           END AS display_name,
+           s.contact_role AS role
+    FROM interaction_contact_links l
+    JOIN interaction_summaries summ ON summ.summary_id = l.interaction_id
+    JOIN contacts c ON c.id = l.contact_id
+    LEFT JOIN pending_account_mapping_signals s
+           ON s.queue_id = CAST(:queue_id AS uuid)
+          AND s.interaction_id = CAST(:raw_interaction_id AS uuid)
+          AND lower(s.contact_email) = lower(c.email)
+          AND s.archived_at IS NULL
+    WHERE summ.interaction_id = CAST(:raw_interaction_id AS uuid)
+      AND c.tenant_id = CAST(:tenant_id AS uuid)
+""")
+
+
+async def fetch_interactions_for_emit(
+    *,
+    materialization: MaterializationResult,
+) -> list[InteractionForEmit]:
+    """Read ``raw_interactions`` + per-interaction contact metadata.
+
+    Plan §6.6 + Codex P2 (signal-role join scope): each interaction
+    gets its OWN contacts list, filtered by signal.interaction_id so
+    multi-touchpoint contacts don't bleed roles across interactions.
+    """
+    if not materialization.interaction_ids:
+        return []
+
+    interactions: list[InteractionForEmit] = []
+    async with get_async_session() as session:
+        rows = (
+            await session.execute(
+                SELECT_INTERACTIONS_FOR_EMIT_SQL,
+                {
+                    "interaction_ids": materialization.interaction_ids,
+                    "tenant_id": materialization.tenant_id,
+                },
+            )
+        ).all()
+        for row in rows:
+            contact_rows = (
+                await session.execute(
+                    SELECT_CONTACTS_FOR_INTERACTION_SQL,
+                    {
+                        "raw_interaction_id": row.interaction_id,
+                        "queue_id": materialization.queue_id,
+                        "tenant_id": materialization.tenant_id,
+                    },
+                )
+            ).all()
+            contacts = [
+                EmittedContact(
+                    contact_id=c.contact_id,
+                    email=c.email,
+                    name=c.display_name,
+                    role=c.role,
+                )
+                for c in contact_rows
+            ]
+            interactions.append(
+                InteractionForEmit(
+                    interaction_id=row.interaction_id,
+                    interaction_type=row.interaction_type,
+                    raw_text=row.raw_text,
+                    user_id=row.user_id,
+                    created_at=row.created_at,
+                    contacts=contacts,
+                )
+            )
+    return interactions
+
+
+async def emit_for_materialization_result(
+    *,
+    materialization: MaterializationResult,
+    boto3_factory: Any = _build_eventbridge_client,
+) -> list[EmissionRecord]:
+    """Fetch interactions for ``materialization`` then emit one EnvelopeV1 each.
+
+    Higher-level entrypoint used by BOTH the workflow's Step 6 AND the
+    ``/map`` route's inline path (so /map gets downstream notification
+    parity with /approve). Plan §6.6 codifies the per-interaction
+    fan-out; without this helper, /map silently skipped emission after
+    the outbox was removed (Codex P1 finding 2026-05-15).
+    """
+    interactions = await fetch_interactions_for_emit(materialization=materialization)
+    return await emit_envelopes_for_materialization(
+        materialization=materialization,
+        interactions=interactions,
+        boto3_factory=boto3_factory,
+    )

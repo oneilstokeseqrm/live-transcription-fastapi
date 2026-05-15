@@ -336,6 +336,142 @@ async def test_emit_raises_on_failed_entry_count():
 
 
 @pytest.mark.asyncio
+async def test_fetch_interactions_constrains_signal_role_to_interaction(
+    session, test_tenant_id, test_user_id,
+):
+    """Codex P2 finding 2026-05-15: the signal-role JOIN must constrain
+    on interaction_id, not just (queue_id, email).
+
+    Setup: one contact email (jane@x.com) appears in two signals for
+    DIFFERENT raw_interactions (with different roles) under the same
+    queue. Pre-fix, fetching contacts for interaction A returned
+    BOTH signals' roles (Cartesian fan-out), duplicating the contact
+    in extras.contacts and potentially attaching the role from
+    interaction B's signal. Post-fix, only the role from interaction
+    A's signal returns.
+    """
+    from sqlalchemy import text
+    import uuid
+    from services.account_provisioning.eventbridge_emit import (
+        fetch_interactions_for_emit,
+    )
+    from services.account_provisioning.types import MaterializationResult
+
+    # Seed two raw_interactions, one queue with two signals (same email,
+    # different interactions + roles), two interaction_summaries, two
+    # interaction_contact_links (linking the same contact to both).
+    iid_a = str(uuid.uuid4())
+    iid_b = str(uuid.uuid4())
+    queue_id = str(uuid.uuid4())
+
+    async with session.begin():
+        # Bootstrap an account so raw_interactions.account_id FK holds.
+        account_id = str(uuid.uuid4())
+        await session.execute(
+            text("""
+                INSERT INTO accounts (id, tenant_id, name, state, account_type, created_at, updated_at)
+                VALUES (CAST(:id AS uuid), CAST(:t AS uuid), :name, 'active', 'Prospect', NOW(), NOW())
+            """),
+            {"id": account_id, "t": test_tenant_id, "name": "JoinScopeTest"},
+        )
+        await session.execute(
+            text("""
+                INSERT INTO account_domains (id, tenant_id, account_id, domain, created_at)
+                VALUES (gen_random_uuid(), CAST(:t AS uuid), CAST(:a AS uuid), :d, NOW())
+            """),
+            {"t": test_tenant_id, "a": account_id, "d": "joinscope.example.com"},
+        )
+        # Create a contact.
+        contact_id = str(uuid.uuid4())
+        await session.execute(
+            text("""
+                INSERT INTO contacts (id, tenant_id, email, account_id, source, validation_status, created_at, updated_at)
+                VALUES (CAST(:id AS uuid), CAST(:t AS uuid), :email, CAST(:a AS uuid), 'test', 'verified', NOW(), NOW())
+            """),
+            {"id": contact_id, "t": test_tenant_id, "email": "jane@joinscope.example.com", "a": account_id},
+        )
+        # Two raw_interactions.
+        for iid in (iid_a, iid_b):
+            await session.execute(
+                text("""
+                    INSERT INTO raw_interactions (interaction_id, tenant_id, account_id, interaction_type, created_at, updated_at)
+                    VALUES (CAST(:id AS uuid), CAST(:t AS uuid), CAST(:a AS uuid), 'meeting', NOW(), NOW())
+                """),
+                {"id": iid, "t": test_tenant_id, "a": account_id},
+            )
+        # Two interaction_summaries + two links (same contact, two interactions).
+        sid_a = str(uuid.uuid4())
+        sid_b = str(uuid.uuid4())
+        for iid, sid in ((iid_a, sid_a), (iid_b, sid_b)):
+            await session.execute(
+                text("""
+                    INSERT INTO interaction_summaries (summary_id, tenant_id, interaction_id, summary_type, created_at, updated_at)
+                    VALUES (CAST(:sid AS uuid), CAST(:t AS uuid), CAST(:iid AS uuid), 'meeting', NOW(), NOW())
+                """),
+                {"sid": sid, "t": test_tenant_id, "iid": iid},
+            )
+            await session.execute(
+                text("""
+                    INSERT INTO interaction_contact_links (link_id, interaction_id, contact_id)
+                    VALUES (gen_random_uuid(), CAST(:sid AS uuid), CAST(:cid AS uuid))
+                """),
+                {"sid": sid, "cid": contact_id},
+            )
+        # Queue + 2 signals: same email, DIFFERENT interactions, DIFFERENT roles.
+        await session.execute(
+            text("""
+                INSERT INTO pending_account_mappings (
+                    id, tenant_id, domain, status, owner_user_id,
+                    discovered_from_type, expires_at, email_count, created_at, updated_at
+                ) VALUES (
+                    CAST(:q AS uuid), CAST(:t AS uuid), :d, 'mapped', CAST(:u AS uuid),
+                    'test', NOW() + INTERVAL '7 days', 2, NOW(), NOW()
+                )
+            """),
+            {"q": queue_id, "t": test_tenant_id, "d": "joinscope.example.com", "u": test_user_id},
+        )
+        for iid, role in ((iid_a, "organizer"), (iid_b, "attendee")):
+            await session.execute(
+                text("""
+                    INSERT INTO pending_account_mapping_signals (
+                        id, queue_id, tenant_id, source_type, source_user_id,
+                        contact_email, contact_role, interaction_id, created_at
+                    ) VALUES (
+                        gen_random_uuid(), CAST(:q AS uuid), CAST(:t AS uuid), 'transcript', CAST(:u AS uuid),
+                        :email, :role, CAST(:iid AS uuid), NOW()
+                    )
+                """),
+                {
+                    "q": queue_id, "t": test_tenant_id, "u": test_user_id,
+                    "email": "jane@joinscope.example.com", "role": role, "iid": iid,
+                },
+            )
+
+    materialization = MaterializationResult(
+        queue_id=queue_id,
+        tenant_id=test_tenant_id,
+        account_id=account_id,
+        contact_ids=[contact_id],
+        interaction_ids=[iid_a, iid_b],
+    )
+    fetched = await fetch_interactions_for_emit(materialization=materialization)
+
+    by_iid = {i.interaction_id: i for i in fetched}
+    # Each interaction must have exactly ONE contact (the same contact),
+    # with the role for THAT interaction's signal — not a Cartesian
+    # cross-product of both signals.
+    assert len(by_iid[iid_a].contacts) == 1, (
+        f"interaction A had {len(by_iid[iid_a].contacts)} contacts; expected 1"
+    )
+    assert by_iid[iid_a].contacts[0].role == "organizer"
+
+    assert len(by_iid[iid_b].contacts) == 1, (
+        f"interaction B had {len(by_iid[iid_b].contacts)} contacts; expected 1"
+    )
+    assert by_iid[iid_b].contacts[0].role == "attendee"
+
+
+@pytest.mark.asyncio
 async def test_emit_empty_interactions_returns_empty_list():
     materialization = MaterializationResult(
         queue_id=str(uuid.uuid4()),

@@ -31,7 +31,7 @@ from dbos import DBOS
 from sqlalchemy import text
 
 from services.account_provisioning.eventbridge_emit import (
-    emit_envelopes_for_materialization,
+    emit_for_materialization_result,
 )
 from services.account_provisioning.materialization import (
     materialize_account_approval,
@@ -40,8 +40,6 @@ from services.account_provisioning.types import (
     AccountProfile,
     AgentEnrichTerminalError,
     EmissionRecord,
-    EmittedContact,
-    InteractionForEmit,
     MaterializationResult,
     QueueState,
 )
@@ -60,6 +58,7 @@ SELECT_QUEUE_STATE_SQL = text("""
            domain,
            status,
            approval_attempt_id::text AS approval_attempt_id,
+           archived_at,
            re_open_count
     FROM pending_account_mappings
     WHERE id = CAST(:queue_id AS uuid)
@@ -112,47 +111,11 @@ INSERT_ACCOUNT_DOMAIN_SQL = text("""
 """)
 
 
-SELECT_INTERACTIONS_FOR_EMIT_SQL = text("""
-    SELECT interaction_id::text AS interaction_id,
-           interaction_type,
-           raw_text,
-           user_id::text AS user_id,
-           created_at
-    FROM raw_interactions
-    WHERE interaction_id = ANY(CAST(:interaction_ids AS uuid[]))
-      AND tenant_id = CAST(:tenant_id AS uuid)
-""")
-# tenant_id filter is belt-and-suspenders. The interaction_ids list comes
-# from materialize_signals' MaterializationResult, which itself only wrote
-# rows under the tenant — but cross-tenant defense in depth is cheap.
-
-
-SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
-    SELECT c.id::text AS contact_id,
-           c.email,
-           CASE
-             WHEN c.first_name IS NOT NULL AND c.last_name IS NOT NULL
-                  THEN c.first_name || ' ' || c.last_name
-             WHEN c.first_name IS NOT NULL THEN c.first_name
-             WHEN c.last_name IS NOT NULL THEN c.last_name
-             ELSE NULL
-           END AS display_name,
-           s.contact_role AS role
-    FROM interaction_contact_links l
-    JOIN interaction_summaries summ ON summ.summary_id = l.interaction_id
-    JOIN contacts c ON c.id = l.contact_id
-    LEFT JOIN pending_account_mapping_signals s
-           ON s.queue_id = CAST(:queue_id AS uuid)
-          AND lower(s.contact_email) = lower(c.email)
-          AND s.archived_at IS NULL
-    WHERE summ.interaction_id = CAST(:raw_interaction_id AS uuid)
-      AND c.tenant_id = CAST(:tenant_id AS uuid)
-""")
-# Joins via summaries because interaction_contact_links.interaction_id
-# stores summary_id (Prisma naming artifact, see tasks/lessons.md). The
-# signal role lookup is LEFT JOIN — if the queue's signals were already
-# archived (reopen path) the role just comes back NULL. Downstream
-# consumers tolerate role=None.
+# Note: fetch helpers (SELECT_INTERACTIONS_FOR_EMIT_SQL,
+# SELECT_CONTACTS_FOR_INTERACTION_SQL, fetch_interactions_for_emit) moved
+# to services.account_provisioning.eventbridge_emit so the /map route's
+# inline emission path can reuse them without an indirect dependency on
+# the DBOS step decorators in this module.
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +151,25 @@ async def revalidate_queue_state(
         raise ValueError(
             f"Queue {queue_id!r} tenant mismatch: workflow has "
             f"{tenant_id!r}; row has {row.tenant_id!r}"
+        )
+    # Codex P2 finding 2026-05-15: between /approve starting the workflow
+    # and Step 1 running, an operator could call /ignore (which archives
+    # the row). Step 2's UPDATE_QUEUE_SQL would no-op (status != 'approved')
+    # but Step 5's UPDATE_QUEUE_SQL inside materialize_account_approval
+    # has no status filter — it would flip the ignored row back to
+    # 'mapped'. Fail loud at Step 1 so the workflow surfaces the race.
+    if row.archived_at is not None:
+        raise ValueError(
+            f"Queue {queue_id!r} was archived (archived_at={row.archived_at}) "
+            f"between /approve and workflow start. The /ignore route fired "
+            f"between the two. The workflow refuses to materialize an "
+            f"archived row."
+        )
+    if row.status not in ("approved", "creating"):
+        raise ValueError(
+            f"Queue {queue_id!r} status drift: expected 'approved' or "
+            f"'creating' at workflow start, got {row.status!r}. A racing "
+            f"action (e.g., /ignore, /map) ran between /approve and Step 1."
         )
     if row.approval_attempt_id != expected_approval_attempt_id:
         raise ValueError(
@@ -449,58 +431,6 @@ async def materialize_signals(
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_interactions_for_emit(
-    *,
-    materialization: MaterializationResult,
-) -> list[InteractionForEmit]:
-    """Read raw_interactions + contact metadata for each materialized interaction."""
-    if not materialization.interaction_ids:
-        return []
-
-    interactions: list[InteractionForEmit] = []
-    async with get_async_session() as session:
-        rows = (
-            await session.execute(
-                SELECT_INTERACTIONS_FOR_EMIT_SQL,
-                {
-                    "interaction_ids": materialization.interaction_ids,
-                    "tenant_id": materialization.tenant_id,
-                },
-            )
-        ).all()
-        for row in rows:
-            contact_rows = (
-                await session.execute(
-                    SELECT_CONTACTS_FOR_INTERACTION_SQL,
-                    {
-                        "raw_interaction_id": row.interaction_id,
-                        "queue_id": materialization.queue_id,
-                        "tenant_id": materialization.tenant_id,
-                    },
-                )
-            ).all()
-            contacts = [
-                EmittedContact(
-                    contact_id=c.contact_id,
-                    email=c.email,
-                    name=c.display_name,
-                    role=c.role,
-                )
-                for c in contact_rows
-            ]
-            interactions.append(
-                InteractionForEmit(
-                    interaction_id=row.interaction_id,
-                    interaction_type=row.interaction_type,
-                    raw_text=row.raw_text,
-                    user_id=row.user_id,
-                    created_at=row.created_at,
-                    contacts=contacts,
-                )
-            )
-    return interactions
-
-
 @DBOS.step(retries_allowed=True, max_attempts=5, interval_seconds=2.0, backoff_rate=2.0)
 async def emit_eventbridge_events(
     *,
@@ -508,11 +438,10 @@ async def emit_eventbridge_events(
 ) -> list[EmissionRecord]:
     """Emit one EnvelopeV1 per materialized interaction.
 
-    Plan §6.6 + §3.3. Consumer-side MERGE is the dedup mechanism;
+    Plan §6.6 + §3.3. Wraps the shared
+    :func:`services.account_provisioning.eventbridge_emit.emit_for_materialization_result`
+    helper so the workflow and the /map inline path share the same
+    fetch + fan-out logic. Consumer-side MERGE is the dedup mechanism;
     DBOS retries are safe at the consumer.
     """
-    interactions = await _fetch_interactions_for_emit(materialization=materialization)
-    return await emit_envelopes_for_materialization(
-        materialization=materialization,
-        interactions=interactions,
-    )
+    return await emit_for_materialization_result(materialization=materialization)
