@@ -253,6 +253,41 @@ async def test_transition_to_creating_moves_approved_to_creating(
 
 
 @pytest.mark.asyncio
+async def test_transition_to_creating_raises_on_archived_race(
+    session: AsyncSession, test_tenant_id: str, test_user_id: str,
+):
+    """Codex P2 finding 2026-05-15: race between Step 1 and Step 2.
+
+    If /ignore archives the row between Step 1 (revalidate succeeded
+    because not-yet-archived) and Step 2 (UPDATE), the UPDATE matches
+    0 rows. Without a 0-row guard, the workflow would proceed to Step
+    3 (30-90s agent call) then Step 5 (materialize) which would flip
+    the ignored row back to 'mapped' (UPDATE_QUEUE_SQL has no status
+    filter).
+    """
+    queue_id = await _seed_pending_account_mapping(
+        session,
+        tenant_id=test_tenant_id,
+        user_id=test_user_id,
+        domain="raceabort.example.com",
+        status="approved",
+    )
+    # Simulate /ignore having just fired.
+    async with session.begin():
+        await session.execute(
+            text("""
+                UPDATE pending_account_mappings
+                SET status='ignored', archived_at=NOW()
+                WHERE id = CAST(:q AS uuid)
+            """),
+            {"q": queue_id},
+        )
+
+    with pytest.raises(ValueError, match="drifted out of"):
+        await transition_to_creating(queue_id=queue_id)
+
+
+@pytest.mark.asyncio
 async def test_transition_to_creating_is_idempotent_on_replay(
     session: AsyncSession, test_tenant_id: str, test_user_id: str,
 ):

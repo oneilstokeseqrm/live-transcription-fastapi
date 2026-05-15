@@ -73,13 +73,18 @@ TRANSITION_TO_CREATING_SQL = text("""
     SET status = 'creating',
         creation_started_at = COALESCE(creation_started_at, NOW()),
         updated_at = NOW()
-    WHERE id = CAST(:queue_id AS uuid) AND status = 'approved'
+    WHERE id = CAST(:queue_id AS uuid)
+      AND archived_at IS NULL
+      AND status IN ('approved', 'creating')
+    RETURNING status
 """)
-# Replay-safe: a retry after status moved to 'creating' is a no-op
-# (WHERE status='approved' matches nothing). If status moved past
-# 'creating' (e.g., 'mapped' from /map racing), the workflow's later
-# materialize step's UPDATE_QUEUE_SQL is the next state transition;
-# this step doesn't need to assert pre-state beyond 'approved'.
+# Replay-safe AND race-tight: status IN ('approved','creating') lets a
+# legitimate replay (status='creating' from prior partial run) pass; the
+# archived_at filter blocks the race where /ignore archives the row
+# between Step 1's revalidate and Step 2's UPDATE. The step body checks
+# rowcount: 0 rows = the row drifted into archived/mapped/ignored state
+# between Step 1 and now → raise to abort the workflow before Step 5
+# would flip the queue back to 'mapped'.
 
 
 SELECT_ACCOUNT_BY_DOMAIN_SQL = text("""
@@ -198,15 +203,33 @@ async def revalidate_queue_state(
 async def transition_to_creating(*, queue_id: str) -> None:
     """Idempotent ``status='approved' → 'creating'`` transition.
 
-    The WHERE status='approved' clause makes this a no-op when the row
-    is already in 'creating' (replay). The route reserved status
-    synchronously, so on first run the row WILL be 'approved' here.
+    Codex P2 finding 2026-05-15: detect the 0-row case so /ignore
+    archiving the row between Step 1's revalidate and Step 2's UPDATE
+    doesn't silently fall through to Step 5 (which would flip the
+    ignored row back to 'mapped' via materialize's UPDATE_QUEUE_SQL).
+
+    1-row match: first-time transition OR legitimate replay
+    (status='creating' from a prior partial run). Either is fine.
+
+    0-row match: row was archived, ignored, mapped, or otherwise moved
+    out of ('approved','creating') between Step 1 and now. The
+    workflow MUST NOT proceed to Step 3 (agent call) because Step 5's
+    materialization has no status guard and would clobber the queue's
+    terminal state.
     """
     async with get_async_session() as session:
         async with session.begin():
-            await session.execute(
+            result = await session.execute(
                 TRANSITION_TO_CREATING_SQL, {"queue_id": queue_id}
             )
+            if result.one_or_none() is None:
+                raise ValueError(
+                    f"Queue {queue_id!r} drifted out of ('approved','creating') "
+                    f"between Step 1 (revalidate) and Step 2 (transition). A "
+                    f"racing /ignore, /map, or expiry-sweep fired in the "
+                    f"window. The workflow aborts to avoid clobbering the "
+                    f"row's terminal state in Step 5."
+                )
 
 
 # ---------------------------------------------------------------------------
