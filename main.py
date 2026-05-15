@@ -1,3 +1,9 @@
+# Compat shim MUST be imported before `deepgram` so the websockets.connect
+# kwarg-translation patch is in place before deepgram-sdk 2.12.0 invokes
+# `websockets.connect(extra_headers=...)` at runtime. See
+# services/deepgram_websockets_compat.py for the rationale.
+from services import deepgram_websockets_compat  # noqa: F401
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse

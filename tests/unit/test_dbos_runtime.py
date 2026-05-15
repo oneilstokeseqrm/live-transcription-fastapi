@@ -15,15 +15,18 @@ import pytest
 from services.dbos_runtime import build_dbos_config, dbos_lifespan
 
 
+_SAFE_DB_URL = "postgresql://user:pass@host.example.com/db"
+
+
 class TestBuildDbosConfig:
     def test_name_is_fixed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
+        monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", _SAFE_DB_URL)
         monkeypatch.delenv("RAILWAY_REPLICA_ID", raising=False)
         config = build_dbos_config()
         assert config["name"] == "live-transcription-fastapi"
 
     def test_admin_server_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
+        monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", _SAFE_DB_URL)
         monkeypatch.delenv("RAILWAY_REPLICA_ID", raising=False)
         config = build_dbos_config()
         assert config["run_admin_server"] is False
@@ -31,6 +34,7 @@ class TestBuildDbosConfig:
     def test_executor_id_from_railway_replica_id(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", _SAFE_DB_URL)
         monkeypatch.setenv("RAILWAY_REPLICA_ID", "replica-abc-123")
         config = build_dbos_config()
         assert config["executor_id"] == "replica-abc-123"
@@ -38,6 +42,7 @@ class TestBuildDbosConfig:
     def test_executor_id_is_none_when_railway_unset(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", _SAFE_DB_URL)
         monkeypatch.delenv("RAILWAY_REPLICA_ID", raising=False)
         config = build_dbos_config()
         # DBOS's config translator skips the field when None per
@@ -48,24 +53,18 @@ class TestBuildDbosConfig:
     def test_system_database_url_from_env(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv(
-            "DBOS_SYSTEM_DATABASE_URL",
-            "postgresql://user:pass@host.example.com/db",
-        )
+        monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", _SAFE_DB_URL)
         config = build_dbos_config()
-        assert (
-            config["system_database_url"]
-            == "postgresql://user:pass@host.example.com/db"
-        )
+        assert config["system_database_url"] == _SAFE_DB_URL
 
-    def test_system_database_url_is_none_when_unset(
+    def test_raises_when_system_database_url_unset(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # M1-hotfix: DBOS_SYSTEM_DATABASE_URL is required. Fall-back to
+        # SQLite would silently break durability — fail fast instead.
         monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
-        config = build_dbos_config()
-        # DBOS falls back to SQLite when the URL is None (verified
-        # against dbos/_dbos_config.py:437-439).
-        assert config["system_database_url"] is None
+        with pytest.raises(RuntimeError, match="DBOS_SYSTEM_DATABASE_URL"):
+            build_dbos_config()
 
 
 class TestDbosLifespanShape:
