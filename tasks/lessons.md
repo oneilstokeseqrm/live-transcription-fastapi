@@ -191,3 +191,53 @@ from the prior Phase 1.5 P2 session lesson — applied to phasing-conditional
 findings specifically.
 
 The judgment: don't ship UNREACHABLE-bug fixes. Ship the documented deferral.
+
+## Probe external service contracts at design time, not deploy time (2026-05-14)
+
+Phase 1.5 worker (PR #12) was scaffolded against an imagined
+eq-agent-action-core contract. The worker sent `{tenant_id, domain,
+worker_attempt_id}` to `POST /api/enrich` and expected `{account_id, domain}`
+back synchronously, treating the agent as the account-creation point.
+
+The actual agent contract (from probing live `/openapi.json` during
+Workstream D deployment):
+
+- `POST /api/enrich` body schema is `{url, effort?}` — `url` required;
+  `tenant_id` comes from JWT claim; `worker_attempt_id` is silently dropped.
+- Default response is `Content-Type: text/event-stream` SSE; `?stream=false`
+  returns AccountProfile blocking 30–90+ seconds.
+- The agent service is "Enrich a company URL into a structured AccountProfile"
+  — research-only. It never INSERTs into our Postgres `accounts` table.
+- No `/api/accounts/create-from-domain` route exists anywhere in the 44
+  endpoints of the agent's API.
+
+The worker code, having 6 rounds of Codex review for internal correctness,
+nonetheless cannot succeed end-to-end because Codex couldn't see the live
+external service. The mismatch was first detectable at deploy time —
+discovered in the deployment session itself.
+
+**Rule:** Before designing code against a live external service's contract,
+probe its `/openapi.json` (or equivalent — Swagger, GraphQL introspection,
+gRPC reflection, or a hand-written API doc). The cost of one curl is ~5
+seconds. The cost of designing 700 LoC + 6 review rounds against a fabricated
+contract is what we hit on 2026-05-14: an architectural reset before
+deployment.
+
+**How to apply:**
+1. At design time for ANY plan that calls an external service, the design
+   doc must include a "Verified contract" section that cites the actual
+   request/response shape from the service's spec, not the spec's name
+   ("OpenAPI says...") or the service's title ("the enrichment service does X").
+2. If the spec doesn't expose what you need, that's a finding — surface it
+   in the design doc as a cross-repo coordination dependency BEFORE code is
+   written, not after.
+3. If the service is "production-deployed for use case A" and you're
+   inventing use case B, explicitly verify B's needs against the spec.
+4. Same rule for cross-repo coordination dependencies: check what other
+   services actually call vs. what their docs say they accept.
+
+This is the second time in this initiative a contract was imagined rather
+than verified (first was Phase 1's caller-side completeness gap; see
+"Multiple ingestion paths drop account_id" lesson). Different failure
+modes, same underlying cause: assumed contract without verification.
+
