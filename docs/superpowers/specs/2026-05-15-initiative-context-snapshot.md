@@ -111,21 +111,53 @@ Six repositories participate in the initiative. Understanding which one owns wha
 
 Postgres (Neon project `super-glitter-11265514`, eq-dev) is shared across services. Neo4j (Aura instance `c6171c63`) is shared across graph services. EventBridge bus is the cross-service event substrate (Kinesis is also in use for transcript chunks).
 
-## 5. Current status: where we are RIGHT NOW (2026-05-15)
+## 5. Current status: where we are RIGHT NOW (2026-05-15, end-of-day)
 
-**🛑 BLOCKED ON ARCHITECTURAL DECISION.**
+**✅ RETHINK DECISION LOCKED. IMPLEMENTATION PLAN WRITING PENDING.**
 
-The Phase 1.5 worker code was scaffolded against an imagined eq-agent-action-core contract. The actual agent service is a research-only product:
+The Phase 1.5 architecture rethink completed Steps 1-5 of the 8-step decision process from `2026-05-15-async-orchestration-rethink-brief.md` Section 8. The substrate is decided: **DBOS** (Apache 2.0 / MIT, library-only durable execution with Postgres-as-durability layer). Steps 6 (write the DBOS implementation plan) and 7 (revise design doc Section 6) are deferred to the next session to preserve plan-authoring quality under fresh context.
 
-- Worker sends `{tenant_id, domain, worker_attempt_id}` → agent rejects with 422 (requires `{url, effort?}` only; tenant_id from JWT claim).
-- Worker expects sync JSON `{account_id, domain}` → agent returns SSE stream or AccountProfile (research data) after 30-90s blocking.
-- Worker depends on the agent being the account-creation point → agent never INSERTs into our accounts table.
+### Decisions made in the rethink session (chronological)
 
-A tactical fix (Path A — move account creation into the worker) was scoped and documented at `tasks/downstream/blocker-agent-contract-mismatch.md`. Path A would ship working software for the existing design.
+- **D1 — Approve UX:** Async + visible streaming progress (user watches the AI reason during the 30-90s agent call). Eliminated sync-in-route.
+- **D2 — Volume:** 100-1000 approvals/day across tenants, with onboarding bursts. Eliminated Temporal as operationally heavy for solo-founder + Railway shop.
+- **D3 — Undoable:** Archive-only (no compensating-action primitives required from the substrate).
+- **D4 — Phase 2 visibility:** Invisible-by-default progressive enrichment.
+- **D5 — Substrate scope:** ONE substrate across Phase 1.5 + 2 + 3 (the "AI workflow runtime for the platform," not just queue infrastructure).
+- **D6 — Initial substrate pick:** Hatchet (subsequently revised).
+- **HARD CONSTRAINT (user interjection):** Strictly open-source only. NO SSPL, NO BSL. Eliminated Inngest (SSPL) and Restate (BSL).
+- **D7 — Substrate revision after Codex consult:** PIVOT to **DBOS**. Codex's design-time consult surfaced material risks with Hatchet: Railway's official deployment is `hatchet-lite` which Hatchet's own docs limit to "development and low-volume use-cases"; RabbitMQ stays a real dependency; at-least-once retry semantics mean the outbox-or-equivalent ledger isn't fully replaced; open production-stability issues (DB corruption, stuck-RUNNING workflows, unbounded session growth, Python SDK reconnection critical issue). DBOS aligns more cleanly with solo-founder + Railway + Neon + FastAPI constraints.
 
-**But the existing design is dated.** The polling-worker + outbox-publisher pattern is how this would have been built in 2018 with Postgres + SQS. In 2026, an AI-native startup would more likely reach for a durable execution framework (Inngest / Temporal / Restate / Trigger.dev) or a different orchestration substrate entirely. Patching the contract preserves ~700 LoC of bespoke infrastructure when a 2026-era choice could ship the same product surface with far less code, better observability, and primitives that compound across Phase 2 + Phase 3 (both of which will need async orchestration).
+### Why DBOS
 
-**Decision:** Stop. Do the architecture rethink in a fresh session BEFORE writing more worker code. The rethink is at the right altitude — it's about the durable execution / async orchestration substrate for the Initiative as a whole, not just this slice.
+- **License:** Apache 2.0 / MIT (verified at https://github.com/dbos-inc/dbos-transact-py) — strictly OSI-compliant open source.
+- **Architecture:** Library-only. `pip install dbos-transact` + connect to existing Neon Postgres = done. NO new service to deploy on Railway.
+- **Durability:** Postgres IS the workflow log. DBOS checkpoints workflow state to a `dbos.*` schema on every step.
+- **Phase 2/3 primitives:** Queues, scheduled workflows (cron), durable sleep, human-in-the-loop (`recv` / `send` / `set_event` / `get_event`) — all library-native and documented.
+- **Cross-service notification:** EventBridge stays as the inter-service notification layer. DBOS's final workflow step calls `put_events` synchronously inside a DBOS step. At-least-once retry semantics mean the publication-identity / consumer-dedup discipline still applies (see Item 5 in `tasks/downstream/test-discipline-gaps-2026-05-15.md`).
+
+### What was eliminated, with reasons
+
+| Option | Status | Reason |
+|--------|--------|--------|
+| Sync-in-route | ❌ | D1 eliminated: streaming UX over 30-90s exceeds Railway HTTP timeouts |
+| AWS Step Functions | ❌ | DX wrong era; Lambda-task constraint conflicts w/ Python-FastAPI; AWS lock-in |
+| Cloudflare Workflows | ❌ | TypeScript-only |
+| Trigger.dev | ❌ | Python SDK less mature than alternatives |
+| Postgres LISTEN/NOTIFY + pg-boss | ❌ | pg-boss is Node-only; Python equivs are job queues not workflow runtimes; D5 altitude eliminates them |
+| Polling worker + outbox (legacy) | ❌ | The pattern being replaced |
+| Inngest | ❌ | SSPL license (source-available, not OSS) |
+| Restate.dev | ❌ | BSL license (source-available) |
+| Temporal | ❌ | MIT (genuine OSS) but operationally too heavy for solo-founder + Railway |
+| Hatchet | ❌ | D7 reversal — Railway production story is `hatchet-lite` (dev-only per docs); RabbitMQ stays a real dep; open production-stability issues |
+| **DBOS** | ✅ | **D7 pick.** Library-only + Postgres-native + Apache 2.0/MIT + Python-primary + lowest operational burden + all required workflow primitives |
+
+### What's NOT done yet (next session scope)
+
+- **Step 6** — Write the DBOS implementation plan at `docs/superpowers/plans/2026-05-XX-async-orchestration-dbos.md` with explicit "Verified contracts" section probing Neon schema + downstream EventBridge rules + consumer Pydantic models + agent OpenAPI.
+- **Step 7** — Revise this design doc's Section 6 (durability machinery) to match the DBOS architecture.
+- **Step 8** — Fresh checkpoint after the plan is written.
+- **A separate later session** executes the new plan (code-writing — out of rethink scope).
 
 ## 6. The hard invariants that must hold across phases
 

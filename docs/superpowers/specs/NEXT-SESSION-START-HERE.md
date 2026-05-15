@@ -1,177 +1,133 @@
 # Next Session — Start Here
 
-**Project:** Contact Quality and Account-Anchoring Initiative — part of a broader AI-native customer intelligence platform.
-**Last session:** 2026-05-15 (architecture rethink decision; no code changes).
-**Status:** 🛑 **PHASE_1.5_ASYNC_ORCHESTRATION_RETHINK_PENDING** — The Phase 1.5 worker's contract mismatch with eq-agent-action-core surfaced a deeper question: the polling-worker + outbox-publisher architecture is a 2018 pattern, not what a cutting-edge 2026 AI-native startup would build. Rather than patch the contract (the previous session's incorrect Path A recommendation), we're rethinking the async orchestration substrate at the right altitude.
-**This session's job:** Run the architecture rethink. **Do NOT write code.** Use `/office-hours` → `/plan-ceo-review` → `/plan-eng-review` → Codex consult → new implementation plan.
+**Project:** Contact Quality and Account-Anchoring Initiative — a multi-phase data-quality foundation for an AI-native customer intelligence platform.
+**Last session:** 2026-05-15 (architecture rethink decision; no code changes; durable lessons committed).
+**Status:** ✅ **PHASE_1.5_RETHINK_DECIDED_DBOS — IMPLEMENTATION_PLAN_WRITING_PENDING** — Substrate is locked: DBOS (Apache 2.0/MIT, library-only, Postgres-as-durability). This session writes the implementation plan + revises the design doc + saves a fresh checkpoint. **Do NOT write code yet.** Code execution is a separate session beyond this one.
 
 ---
 
-## CRITICAL — preserve full project context
+## CRITICAL — this is a multi-session, multi-repo, long-arc project
 
-The Contact Quality Initiative is **multi-phase, multi-repo, and load-bearing for everything downstream in the AI-native customer intelligence platform**. The Phase 1.5 worker is one piece of a project that already shipped Phase 1 and has Phase 2 + Phase 3 in the pipeline. Decisions made for Phase 1.5 must compound to those phases.
+The Contact Quality Initiative is foundational hardening of the contact + account entity layer that the entire AI-native customer intelligence platform stands on. **Decisions made for Phase 1.5 must compound across Phase 2 + Phase 3, which together represent ~6-12+ months of additional work.** Treat this session's deliverables as load-bearing for that whole arc.
 
-**Mandatory first read:**
+### Project trajectory
 
-1. **`docs/superpowers/specs/2026-05-15-initiative-context-snapshot.md`** (~10 min). Standalone entry point for the whole initiative. A new agent should read this and understand the project cold before touching anything else.
+- **Phase 1 — SHIPPED 2026-05-14:** Account-anchoring contract tightened end-to-end at every ingestion path. Per-attendee three-state branching (PERSONAL / INTERNAL / BUSINESS+known / BUSINESS+unknown). Backend rejection on missing `account_id`. PR #10 (live-transcription-fastapi), PR #11 (P2 cleanup), PR #6 (eq-email-pipeline) all merged. Production E2E 20/20 PASS. **Phase 1 silent regression fixed 2026-05-15** at commit `31f513f` (account_lookup SQL was querying wrong table for 24h before downstream agent surfaced it). Production now verified working end-to-end, not just "tests pass."
+- **Phase 1.5 — IN FLIGHT, architecture rethink complete:** Async workflow handling queued unknown business domains. **DBOS-based architecture decided 2026-05-15.** Implementation plan pending — THIS SESSION'S WORK.
+- **STOPPING POINT** — Comprehensive re-planning before any Phase 2 commitment.
+- **Phase 2 — FUTURE (not committed):** Identity state machine + progressive enrichment. Contacts gain explicit state (`shell` → `emerging` → `partial` → `resolved` → `verified`). Re-enrichment runs async; new signals trigger state transitions. **Will run on the same DBOS substrate.**
+- **Phase 3 — FUTURE (not committed):** Conflict resolution, multi-account history, fuzzy matching. Multi-step decision workflows with human-in-the-loop. **Will run on the same DBOS substrate.**
 
-After reading the snapshot, read in this order:
+### Cross-repo scope (load-bearing context)
 
-2. **This handoff** (~5 min).
-3. **`docs/superpowers/specs/2026-05-15-async-orchestration-rethink-brief.md`** (~10 min) — the canonical scope for this session's work. NEUTRAL framing — does not anchor on any option.
-4. **`docs/superpowers/research/2026-05-15-durable-execution-landscape.md`** (~10 min) — 2026 landscape of orchestration options. Honest about what AI-native startups are picking.
-5. **`tasks/lessons.md`** bottom entries — especially the 2026-05-15 lesson "Probe external service contracts at design time" and the older Codex-spiral discipline lessons.
+Six repositories participate. Decisions in this session affect coordination across them:
 
-On-demand / as the work requires:
-- `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` Section 6 (durability machinery design — what problem the old architecture was solving).
-- `docs/superpowers/specs/2026-05-14-dispatch-patterns-research.md` (earlier dispatch research — useful complement to landscape doc).
-- `docs/superpowers/plans/2026-05-13-contact-quality-phase-1-and-1.5.md` (current implementation plan — needs Phase 1.5 revision after rethink).
-- `tasks/downstream/blocker-agent-contract-mismatch.md` (audit-trail only — Path A tactical fix, superseded by this rethink).
+| Repo | Role | Status as of 2026-05-15 |
+|------|------|--------------------------|
+| `live-transcription-fastapi` (this repo) | Primary. Transcript + text + upload ingestion. Queue routes. Soon: DBOS workflows. | Phase 1 + Phase 1.5 P2 + Phase 1.5 main-scope CODE all in main. DBOS workflows not written yet. |
+| `eq-email-pipeline` | Email ingestion. Three-state branching live. | Phase 1 changes shipped (PR #6 / `895cc9f`). |
+| `eq-structured-graph-core` | Neo4j Account/Contact MERGE. AccountCreated consumer (will read from EventBridge once workflows ship). Owns one of the two Lambda forwarders. | Unchanged for Phase 1. |
+| `action-item-graph` | Downstream consumer. Owns the second Lambda forwarder. | Unchanged for Phase 1. Has separate `SourceType` enum fix in flight by its own agent (missing `zoom`+`generic`) — NOT this session's problem. |
+| `eq-frontend` | Prisma schema owner. Queue UI (cross-repo Phase 1.5). | Phase 1.5 schema applied to Neon eq-dev. |
+| `eq-agent-action-core` | AI-powered company-research service. Tavily + Claude AccountProfile generation. | Production-deployed; research-only; never INSERTs into our accounts table. |
 
----
+### The five test-discipline expectations the new plan must address
 
-## What this session does — the decision process
+The 2026-05-15 quality-gap incidents codified five expectations any architecture must explicitly handle. Plans that don't explicitly address all five are repeating the exact mistakes. They are:
 
-**The rethink is not "pick an option." The rethink is "run a real decision process."** Skip steps and we'll end up where we are now.
+1. **Live-schema verification at design time** — Neon MCP probe for any new SQL.
+2. **Real-substrate coverage for in-service primitives** — no mock-at-import-level coverage holes.
+3. **Per-branch E2E coverage** — production E2E exercises every fan-out branch with a happy-path case.
+4. **Narrow exception handling** — broad `except Exception:` is a code smell that masks bugs.
+5. **Cross-service contract verification at design time** — probe live EventBridge rules + downstream Pydantic models + agent OpenAPI before writing code that crosses the boundary.
 
-### Step 1 — `/office-hours` (product-level)
-
-Interrogate from first principles. The user is a non-developer founder; office-hours surfaces product intent. Specifically:
-
-- What does the user EXPERIENCE when they click "Approve" on a queued domain?
-- What's the volume — approvals per day per tenant, bursty or steady?
-- Should the approval be undoable?
-- Should the agent's research progress stream to the UI?
-- What about Phase 2's progressive enrichment — visible or invisible?
-
-Output: a one-page product brief.
-
-### Step 2 — `/plan-ceo-review` (scope challenge)
-
-Challenge whether we're solving the right problem. Is the queue itself the right product surface? Is agent enrichment the right user value? Should the architecture be ambitious or pragmatic? CEO-review surfaces 10-star-product thinking.
-
-### Step 3 — Read the landscape doc with the product brief in hand
-
-Eliminate options that don't fit. The viable short-list is usually 2-3 options, not 7.
-
-### Step 4 — `/plan-eng-review` (engineering tradeoffs)
-
-For the surviving short-list, evaluate engineering axes: operational burden, DX, observability, lock-in, cost, test story, upgrade story. Output: recommended architecture with explicit rationale.
-
-### Step 5 — Codex consult on the architecture decision
-
-Per the recurring quality-gate discipline ("Real /codex review is non-substitutable at every phase boundary"; "Run Codex consult BEFORE writing implementation plans for substantial designs"). This is design-time review, not implementation-time review.
-
-### Step 6 — Write the new implementation plan
-
-`docs/superpowers/plans/2026-05-XX-async-orchestration-revised.md`. Covers revised Phase 1.5 + considerations for Phase 2 + Phase 3.
-
-### Step 7 — Update the design doc
-
-`docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` Section 6 needs revision. Document what we kept, what we changed, why.
-
-### Step 8 — `/context-save`
-
-Checkpoint titled with the chosen architecture. Example: `phase-1.5-rethink-inngest-decided` or `phase-1.5-rethink-sync-in-route-decided`.
-
-**A subsequent session executes the new plan. This session does the DECISION.**
+See `tasks/lessons.md` (bottom two umbrella lessons) and `tasks/downstream/test-discipline-gaps-2026-05-15.md` for full how-to-apply guidance on each.
 
 ---
 
-## Anti-anchoring instructions (load-bearing)
+## Mandatory read order at session start
 
-The previous session recommended Path A (patch the agent contract, keep the polling worker). That was wrong — it preserved a 2018 pattern. The next session must:
-
-- **NOT anchor on what's already shipped.** ~700-900 LoC of code is small relative to picking the right substrate for an 18-month build.
-- **NOT anchor on Path A.** The rethink brief does not recommend any option for this reason.
-- **NOT shortcut to "obviously Inngest."** Inngest is a strong candidate for AI-native 2026, but the rethink should genuinely evaluate sync-in-route + Temporal + Restate before picking.
-- **NOT anchor on existing infrastructure.** "We already use Postgres and EventBridge" is the legacy-pattern trap.
-
-**Right posture:** "If we were a 2026 AI-native startup starting today, knowing Phase 2 + Phase 3 are coming, what would we pick?"
+1. **`docs/superpowers/specs/2026-05-15-initiative-context-snapshot.md`** (~10 min) — Standalone entry point for the WHOLE initiative. Read Section 5 (current status, now reflects DBOS decision) and Section 6 (30 numbered hard invariants).
+2. **This handoff** (~5 min) — Specific work for this session.
+3. **The latest checkpoint** (loaded automatically by `/context-restore`) — `phase-1.5-rethink-decided-dbos` from 2026-05-15. Captures D1-D7 decisions + full eliminations + new lesson + Steps 6-8 scope.
+4. **`tasks/lessons.md` bottom TWO umbrella lessons** — "Four systemic quality gaps" + "Cross-service contract verification at design time." These are the five expectations the implementation plan must address.
+5. **`tasks/downstream/test-discipline-gaps-2026-05-15.md`** — All five items with how-to-apply guidance and acceptance criteria.
+6. **`docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` Section 6** — The CURRENT (now-stale) durability machinery design. Read to understand what the polling-worker + outbox + publisher architecture was solving, so the DBOS architecture can solve the same problems differently rather than skip them.
+7. **Reference on-demand:** `docs/superpowers/research/2026-05-15-durable-execution-landscape.md` if you need to recall why DBOS over the alternatives.
 
 ---
 
-## Repository state (as of 2026-05-15 end-of-session)
+## This session's work — three deliverables
 
-- **Main HEAD:** `31f513f fix(account-lookup): query account_domains, not accounts.domain` — plus docs-only commits from this session. Working tree clean. All commits pushed to `origin/main`.
-- **All shipped code intact** — PR #10, #11, #12, #13 all merged in main. Production E2E still 20/20 PASS for shipped routes. (Caveat — see "Phase 1 silent regression fixed" section below.)
-- **Worker process not running in production.** Approved queue entries currently accumulate without being processed; this is by design until the rethink picks a substrate.
-- **FastAPI service** serving all ingestion + queue routes correctly. Last Railway deploy: `0ac9010d-7ddd-4d86-af0d-285fcb71e675` SUCCESS — picked up the account_lookup fix.
-- **Neon eq-dev schema** all Phase 1.5 columns + tables present.
-- **Production E2E** at `/tmp/e2e_phase_1_production.py` (486 lines, 20/20 PASS). Will need updates after rethink picks substrate, AND should be extended with per-attendee-branching happy-path cases per `tasks/downstream/test-discipline-gaps-2026-05-15.md` Item 2.
+### Deliverable 1 (Step 6): Write the DBOS implementation plan
 
-### Phase 1 silent regression fixed 2026-05-15 — important context for the rethink
+File: `docs/superpowers/plans/2026-05-XX-async-orchestration-dbos.md` (substitute today's date)
 
-A bug in `services/account_lookup.py` (introduced 2026-05-14 in PR #10 merge) made calendar-event matching and contact resolution silently fail for every transcript with BUSINESS-domain attendees. The bug was undetected by 6 layers of quality gates (Codex review, unit tests, integration tests, self-review, production E2E reporting 20/20 PASS) and was traced by a downstream agent (eq-synthetic-date-generation). Fixed at commit `31f513f` 2026-05-15.
+The plan must include:
 
-**Why this matters for the rethink session:**
+- **Revised Phase 1.5 design on DBOS primitives** — `@DBOS.workflow`, `@DBOS.step`, `@DBOS.scheduled`, `recv`/`send`/`set_event`/`get_event` for HITL.
+- **File-by-file deletion list** for the polling worker + outbox publisher + worker entrypoint. KEEP `workers/materialization.py` (real product logic — INSERT contacts, INSERT raw_interactions, UPSERT placeholder summaries, INSERT links). DELETE `workers/outbox_publisher.py` + `workers/__main__.py` + `workers/account_provisioning_worker.py` + `workers/advisory_lock.py` + `services/agent_action_core_client.py`. The `account_provisioning_outbox` table itself may or may not stay depending on the publication-identity-and-consumer-dedup analysis (see "Verified contracts" section below).
+- **Queue routes refactor** — `routers/queue_actions.py` HTTP contract stays the same; the body changes to start a DBOS workflow via `await Workflow.start(...)` with an idempotency key derived from `approval_attempt_id`.
+- **"Verified contracts" section** — explicit, baked-in design-time verification, NOT afterthoughts. Probe and cite each of:
+  - **Neon Postgres schema** — `information_schema.columns` queries for every table the new code reads or writes (`pending_account_mappings`, `pending_account_mapping_signals`, `accounts`, `account_domains`, `contacts`, `raw_interactions`, `interaction_summaries`, `interaction_contact_links`, `calendar_event_interaction_links`, optionally `account_provisioning_outbox`)
+  - **eq-agent-action-core OpenAPI** — re-probe `/openapi.json` for the enrich endpoint. The current shape (per the prior session's blocker discovery) is `POST /api/enrich` body `{url, effort?}`; SSE response by default; `?stream=false` returns AccountProfile blocking 30-90s. Confirm this is still current.
+  - **EventBridge rules** — `aws events describe-rule --name eq-structured-graph-ingest-rule` and `--name action-item-graph-rule`. Cite their current Source + DetailType filters verbatim. The new workflow's final-step EventBridge emit MUST flow through whichever rules are intended (`eq-structured-graph-ingest-rule` for the Neo4j consumer; new `AccountProvisioning.*` events may need new rules in those repos).
+  - **Downstream consumer Pydantic models** — `action-item-graph/src/action_item_graph/models/envelope.py` and `eq-structured-graph-core/app/models/envelope.py`. Cite the relevant enum / required-field shapes verbatim with file:line references and current commit SHA.
+- **Idempotency analysis** — DBOS provides workflow-level idempotency keys but tasks are at-least-once. The final EventBridge emit step can retry. Decide: (a) keep an outbox-style publication ledger in Postgres, or (b) push dedup responsibility to consumers via stable event IDs. Document the choice with reasoning.
+- **All five test-discipline expectations addressed explicitly** — for each new component, name the live-substrate test, the per-branch E2E case, the narrow exception handling, the schema probe, and the cross-service contract probe.
+- **Phase 2 + 3 compounding considerations** — sketch how `@DBOS.scheduled` cron + `set_event`/`get_event` HITL primitives serve Phase 2 progressive enrichment and Phase 3 conflict resolution. Not detailed design — just confirm the substrate compounds.
+- **Cross-repo coordination tasks IDENTIFIED but NOT executed** — frontend queue-UI implications, any new EventBridge rules needed in downstream consumer repos.
+- **Sequencing** — DBOS install + Neon `dbos.*` schema migration → workflow definition → queue routes refactor → final-step EventBridge emit → cutover plan → production E2E extension with new branch cases.
 
-1. **The rethink starts on a verified-working Phase 1 layer.** Before the fix, the rethink was proceeding on top of a foundation we hadn't verified end-to-end. Now we have.
+### Deliverable 2 (Step 7): Revise design doc Section 6
 
-2. **The four systemic quality gaps that let this bug ship apply equally to whatever architecture the rethink picks.** The new architecture must:
-   - Probe live schema at design time (don't assume table/column names).
-   - Avoid mock-at-import-level for in-service functions without real-substrate coverage.
-   - Exercise every fan-out branch in production E2E, not just auth/validation boundaries.
-   - NOT bake in broad try/except blocks that silently degrade on bugs. If the new framework provides retry/error-handling primitives, those REPLACE our excepts — not add to them.
+File: `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` Section 6 (durability machinery)
 
-3. **`tasks/downstream/test-discipline-gaps-2026-05-15.md`** has four concrete follow-up actions that should fold into the new implementation plan (or be done as standalone work before the rethink-execution session, if the user wants confidence restored sooner).
+Replace the polling-worker + outbox + publisher description with the DBOS architecture. Document:
 
-4. **`tasks/lessons.md`** bottom entry "Four systemic quality gaps that let a silent regression ship Phase 1" has the full breakdown of how the bug shipped through six quality gates. Read it before the rethink — it informs which architecture properties matter more than they might appear from the landscape doc alone (observability, real-substrate testability, explicit error propagation).
+- **What was kept** — `workers/materialization.py` SQL, EventBridge cross-service notification, three-layer idempotency invariants (now via DBOS keys + publication ledger).
+- **What changed** — durable execution via DBOS in-process instead of bespoke worker + outbox + publisher process. No new Railway service. No RabbitMQ.
+- **Why** — Codex consult outcome + OSS-strict constraint + solo-founder + Railway operational fit.
 
-## Production credentials + IDs
+### Deliverable 3 (Step 8): Fresh checkpoint
 
-Locked in across the initiative (also in `2026-05-15-initiative-context-snapshot.md` Section 10):
+After Deliverables 1 + 2 are done, run `/context-save` (or write the checkpoint file directly to `~/.gstack/projects/oneilstokeseqrm-live-transcription-fastapi/checkpoints/`) with title `phase-1.5-dbos-plan-written` or similar. The checkpoint should capture: which plan file was written, which design-doc section was revised, what cross-repo coordination tasks were identified, and what the NEXT-NEXT session's scope is (plan execution = code-writing).
 
-- Neon: project `super-glitter-11265514`. Test tenant `11111111-1111-4111-8111-111111111111` (column is `tenants.id`).
-- Railway FastAPI: project `847cfa5a-b77c-4fb0-95e4-b20e8773c23e`, service `59a69f3d-9a24-4041-942a-891c4a81c5fb`, env `e4c5ec15-1931-4632-9e58-92d9c6be4261`, URL `https://live-transcription-fastapi-production.up.railway.app`.
-- Railway eq-agent-action-core: project `421e079f-2e46-4c22-83c4-0fe6208e6aff`, service `3036ea0f-afc9-4bc4-889d-c98617d81e96`, env `f2c0a13f-40c6-4514-9c02-acac2a22c05c`, URL `https://eq-agent-action-core-production.up.railway.app`.
-- Internal JWT: HS256, secret shared (`INTERNAL_JWT_SECRET`), `iss=eq-frontend`, `aud=eq-backend`, claims `tenant_id` (UUID), `user_id`, optional `pg_user_id`.
+---
+
+## What this session does NOT do
+
+- **Write code.** None. Zero. The plan describes what code to write; the next session writes it.
+- **Migrate data.** Schema stays.
+- **Touch action-item-graph or eq-structured-graph-core.** Those repos have their own agents.
+- **Detailed Phase 2/3 design.** Sketch how DBOS compounds; don't design Phase 2/3.
+- **Cross-repo execution.** Identify what needs coordination; don't execute.
 
 ---
 
 ## The user
 
-A non-developer founder. Make confident technical decisions; surface only product / strategic decisions for the user to weigh in on. Work without stopping for clarifying questions; make the reasonable call and continue; the user redirects if needed.
+Non-developer founder. Make confident technical decisions; surface only product / strategic decisions for the user to weigh in on. Work without stopping for clarifying questions; make the reasonable call and continue; the user redirects if needed.
 
-**The user explicitly cares about:** what a cutting-edge 2026 AI-native startup would actually build. Architectural correctness over short-term shortcuts. Maintaining full project context across sessions so any new agent can pick up where the prior left off.
+**The user cares about:** What a cutting-edge 2026 AI-native startup would actually build. Architectural correctness over short-term shortcuts. Maintaining full project context across sessions so any new agent can pick up where the prior left off. Strict OSS-only stance (no SSPL, no BSL, no source-available).
 
-**The user does NOT care about:** preserving sunk-cost code, hitting an arbitrary deadline over correctness, or maintaining patterns that don't represent 2026 best practice.
-
----
-
-## What's NOT in scope this session
-
-- **Writing code.** None. Zero. The rethink is a decision session.
-- **Migrating data.** Schema stays.
-- **Executing on the chosen architecture.** Separate session.
-- **Phase 2 / Phase 3 detailed design.** Pick a substrate that COMPOUNDS into them; don't design them.
-- **Cross-repo coordination work.** Identify what needs coordination; don't execute it.
+**The user does NOT care about:** Preserving sunk-cost code. Hitting arbitrary deadlines over correctness. Patterns that don't represent 2026 best practice.
 
 ---
 
-## Suggested first actions
+## Pre-flight checks at session start
 
-1. Run `/context-restore`. Expect a checkpoint titled "phase-1.5-async-orchestration-rethink-pending" dated 2026-05-15.
-2. Read `2026-05-15-initiative-context-snapshot.md` first (mandatory).
-3. Read this handoff.
-4. Read `2026-05-15-async-orchestration-rethink-brief.md`.
-5. Read `2026-05-15-durable-execution-landscape.md`.
-6. Run `/office-hours` to interrogate the product-level questions in the rethink brief Section 7.
-7. Run `/plan-ceo-review`.
-8. Run `/plan-eng-review` on the short-list.
-9. Run Codex consult on the recommended architecture.
-10. Write the new implementation plan.
-11. Update the design doc.
-12. Save checkpoint. End session.
-
-A subsequent session executes the chosen plan.
+1. Run `/context-restore`. Expect the `phase-1.5-rethink-decided-dbos` checkpoint dated 2026-05-15.
+2. Confirm `MEMORY.md` status reads `PHASE_1.5_RETHINK_DECIDED_DBOS — IMPLEMENTATION_PLAN_WRITING_PENDING`.
+3. Read this handoff + the snapshot Section 5 + the bottom two lessons.
+4. `git status` — should be clean. `git log --oneline -5` should show the doc-only commits from this session at top.
+5. Confirm with the user that the substrate is still DBOS before plan-writing (cheap check in case context has changed).
+6. Execute Deliverable 1, 2, 3 in order.
 
 ---
 
-## Final note for the next agent
+## Final note
 
-The user is paying for thinking, not typing. The value of this session is in the decision quality, not the doc volume. Take time to actually run the workflow skills. Don't shortcut.
+The user is paying for thinking, not typing. The implementation plan is the load-bearing artifact of this session. Take time to actually probe the live contracts — that's what the "Verified contracts" section is for, and the discipline that produced this session's hard-won lesson is the discipline that protects the plan from shipping with another silent gap. Don't shortcut.
 
-The reason this rethink exists: the previous session shortcut to "obviously keep the worker." Don't make the same mistake at a different level (e.g., "obviously Inngest").
-
-When you reach a decision, document the alternatives considered and why they lost. Future sessions need to know not just what we picked but what we explicitly rejected, so they don't re-litigate.
+When in doubt, the checkpoint at `~/.gstack/projects/oneilstokeseqrm-live-transcription-fastapi/checkpoints/20260515-095506-phase-1.5-rethink-decided-dbos.md` has the full decision record, all eliminations with reasons, and the rationale for every choice. Future sessions should know not just what was picked but what was explicitly rejected, so they don't re-litigate.
