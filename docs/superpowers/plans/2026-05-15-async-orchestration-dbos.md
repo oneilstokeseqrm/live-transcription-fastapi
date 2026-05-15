@@ -1031,6 +1031,36 @@ This document is the load-bearing artifact of session 2026-05-15. The executing 
 
 ## 20. Revision history
 
+### v4 — 2026-05-15 (M1 execution — DBOS API + dep contract drift folded in)
+
+Two design-time contract checks during M1 execution surfaced drift between v3 and live reality. Both folded in without altering the substrate decision or any locked architectural choice.
+
+**API drift — DBOS v2.x is sync, not async (probed 2026-05-15 against `dbos==2.22.0` source on GitHub):**
+
+- `DBOS.launch_async()` does not exist; the v2.x API is `DBOS.launch()` (synchronous classmethod, `dbos/_dbos.py:519`).
+- `DBOS.destroy_async()` does not exist; the v2.x API is `DBOS.destroy()` (synchronous classmethod, `dbos/_dbos.py:362`).
+- Both are called inside the async FastAPI lifespan — they are quick startup/shutdown bookkeeping with no event-loop blocking concerns.
+- `executor_id` IS a valid config field (confirmed at `dbos/_dbos_config.py:58`); the assignment guard at `dbos/_dbos.py:445` skips it when None, so `executor_id=os.environ.get("RAILWAY_REPLICA_ID")` correctly yields DBOS-default behavior locally.
+- `run_admin_server` IS a valid config field; setting it to `False` is the documented way to suppress the admin server (port 3001) per `dbos/_dbos_config.py:64`. M1 sets this to False per plan §3.5 + §10.6.
+
+Affected sections (`services/dbos_runtime.py` snippet only — no architectural change):
+
+- §4.3 ("FastAPI lifespan integration: `DBOS.launch_async()`...") — actual code uses sync `DBOS.launch()`.
+- §5.4 (`services/dbos_runtime.py` code snippet) — actual file uses `DBOS.launch()` / `DBOS.destroy()`.
+
+**Dependency knock-on — websockets pin bump:**
+
+- PyPI package name is `dbos` (not `dbos-transact-py` — the GitHub repo is `dbos-transact-py` but the wheel is published as `dbos`). §10.7 references `dbos-transact-py`; actual `requirements.txt` line is `dbos==2.22.0`.
+- `dbos>=1.0.0` requires `websockets>=14.0`. The repo pinned `websockets==13.1` for `deepgram-sdk==2.12.0`. Verified at design time: deepgram-sdk 2.12.0 declares no upper bound on websockets, uses `websockets.client.WebSocketClientProtocol` which remains a deprecated-but-functional alias in websockets 14+, and imports cleanly under websockets 14.2. M1 bumps `websockets==13.1` → `websockets==14.2` (minimum 14.x that satisfies DBOS).
+- Knock-on risk: the deprecation alias may be removed in a future websockets major; tracked as a Phase 2+ concern with the upgrade path being either deepgram-sdk upgrade OR (eventually) switching off the deprecated import surface.
+
+**Test suite delta:**
+- 7 new tests added (`tests/unit/test_dbos_runtime.py`).
+- Pre-existing failures (`test_integration_endpoints.py`, `test_jwt_auth.py`, etc.): 50 failed / 327 passed / 2 skipped on baseline main vs 50 failed / 334 passed / 2 skipped on M1 branch. Net delta: +7 passing, 0 new failures. The pre-existing 50 failures stem from Phase 1 schema-drift (account_id required) and env-var dependencies; tracked under Items 1–3 in `tasks/downstream/test-discipline-gaps-2026-05-15.md`.
+
+**Empirical boot test:**
+- Isolated invocation of `dbos_lifespan` against SQLite fallback succeeds end-to-end (M1 acceptance partial confirmation; production deploy supplies the remaining empirical evidence per M1 §13).
+
 ### v3 — 2026-05-15 (post-user strategy decision on multi-replica scaling)
 
 User-driven update after surfacing the `--workers 1` versus `--workers 2` trade-off explicitly. Decision: ship V1 with one Railway replica running `uvicorn --workers 1`, AND make the deploy multi-replica-ready by configuration via `executor_id=os.environ.get("RAILWAY_REPLICA_ID")` in `DBOS.DBOSConfig`. Defer the orphan-workflow detector to Phase 2 scale work. Full decision record + Phase-2-trigger rules in `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`.
