@@ -1061,6 +1061,25 @@ Affected sections (`services/dbos_runtime.py` snippet only — no architectural 
 **Empirical boot test:**
 - Isolated invocation of `dbos_lifespan` against SQLite fallback succeeds end-to-end (M1 acceptance partial confirmation; production deploy supplies the remaining empirical evidence per M1 §13).
 
+**M2 ordering correction — DROP TABLE deferred to post-M3:**
+
+Plan §11 sequenced M2 (Prisma migrations: add UNIQUE INDEX + DROP outbox) BEFORE M3 (materialization update). But the current `workers/materialization.py:243` still calls `INSERT_OUTBOX_SQL` on every `/map` invocation; dropping the outbox table in M2 would break `/map` until M3's materialization update deployed. The plan's "verify the existing live-transcription-fastapi test suite still passes against the post-migration database" check would catch this if the test suite exercised the real /map → materialization path, but tests use import-level mocks per the open Item 1 gap.
+
+**Mitigation:** M2's scope is split — the eq-frontend migration ships UNIQUE INDEX only. The DROP TABLE moves to a separate post-M3 cleanup migration (tracked as M3.5). After M3 deploys (materialization no longer writes to outbox), the outbox drop is safe.
+
+**State at time of correction (2026-05-15 mid-session):**
+- UNIQUE INDEX `interaction_contact_links_interaction_id_contact_id_key` applied to production Neon.
+- `account_provisioning_outbox` table: initially dropped then restored via a second Neon migration before any /map call could have hit the dropped state. Net: production returned to consistent pre-M2 + UNIQUE-INDEX-added posture.
+
+**Updated milestone sequence:**
+- M2 (current scope): UNIQUE INDEX only. Coordinated via the eq-frontend Prisma PR.
+- M3: workflow definition + materialization update (no INSERT_OUTBOX_SQL).
+- M3.5 (new): drop `account_provisioning_outbox` via a separate Prisma migration after M3 deploys.
+- M4: queue route cutover.
+- M5: tooling + checklist updates.
+
+This honors the plan §11 intent (drop the outbox table as part of Phase 1.5 cleanup) while making the deploy sequence safe.
+
 ### v3 — 2026-05-15 (post-user strategy decision on multi-replica scaling)
 
 User-driven update after surfacing the `--workers 1` versus `--workers 2` trade-off explicitly. Decision: ship V1 with one Railway replica running `uvicorn --workers 1`, AND make the deploy multi-replica-ready by configuration via `executor_id=os.environ.get("RAILWAY_REPLICA_ID")` in `DBOS.DBOSConfig`. Defer the orphan-workflow detector to Phase 2 scale work. Full decision record + Phase-2-trigger rules in `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`.

@@ -610,3 +610,160 @@ include a "verified contracts" section that explicitly cites:
 Plans that don't include this section are repeating the exact
 mistake all three incidents share.
 
+---
+
+## Codex review is a merge gate, not a follow-up (2026-05-15)
+
+### Lesson
+
+Run `/codex review` on the diff **before requesting merge**, not
+after. Treat its P1 findings as merge blockers: fold them into the
+same PR before the merge button is pressed. Post-merge Codex review
+is allowed but ONLY catches what a pre-merge review would have at the
+cost of a hotfix PR.
+
+### Why
+
+Phase 1.5 M1 merged at commit `dc0806c` then surfaced two real P1
+findings on the post-merge Codex pass — `websockets>=14.0`'s rename
+of `extra_headers` → `additional_headers` broke deepgram-sdk 2.12.0
+at runtime, and the missing `DBOS_SYSTEM_DATABASE_URL` env var would
+have silently fallen back to ephemeral SQLite, defeating the entire
+durability buy. Both shipped to production with the deploy succeeding
+(import-time, but call-site failure on the first `/listen`). The fix
+was PR #15 `e334638`. Cost: a hotfix PR, an extra production deploy,
+extra time in the merge cycle, and one user-visible failure window
+between the M1 deploy and the hotfix.
+
+Pre-merge would have been a normal review iteration — one extra
+commit on the open PR before merging — instead of "merge, deploy,
+hotfix, deploy again."
+
+### How to apply
+
+For every phase-1.5 milestone PR (M3 onwards) and every comparable
+phase boundary:
+
+1. Open the PR with the proposed diff.
+2. Before clicking merge, run `/codex review` on the diff or the PR
+   URL.
+3. Read Codex's output:
+   - P1 findings → fold into the same PR; commit, push, re-run Codex
+     until P1 count is zero.
+   - P2/P3 → judgment call. If the work is small, fold in; if it's
+     genuinely follow-up, ticket it and proceed.
+4. Only after the P1 gate passes, merge.
+
+This rule is non-negotiable for milestones that touch durability,
+schema migrations, dependency upgrades, or cross-service contracts.
+For ergonomic PRs (docstring fixes, README edits) the gate is overkill.
+
+The four systemic quality gaps that shipped the 2026-05-15 silent
+regression all could have been caught by the disciplines in the
+Phase 1.5 implementation plan. Don't repeat them by skipping the
+explicit Codex pass between code being written and code shipping.
+
+---
+
+## Imports don't catch keyword-arg removals in transitive dependency upgrades (2026-05-15)
+
+### Lesson
+
+When a dependency upgrade renames or removes a public keyword
+argument, the failure mode is **at call-time, not import-time**.
+Smoke-test the actual call sites at runtime — don't trust that
+imports succeeding means the code still works.
+
+### Why
+
+DBOS install pulled `websockets>=14.0` (versus our pinned 13.1).
+`deepgram-sdk==2.12.0` imports cleanly under websockets 14.2, AND
+`websockets.client.WebSocketClientProtocol` still works under
+websockets 14.x as a deprecated alias — so two of three smoke checks
+passed. But `websockets.connect(extra_headers=...)` was renamed to
+`additional_headers=` in websockets 14.0, and deepgram's
+`_utils.py:230` calls `extra_headers=`. The TypeError surfaces only
+when `/listen` actually negotiates a connection — neither imports
+nor unit tests with mocked websockets exercise it.
+
+The fix was `services/deepgram_websockets_compat.py`: a kwarg-
+translating shim imported BEFORE deepgram. The shim is small, but
+spotting the need for it required reading the dependency's source —
+which we wouldn't have done if the M1 hotfix Codex review hadn't
+flagged the version-skew risk.
+
+### How to apply
+
+When bumping a transitive dependency for an unrelated reason:
+
+1. **Grep all in-tree call sites** for the deprecated/removed
+   signature — search the dependency's source AND your own.
+2. **Run a real call-path smoke test** in CI or a Railway one-off:
+   the actual HTTP request, WebSocket handshake, or whatever the
+   bumped dependency mediates. Importing the module is not enough.
+3. **If the dependency is a leaf in your dependency tree** (you
+   import it directly), upgrade it deliberately and check the
+   changelog. If it's a transitive (forced by another upgrade),
+   verify the *transitive* dependency's call sites against the new
+   version's API.
+4. **Pin the surfaced incompatibilities** as a compat shim or a
+   coordinated upstream upgrade — don't paper over with a try/except.
+
+A passing unit test suite with mocked transport is the same
+silent-regression risk class as the 2026-05-15 schema bug: import-
+level mocks make real-call-site breakage invisible.
+
+---
+
+## Coordinated multi-repo schema migrations need explicit code-lifecycle sequencing (2026-05-15)
+
+### Lesson
+
+Schema migrations that **add** (columns, tables, indexes) are
+forward-compatible — old code keeps working against new schema.
+Schema migrations that **remove** (drop column, drop table, NOT
+NULL flip) are backward-incompatible — old code breaks against new
+schema. Bundle them at your peril. Each must ship in a milestone
+whose code lifecycle no longer depends on the removed thing.
+
+### Why
+
+Plan §11 v2/v3 bundled M2 (Prisma migrations) as "add UNIQUE INDEX
+AND drop `account_provisioning_outbox`." At execution time the
+ordering caught us: `workers/materialization.py:243` still INSERTed
+into the outbox on every `/map` call. Dropping the table in M2 would
+have broken `/map` until M3 deployed. The mid-flight fix was to
+restore the table within ~3 minutes (zero rows lost; queue UI not
+exercising /map yet in production) and split M2: UNIQUE INDEX (an
+addition) ships in M2; DROP TABLE (a removal) moves to M3.5,
+post-M3-deploy when no code path writes to outbox.
+
+The plan's "verify the existing test suite passes against post-
+migration schema" gate would have caught this if integration tests
+weren't import-mocking the materialization path (Item 1 of test-
+discipline-gaps).
+
+### How to apply
+
+For any coordinated cross-repo / cross-service migration:
+
+1. **Classify each migration as ADDITION or REMOVAL.** Adding a
+   column / index / table / constraint = ADDITION. Dropping anything
+   or tightening nullability/typing = REMOVAL.
+2. **Bundle only ADDITIONS together.** A single PR with N additions
+   is safe regardless of deploy order across consumers.
+3. **Sequence REMOVALS post-deploy of all code paths that referenced
+   the removed thing.** The acceptance gate for any removal migration
+   is "grep the codebase, every production code path that referenced
+   the removed thing has been deployed in its updated form."
+4. **When a plan accidentally bundles both, split it at execution
+   time.** The cost of one extra milestone PR is small; the cost of
+   a broken-production deploy window is high.
+5. **Document the split in the plan's revision history.** Future
+   sessions reading the plan should see the original intent + the
+   correction + why.
+
+This is the third rule in the family: **deployments are sequenced,
+not atomic**; the migration's safety window depends on which
+service's code is "ahead" at any given moment.
+
