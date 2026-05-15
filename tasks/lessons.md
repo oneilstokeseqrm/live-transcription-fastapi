@@ -309,3 +309,176 @@ The benefit: a substrate that compounds across the remaining 2-3 phases
 of the initiative, rather than another session like this one in 3 months
 when Phase 2 hits the same wall.
 
+## Four systemic quality gaps that let a silent regression ship Phase 1 (2026-05-15)
+
+A downstream agent (eq-synthetic-date-generation) traced a bug in
+`services/account_lookup.py` where the SQL queried `FROM accounts` for
+a `domain` column that doesn't exist on that table — the correct table
+is `account_domains` (a join table). The bug was introduced in commit
+2552b4b (Phase 1 contract-tightening merge, 2026-05-14) and was live
+in production for ~24 hours before being detected. During that window,
+every transcript whose calendar event had BUSINESS-domain attendees
+produced ZERO rows in `raw_interactions`, `interaction_contact_links`,
+and `calendar_event_interaction_links` because the SQL error was
+silently swallowed by the outer try/except in
+`TranscriptEnrichmentService.enrich()`.
+
+**Six quality gates did not catch it:**
+
+1. The Phase 1 implementation session (didn't probe live schema)
+2. 2 rounds of Codex review on the diff (Codex can't see live schema)
+3. A self-review in Codex format (claimed everything was wired correctly)
+4. 122 unit tests passing (3 of them mocked the function; mocks don't run SQL)
+5. ~10 integration tests passing (ALL patched `lookup_account_by_domain`
+   at the import level, so the real query never ran in tests)
+6. Production E2E reporting 9/9 → 13/13 → 20/20 PASS across phase ships
+   (no case exercised a BUSINESS-domain attendee with a known account)
+
+This is the worst kind of bug: silent, in critical-path data, undetected
+by every quality gate the team built, and visible only to a downstream
+observer. The fix itself is one SQL change. The systemic gaps it
+revealed are four separate disciplines that need codifying.
+
+### Gap 1 — Probe live schema at design time
+
+Internal database schema must be probed at design time, not at runtime.
+This is the same lesson as "probe external service contracts at design
+time" (2026-05-15, earlier) but generalized to internal schemas — same
+failure mode, different surface.
+
+**How to apply:**
+1. Before writing any new SQL that references columns / tables you didn't
+   personally write in this same diff, run a probe query via Neon MCP:
+   ```sql
+   SELECT column_name, data_type FROM information_schema.columns
+   WHERE table_name = '<your_table>' AND table_schema = 'public';
+   ```
+2. The probe takes ~5 seconds. The cost of NOT probing is the multi-day,
+   multi-quality-gate failure mode above.
+3. Document the probe result inline in the SQL comment, with a date stamp.
+   ("Schema verified via information_schema on YYYY-MM-DD against
+   project <project_id>.") This makes future drift auditable.
+4. Codex review CANNOT verify live schema. Self-review in Codex format
+   CANNOT verify live schema. Only an actual probe verifies it.
+
+### Gap 2 — Mock-at-import-level is a coverage hole for in-service functions
+
+When integration tests patch `services.foo.bar` at the import level
+(`patch("services.foo.bar", AsyncMock(return_value=...))`), the real
+implementation of `bar` is bypassed entirely. If `bar` has no direct
+unit test against a real-ish substrate (or its unit tests are also
+mocked at the import level), the function's real behavior is uncovered
+across the entire test suite. Bugs in `bar` ship through every quality
+gate.
+
+In our case: `lookup_account_by_domain` was mocked at the import level
+in 6 different integration test files. Its only direct unit tests used
+`MagicMock` for the session, so the SQL was never executed. Total real
+coverage of the function: zero. A SQL error in the function shipped
+through 132 passing tests.
+
+**How to apply:**
+1. When patching an in-service function in an integration test, audit
+   whether that function has DIRECT real-substrate coverage elsewhere.
+   "Real-substrate" means: tests that actually execute the function's
+   side effects against something other than a `MagicMock` (a test DB,
+   a fixture, a SQL parser).
+2. If no real-substrate coverage exists, add at least one — either an
+   integration test against a test DB, or (cheapest) a SQL-text assertion
+   in the unit test (as the new `test_sql_queries_account_domains_not_accounts`
+   demonstrates).
+3. Boundary functions (third-party HTTP clients, external services) ARE
+   appropriate to mock at the import level. In-service primitives are
+   not — they're owned by the same codebase and should be tested against
+   real substrates.
+4. The /review skill checklist should include: "for every import-level
+   mock of an in-service function, name the test that exercises the
+   real implementation."
+
+### Gap 3 — Production E2E must exercise happy paths through fan-out branches, not just boundaries
+
+The production E2E suite at `/tmp/e2e_phase_1_production.py` reports
+20/20 PASS but only covers: auth rejection (401/400), validation rejection
+(422), missing-header rejection (400), and bare happy-path 200s with
+minimal participants. It does NOT cover: a happy path with a calendar
+event that has BUSINESS-domain attendees whose domain is already in
+`account_domains`. That branch — three-state branching → BUSINESS+known
+→ `lookup_account_by_domain` returns a hit → contact created with
+resolved account_id — is the most-traveled production path and had
+zero coverage.
+
+**How to apply:**
+1. For every fan-out branch in critical-path code (per-attendee
+   classification PERSONAL/INTERNAL/BUSINESS+known/BUSINESS+unknown,
+   three-state state machines, multi-arm decision logic), the production
+   E2E suite MUST include at least one happy-path case per arm that
+   exercises real downstream effects (writes the expected rows, emits
+   the expected events).
+2. Boundary tests (auth, validation, error mapping) are necessary but
+   not sufficient. A 20/20 pass on boundary cases means we know we
+   correctly reject bad input; it does NOT mean we know we correctly
+   process good input.
+3. Each phase ship must add E2E cases for the new branches it introduces.
+   This is already codified in the "Phase 1.5 Production E2E Discipline"
+   section of the plan doc but only as "extend the suite incrementally"
+   — make the rule stronger: "extend the suite with one happy-path-per-arm
+   case for every new branch."
+
+### Gap 4 — Broad try/except blocks silently degrade behavior on bugs
+
+`services/transcript_enrichment.py:399-405` has a `try: ... except
+Exception:` block around the enrichment side-effects that catches and
+silently degrades on any failure. When `lookup_account_by_domain`
+threw a SQL error from the missing column, the except caught it,
+logged something, and returned an empty `EnrichmentResult`. The user
+saw `/text/clean` return 200; the deeper pipeline silently produced
+zero rows.
+
+This was already noted as a NIT in prior Phase 1 code review (project
+memory "Phase 1 minor nits noted (defer to Phase 1.5 polish)" item 3).
+The NIT said: "outer `try/except Exception` swallows the new `ValueError`
+from the recording_user_id-None invariant. Either narrow the outer
+except or add a comment documenting the intentional swallow." The
+NIT was deferred. The bug we just fixed is a concrete case of why
+deferring it cost ~24 hours of production silently-broken behavior.
+
+**How to apply:**
+1. In critical-path code, `except Exception:` is a code smell. Either
+   narrow it to the specific exception types we expect (and let
+   everything else propagate to surface as a real error), or write a
+   comment documenting WHY the broad swallow is intentional.
+2. The /review skill checklist should flag every `except Exception:`
+   in code under `services/`, `workers/`, `routers/` and require an
+   inline justification.
+3. NITs from prior reviews that have shipped become DEBT, not "deferred."
+   Treat them as such — when a NIT comment becomes load-bearing for a
+   bug, the next ship cycle should narrow the except in the same PR as
+   the bug fix. (This fix does NOT narrow `transcript_enrichment.py`'s
+   except per the prompt's instruction to limit scope; it's tracked in
+   `tasks/downstream/test-discipline-gaps-2026-05-15.md` for follow-up.)
+
+### Why the existing lessons didn't catch this
+
+The 2026-05-15 earlier lesson ("Probe external service contracts at
+design time") was about EXTERNAL services (the eq-agent-action-core
+agent). The principle generalizes to INTERNAL schemas but the prior
+lesson didn't explicitly say so. Future external-vs-internal contract
+verification should be one umbrella lesson, not two.
+
+The Production E2E lesson (2026-05-14, "Production E2E with a Railway-
+signed JWT is non-substitutable") asserted the E2E suite is the final
+quality gate. It IS — but the suite is only as good as its coverage,
+and 20/20 PASS on auth/validation boundaries doesn't mean coverage of
+happy-path branches.
+
+The Codex review lessons asserted that Codex review is non-substitutable.
+It IS — but Codex can't see live database schema. "Codex review caught
+3 P1s in Round 1" implies Codex is sufficient; the right framing is
+"Codex review is necessary but insufficient — must be combined with
+live schema probing AND real-substrate test coverage AND branch-
+covering E2E."
+
+All three prior lessons remain true. They just don't compose to "this
+bug should have been caught." This new lesson explicitly closes the
+composition gap.
+

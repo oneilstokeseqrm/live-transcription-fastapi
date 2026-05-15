@@ -105,6 +105,22 @@ From `2026-05-15-initiative-context-snapshot.md` section 6:
 
 The rethink decides what's in the "could be replaced by" column. The invariant columns stay.
 
+### Test-discipline expectations the new architecture must meet (added 2026-05-15)
+
+The 2026-05-15 `account_lookup` bug surfaced four systemic quality gaps that affect any architecture choice. Whatever substrate the rethink picks, the new code must:
+
+1. **Live-schema verification at design time.** Any new SQL (or framework-native data access pattern) must be probed against the live Postgres project via Neon MCP at design time, with the probe result cited inline in the code. Codex review CANNOT verify live schema; only an actual probe does.
+
+2. **Real-substrate coverage for in-service primitives.** If the new architecture has functions that wrap DB queries, agent calls, or other side-effects, they must have at least one test that exercises the real implementation (real test DB, real HTTP server, or at minimum a SQL-text / payload assertion). Mock-at-import-level testing for in-service functions is a coverage hole that hides shipping bugs.
+
+3. **Per-branch E2E coverage.** Every fan-out branch in critical-path code (e.g., per-attendee three-state branching, workflow decision arms, retry-vs-fail policies) must have at least one happy-path case in the production E2E suite that exercises real downstream effects (writes, events, state transitions). Auth/validation/error cases are necessary but not sufficient.
+
+4. **Narrow exception handling.** Broad `except Exception:` blocks that silently degrade behavior on bugs are the smell that hid the account_lookup bug for 24 hours. If the new framework provides retry/error-handling primitives, those REPLACE our excepts — they don't add to them. Programming errors should propagate to Sentry / Railway / observability rather than be swallowed.
+
+These four expectations are codified in `tasks/lessons.md` ("Four systemic quality gaps that let a silent regression ship Phase 1") with concrete how-to-apply guidance, and in `tasks/downstream/test-discipline-gaps-2026-05-15.md` as four follow-up action items with acceptance criteria.
+
+**The new implementation plan must explicitly address all four.** Plans that don't (and just say "we'll test it") are repeating the exact mistake.
+
 ## 5. Frozen-state inventory: what we'd potentially throw away
 
 If the rethink picks something other than "keep the polling worker," here's what gets deleted:

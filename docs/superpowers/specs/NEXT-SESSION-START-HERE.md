@@ -93,12 +93,30 @@ The previous session recommended Path A (patch the agent contract, keep the poll
 
 ## Repository state (as of 2026-05-15 end-of-session)
 
-- **Main HEAD:** docs-only commits from this session on top of `4b44898`. Working tree clean.
-- **All shipped code intact** — PR #10, #11, #12, #13 all merged in main. Production E2E still 20/20 PASS for shipped routes.
+- **Main HEAD:** `31f513f fix(account-lookup): query account_domains, not accounts.domain` — plus docs-only commits from this session. Working tree clean. All commits pushed to `origin/main`.
+- **All shipped code intact** — PR #10, #11, #12, #13 all merged in main. Production E2E still 20/20 PASS for shipped routes. (Caveat — see "Phase 1 silent regression fixed" section below.)
 - **Worker process not running in production.** Approved queue entries currently accumulate without being processed; this is by design until the rethink picks a substrate.
-- **FastAPI service** serving all ingestion + queue routes correctly.
+- **FastAPI service** serving all ingestion + queue routes correctly. Last Railway deploy: `0ac9010d-7ddd-4d86-af0d-285fcb71e675` SUCCESS — picked up the account_lookup fix.
 - **Neon eq-dev schema** all Phase 1.5 columns + tables present.
-- **Production E2E** at `/tmp/e2e_phase_1_production.py` (486 lines, 20/20 PASS). Will need updates after rethink picks substrate.
+- **Production E2E** at `/tmp/e2e_phase_1_production.py` (486 lines, 20/20 PASS). Will need updates after rethink picks substrate, AND should be extended with per-attendee-branching happy-path cases per `tasks/downstream/test-discipline-gaps-2026-05-15.md` Item 2.
+
+### Phase 1 silent regression fixed 2026-05-15 — important context for the rethink
+
+A bug in `services/account_lookup.py` (introduced 2026-05-14 in PR #10 merge) made calendar-event matching and contact resolution silently fail for every transcript with BUSINESS-domain attendees. The bug was undetected by 6 layers of quality gates (Codex review, unit tests, integration tests, self-review, production E2E reporting 20/20 PASS) and was traced by a downstream agent (eq-synthetic-date-generation). Fixed at commit `31f513f` 2026-05-15.
+
+**Why this matters for the rethink session:**
+
+1. **The rethink starts on a verified-working Phase 1 layer.** Before the fix, the rethink was proceeding on top of a foundation we hadn't verified end-to-end. Now we have.
+
+2. **The four systemic quality gaps that let this bug ship apply equally to whatever architecture the rethink picks.** The new architecture must:
+   - Probe live schema at design time (don't assume table/column names).
+   - Avoid mock-at-import-level for in-service functions without real-substrate coverage.
+   - Exercise every fan-out branch in production E2E, not just auth/validation boundaries.
+   - NOT bake in broad try/except blocks that silently degrade on bugs. If the new framework provides retry/error-handling primitives, those REPLACE our excepts — not add to them.
+
+3. **`tasks/downstream/test-discipline-gaps-2026-05-15.md`** has four concrete follow-up actions that should fold into the new implementation plan (or be done as standalone work before the rethink-execution session, if the user wants confidence restored sooner).
+
+4. **`tasks/lessons.md`** bottom entry "Four systemic quality gaps that let a silent regression ship Phase 1" has the full breakdown of how the bug shipped through six quality gates. Read it before the rethink — it informs which architecture properties matter more than they might appear from the landscape doc alone (observability, real-substrate testability, explicit error propagation).
 
 ## Production credentials + IDs
 

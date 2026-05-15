@@ -217,12 +217,26 @@ Even though Phase 1.5 worker is blocked, **a lot is working in production:**
 
 - FastAPI service at `https://live-transcription-fastapi-production.up.railway.app` serving all ingestion routes (WebSocket /listen, /text/clean, /batch/process, /upload/init + /upload/complete) with full Phase 1 + Phase 1.5 P2 enforcement.
 - Queue routes (POST /queue/{id}/approve, /map, /ignore) all serving correctly with full Codex-reviewed auth/idempotency.
-- Production E2E suite at `/tmp/e2e_phase_1_production.py`: 20/20 PASS against the live service.
-- All shipped code (PRs #10, #11, #12, #13) intact and merged in main.
+- Production E2E suite at `/tmp/e2e_phase_1_production.py`: 20/20 PASS against the live service. **Important caveat — see Section 9.1 below.**
+- All shipped code (PRs #10, #11, #12, #13, and the 2026-05-15 fix at commit `31f513f`) intact and merged in main.
 - Postgres schema (Neon eq-dev) has all Phase 1.5 columns + tables.
-- Three-state branching live for all four ingestion paths.
+- Three-state branching live for all four ingestion paths and **verified working** as of 2026-05-15.
 
 What's not in production: the worker process that consumes the queue. Approved queue entries currently accumulate without being processed because there is no worker container running `python -m workers`. The queue UI (eq-frontend) may also be incomplete (it was tracked as separate cross-repo work).
+
+### 9.1 Phase 1 had a 24-hour silent regression — fixed 2026-05-15
+
+**What happened:** Phase 1 shipped at commit `2552b4b` (2026-05-14) introduced a bug in `services/account_lookup.py` — the SQL queried `FROM accounts WHERE ... AND lower(domain) = :domain`, but the `accounts` table has no `domain` column (the correct join table is `account_domains`). Every transcript whose calendar event had BUSINESS-domain attendees triggered a SQL error inside `lookup_account_by_domain`. The error was silently swallowed by the outer try/except at `services/transcript_enrichment.py:399-405`, causing `enrich()` to return an empty `EnrichmentResult`. The downstream effect: ZERO rows produced in `raw_interactions`, `interaction_contact_links`, and `calendar_event_interaction_links` for the affected meetings. The /text/clean response was still 200; intelligence-extraction tables (`interaction_summary_entries`, `interaction_insights`) still populated because they're independent of the contact path.
+
+**How long it was live:** ~24 hours, from PR #10 merge on 2026-05-14 to fix on 2026-05-15.
+
+**How it was found:** Not by our own test suites or production E2E. The eq-synthetic-date-generation agent (a downstream observer in a separate repo) traced the bug while investigating why their calendar-event matching was dropping data.
+
+**How it shipped through six quality gates:** the lessons doc has the full breakdown (`tasks/lessons.md` → "Four systemic quality gaps that let a silent regression ship Phase 1"). Summary: Codex review can't see live schema; all unit tests used mocks that didn't execute SQL; all integration tests patched `lookup_account_by_domain` at the import level so the real query never ran; production E2E covered auth/validation boundaries but no happy-path-through-branching cases.
+
+**The fix:** commit `31f513f` on main (deployed at Railway deployment `0ac9010d-7ddd-4d86-af0d-285fcb71e675`, SUCCESS 2026-05-15). SQL changed from `accounts.domain` to `account_domains` (the correct join table). Two new regression tests added including a SQL-text assertion that catches mock-only test coverage gaps.
+
+**What this means for the rethink:** Phase 1's product behavior is now verified-correct. The rethink proceeds on a foundation that we KNOW works end-to-end (not just "tests pass"). But the four systemic quality gaps that let this ship apply equally to whatever architecture the rethink picks — see `tasks/downstream/test-discipline-gaps-2026-05-15.md` for follow-up actions that should fold into the new implementation plan.
 
 ## 10. Production credentials + IDs
 
