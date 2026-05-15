@@ -62,8 +62,11 @@ SELECT_QUEUE_STATE_SQL = text("""
            approval_attempt_id::text AS approval_attempt_id,
            re_open_count
     FROM pending_account_mappings
-    WHERE id = :queue_id::uuid
+    WHERE id = CAST(:queue_id AS uuid)
 """)
+# SQLAlchemy 2.0.49 parses ``:name::uuid`` as a truncated bindname
+# (one char dropped at the second-to-last colon). The CAST(:name AS
+# uuid) form is the portable workaround for explicit casts.
 
 
 TRANSITION_TO_CREATING_SQL = text("""
@@ -71,7 +74,7 @@ TRANSITION_TO_CREATING_SQL = text("""
     SET status = 'creating',
         creation_started_at = COALESCE(creation_started_at, NOW()),
         updated_at = NOW()
-    WHERE id = :queue_id::uuid AND status = 'approved'
+    WHERE id = CAST(:queue_id AS uuid) AND status = 'approved'
 """)
 # Replay-safe: a retry after status moved to 'creating' is a no-op
 # (WHERE status='approved' matches nothing). If status moved past
@@ -83,7 +86,7 @@ TRANSITION_TO_CREATING_SQL = text("""
 SELECT_ACCOUNT_BY_DOMAIN_SQL = text("""
     SELECT account_id::text
     FROM account_domains
-    WHERE tenant_id = :tenant_id::uuid AND lower(domain) = lower(:domain)
+    WHERE tenant_id = CAST(:tenant_id AS uuid) AND lower(domain) = lower(:domain)
 """)
 
 
@@ -93,7 +96,7 @@ INSERT_ACCOUNT_SQL = text("""
         industry, company_size, region, website, description,
         ai_workflow_trigger, created_at, updated_at
     ) VALUES (
-        :id::uuid, :tenant_id::uuid, :name, 'active', 'Prospect',
+        CAST(:id AS uuid), CAST(:tenant_id AS uuid), :name, 'active', 'Prospect',
         :industry, :company_size, :region, :website, :description,
         false, NOW(), NOW()
     )
@@ -102,7 +105,7 @@ INSERT_ACCOUNT_SQL = text("""
 
 INSERT_ACCOUNT_DOMAIN_SQL = text("""
     INSERT INTO account_domains (id, tenant_id, account_id, domain, created_at)
-    VALUES (gen_random_uuid(), :tenant_id::uuid, :account_id::uuid,
+    VALUES (gen_random_uuid(), CAST(:tenant_id AS uuid), CAST(:account_id AS uuid),
             lower(:domain), NOW())
     ON CONFLICT (tenant_id, domain) DO NOTHING
     RETURNING account_id::text
@@ -116,8 +119,8 @@ SELECT_INTERACTIONS_FOR_EMIT_SQL = text("""
            user_id::text AS user_id,
            created_at
     FROM raw_interactions
-    WHERE interaction_id = ANY(:interaction_ids::uuid[])
-      AND tenant_id = :tenant_id::uuid
+    WHERE interaction_id = ANY(CAST(:interaction_ids AS uuid[]))
+      AND tenant_id = CAST(:tenant_id AS uuid)
 """)
 # tenant_id filter is belt-and-suspenders. The interaction_ids list comes
 # from materialize_signals' MaterializationResult, which itself only wrote
@@ -139,11 +142,11 @@ SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
     JOIN interaction_summaries summ ON summ.summary_id = l.interaction_id
     JOIN contacts c ON c.id = l.contact_id
     LEFT JOIN pending_account_mapping_signals s
-           ON s.queue_id = :queue_id::uuid
+           ON s.queue_id = CAST(:queue_id AS uuid)
           AND lower(s.contact_email) = lower(c.email)
           AND s.archived_at IS NULL
-    WHERE summ.interaction_id = :raw_interaction_id::uuid
-      AND c.tenant_id = :tenant_id::uuid
+    WHERE summ.interaction_id = CAST(:raw_interaction_id AS uuid)
+      AND c.tenant_id = CAST(:tenant_id AS uuid)
 """)
 # Joins via summaries because interaction_contact_links.interaction_id
 # stores summary_id (Prisma naming artifact, see tasks/lessons.md). The
@@ -344,62 +347,72 @@ async def resolve_or_create_account(
     domain)`` UNIQUE INDEX gating, but possible) — one wins the
     ``account_domains`` insert; the other's INSERT gets the ON CONFLICT
     DO NOTHING branch (returns 0 rows), then re-SELECTs to fetch the
-    winner's account_id and rolls back its own ``accounts`` insert.
+    winner's account_id and rolls back its own ``accounts`` insert in
+    a fresh session.
     """
-    async with get_async_session() as session:
-        # Fast path: domain already bound. Avoids creating an orphan
-        # accounts row in the rare case the workflow ran once, was
-        # retried, but the prior run's account row was rolled back
-        # before checkpointing.
-        existing = (
-            await session.execute(
-                SELECT_ACCOUNT_BY_DOMAIN_SQL,
-                {"tenant_id": tenant_id, "domain": domain},
-            )
-        ).one_or_none()
-        if existing is not None:
-            return existing.account_id
-
-        async with session.begin():
-            account_id = str(uuid.uuid4())
-            await session.execute(
-                INSERT_ACCOUNT_SQL,
-                {
-                    "id": account_id,
-                    "tenant_id": tenant_id,
-                    "name": profile.name,
-                    "industry": profile.industry,
-                    "company_size": profile.company_size,
-                    "region": profile.region,
-                    "website": profile.website,
-                    "description": profile.description,
-                },
-            )
-            domain_row = (
-                await session.execute(
-                    INSERT_ACCOUNT_DOMAIN_SQL,
-                    {
-                        "tenant_id": tenant_id,
-                        "account_id": account_id,
-                        "domain": domain,
-                    },
+    # Fast-path read in its own short transaction — avoids holding a
+    # row-locking transaction open across the agent profile inspection.
+    async with get_async_session() as read_session:
+        async with read_session.begin():
+            existing = (
+                await read_session.execute(
+                    SELECT_ACCOUNT_BY_DOMAIN_SQL,
+                    {"tenant_id": tenant_id, "domain": domain},
                 )
             ).one_or_none()
+    if existing is not None:
+        return existing.account_id
 
-            if domain_row is None:
-                # Race: another concurrent provisioning won the domain
-                # bind. Roll back our accounts insert and resolve to
-                # the winner.
-                await session.rollback()
-                winner = (
-                    await session.execute(
+    # Write path. INSERT accounts + INSERT account_domains in one
+    # transaction; race-loser raises ``_DomainRaceLost`` which rolls
+    # back the accounts insert via SQLAlchemy's begin() context-manager
+    # exit-on-exception behavior, then we re-resolve in a fresh session.
+    account_id = str(uuid.uuid4())
+    try:
+        async with get_async_session() as write_session:
+            async with write_session.begin():
+                await write_session.execute(
+                    INSERT_ACCOUNT_SQL,
+                    {
+                        "id": account_id,
+                        "tenant_id": tenant_id,
+                        "name": profile.name,
+                        "industry": profile.industry,
+                        "company_size": profile.company_size,
+                        "region": profile.region,
+                        "website": profile.website,
+                        "description": profile.description,
+                    },
+                )
+                domain_row = (
+                    await write_session.execute(
+                        INSERT_ACCOUNT_DOMAIN_SQL,
+                        {
+                            "tenant_id": tenant_id,
+                            "account_id": account_id,
+                            "domain": domain,
+                        },
+                    )
+                ).one_or_none()
+                if domain_row is None:
+                    raise _DomainRaceLost()
+                return account_id
+    except _DomainRaceLost:
+        # Race: another concurrent provisioning won the domain bind.
+        # Our accounts insert was rolled back; resolve to the winner.
+        async with get_async_session() as resolve_session:
+            async with resolve_session.begin():
+                row = (
+                    await resolve_session.execute(
                         SELECT_ACCOUNT_BY_DOMAIN_SQL,
                         {"tenant_id": tenant_id, "domain": domain},
                     )
                 ).one()
-                return winner.account_id
+                return row.account_id
 
-            return account_id
+
+class _DomainRaceLost(Exception):
+    """Internal sentinel: rolls back the write txn so we can re-resolve."""
 
 
 # ---------------------------------------------------------------------------

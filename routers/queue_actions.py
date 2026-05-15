@@ -171,14 +171,18 @@ SELECT_QUEUE_SQL = text("""
 APPROVE_SQL = text("""
     UPDATE pending_account_mappings
     SET status = 'approved',
-        approval_attempt_id = :attempt_id::uuid,
+        approval_attempt_id = CAST(:attempt_id AS uuid),
         updated_at = NOW()
     WHERE id = :queue_id
       AND archived_at IS NULL
       AND status IN ('pending', 'approved')
-      AND (approval_attempt_id IS NULL OR approval_attempt_id = :attempt_id::uuid)
+      AND (approval_attempt_id IS NULL OR approval_attempt_id = CAST(:attempt_id AS uuid))
     RETURNING id::text
 """)
+# SQLAlchemy 2.0.49 parses the bindname in ``:attempt_id::uuid`` as
+# ``attempt_i`` (one char truncation at the second-to-last colon), so
+# the route's ``{"attempt_id": ...}`` kwarg never bound. The CAST(...)
+# form is the portable workaround. Pre-existing P1 fixed during M3.
 
 
 # Codex Round 3 P2 #2: status filter prevents /ignore from overwriting
@@ -208,7 +212,7 @@ IGNORE_SQL = text("""
     UPDATE pending_account_mappings
     SET status = 'ignored',
         ignored_at = NOW(),
-        ignored_by = :user_id::uuid,
+        ignored_by = CAST(:user_id AS uuid),
         archived_at = NOW(),
         archive_reason = 'owner_ignored',
         updated_at = NOW()
@@ -249,7 +253,7 @@ ARCHIVE_SIGNALS_SQL = text("""
 # compound (tenant_id, account_id) constraint.
 SELECT_ACCOUNT_FOR_TENANT_SQL = text("""
     SELECT id::text FROM accounts
-    WHERE id = :account_id::uuid AND tenant_id = :tenant_id::uuid
+    WHERE id = CAST(:account_id AS uuid) AND tenant_id = CAST(:tenant_id AS uuid)
 """)
 
 
@@ -278,12 +282,12 @@ SELECT_ACCOUNT_FOR_TENANT_SQL = text("""
 # resolved_account_id, else 409.
 MAP_RESERVE_SQL = text("""
     UPDATE pending_account_mappings
-    SET approval_attempt_id = :attempt_id::uuid,
+    SET approval_attempt_id = CAST(:attempt_id AS uuid),
         updated_at = NOW()
     WHERE id = :queue_id
       AND archived_at IS NULL
       AND status = 'pending'
-      AND (approval_attempt_id IS NULL OR approval_attempt_id = :attempt_id::uuid)
+      AND (approval_attempt_id IS NULL OR approval_attempt_id = CAST(:attempt_id AS uuid))
     RETURNING id::text
 """)
 
