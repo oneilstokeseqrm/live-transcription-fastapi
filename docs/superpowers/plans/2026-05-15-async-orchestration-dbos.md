@@ -1031,6 +1031,97 @@ This document is the load-bearing artifact of session 2026-05-15. The executing 
 
 ## 20. Revision history
 
+### v5 — 2026-05-15 (M3 execution — scope expansion + legacy SQL P1)
+
+**M3 scope expansion: workers/* + dedicated tests deleted in M3, not M4.**
+
+The plan §11 sequenced the worker module + outbox publisher deletes for
+M4 (alongside the ``/approve`` route refactor). M3 deletes were limited
+to ``workers/materialization.py`` (moved into the new package).
+
+At M3 execution time, the rewrite of ``services/agent_action_core_client.py``
+to the live contract (plan §3.2: ``enrich(url, effort, jwt) → AccountProfile``)
+invalidated the worker's call site (which used
+``enrich(tenant_id, domain, worker_attempt_id) → EnrichResult``). The
+worker code would no longer compile. Options were:
+
+(a) Keep the old + new agent client methods side-by-side (ugly; leaves
+   dead code; user explicitly disprefers sunk-cost preservation).
+(b) Delete the worker + its dedicated tests now (scope expansion vs
+   plan; but the deletes were already in M4's list).
+(c) Patch the worker to use the new client + restructure tests.
+
+**Picked (b).** Brought forward to M3:
+- DELETE ``workers/__main__.py``, ``workers/account_provisioning_worker.py``,
+  ``workers/advisory_lock.py``, ``workers/outbox_publisher.py``
+- DELETE ``tests/integration/test_worker_replay_safety.py``,
+  ``tests/integration/test_outbox_publisher.py``,
+  ``tests/unit/test_advisory_lock.py``,
+  ``tests/unit/test_agent_action_core_client.py`` (the latter tested the
+  legacy contract; replaced by new ``tests/unit/account_provisioning/
+  test_agent_client.py``)
+
+**Impact on M4:** the route refactor is the only remaining M4 work
+relative to plan §11. The "DELETE workers/*" acceptance bullet is
+already satisfied at M3 merge time.
+
+**Pre-merge P1 caught: legacy ``:name::uuid`` SQL pattern broken under SQLAlchemy 2.0.49.**
+
+Surfaced by the M3 unit tests against real Neon. SQLAlchemy 2.0.49
+parses ``text("WHERE id = :queue_id::uuid")``'s bindname as
+``queue_i`` (one-char truncation at the second-to-last colon). The
+route's ``{"queue_id": ..., "attempt_id": ...}`` kwargs never bound.
+asyncpg then sees the literal ``:queue_id::uuid`` as raw SQL and
+raises ``PostgresSyntaxError: syntax error at or near ":"``.
+
+**Affected production code (pre-fix):** ``routers/queue_actions.py``
+APPROVE_SQL, MAP_RESERVE_SQL, IGNORE_SQL, SELECT_ACCOUNT_FOR_TENANT_SQL.
+Every ``/approve``, ``/map``, ``/ignore`` call would have hit a 500.
+
+**Why it was latent:** the worker container hasn't run in production
+since Phase 1.5 P2 (no Railway service running ``python -m workers``).
+The queue UI in ``eq-frontend`` is incomplete. No real callers exist.
+Existing ``tests/integration/test_queue_lifecycle.py`` used MagicMock
+sessions (deleted in this milestone) — never executed the SQL against
+a real Postgres in CI. This is the Item 1 of test-discipline-gaps
+pattern repeating on a different surface: mock-only integration
+tests bypass the SQL execution path.
+
+**Fix:** All ``:name::uuid`` and ``:name::uuid[]`` patterns rewritten
+as ``CAST(:name AS uuid)`` / ``CAST(:name AS uuid[])``.
+
+**Affected files:**
+- ``routers/queue_actions.py`` (APPROVE_SQL, MAP_RESERVE_SQL, IGNORE_SQL,
+  SELECT_ACCOUNT_FOR_TENANT_SQL — 6 occurrences total)
+- ``services/account_provisioning/steps.py`` (10 SQL constants)
+- ``tests/conftest.py`` teardown SQL
+- ``tests/unit/account_provisioning/test_*.py`` seed SQL
+
+**Test infrastructure (Option B, locked):**
+
+Per ``docs/superpowers/specs/NEXT-SESSION-START-HERE.md`` item 10:
+- ``TEST_TENANT_ID`` = ``11111111-1111-4111-8111-111111111111``
+- ``TEST_USER_ID`` = ``b0000000-0000-4000-8000-000000000002`` (pre-existing
+  user row under the test tenant; required as FK target for
+  ``pending_account_mappings.owner_user_id``)
+- ``tests/conftest.py`` ``session`` fixture: opens AsyncSession against
+  ``DATABASE_URL``; on teardown deletes all test-tenant rows in
+  M3-relevant tables (FK-order-aware). Engine NOT disposed between
+  tests — disposing on per-test loop iterations triggers asyncpg
+  "Task got Future attached to a different loop" errors.
+- ``pytest.ini``: ``asyncio_default_fixture_loop_scope = session`` AND
+  ``asyncio_default_test_loop_scope = session`` so all async tests
+  share one event loop and the module-global engine survives the
+  test session.
+
+**Net test delta after M3 merge:**
+- 8 new test files (5 unit, 1 contract-pinning, 3 integration scaffolds)
+- 58 new tests passing (real-substrate unit tests + contract pinning
+  + mocked unit tests)
+- 4 dedicated worker/agent test files deleted (replaced by new tests)
+- Pre-existing 50 failures unrelated (Phase 1 schema-drift; tracked
+  under Items 1-3 of test-discipline-gaps)
+
 ### v4 — 2026-05-15 (M1 execution — DBOS API + dep contract drift folded in)
 
 Two design-time contract checks during M1 execution surfaced drift between v3 and live reality. Both folded in without altering the substrate decision or any locked architectural choice.
