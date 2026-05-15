@@ -133,15 +133,103 @@ Half-session. The script is small; the discipline change is documentation.
 
 ---
 
+---
+
+## Item 5 — Cross-service contract verification at design time (added 2026-05-15 after action-item-graph incident)
+
+### Problem
+
+About an hour after Item 4 was codified, a downstream agent in
+`action-item-graph` flagged 422 errors from EnvelopeV1 events with
+source values not in its `SourceType` enum (missing `zoom` and
+`generic` — both listed as valid in `tasks/lessons.md:6-14`). The
+enum at `src/action_item_graph/models/envelope.py:34-43` drifted
+from the documented canonical set without any review process
+catching it. The 422s were initially mis-attributed to PR #13's
+outbox publisher; independent verification proved the publisher
+hasn't run in production, and the actual cause was the downstream
+enum drift.
+
+This is the SAME failure mode as `account_lookup.py`, on a different
+contract surface (cross-service Pydantic model instead of internal
+SQL schema). The principle generalizes: **any contract between us
+and another system — internal or external, schema or behavior — must
+be verified against the actual artifact at design time, not its
+documentation.** Codified as a new lesson in `tasks/lessons.md` under
+"Cross-service contract verification at design time (2026-05-15)."
+
+### Action
+
+1. Update the `/review` skill checklist (or project-equivalent
+   plan-review process) to add a "Cross-service contracts" section
+   that lists every contract boundary the diff crosses, and for each
+   one, requires citing the verified artifact (file path + line range
+   + commit SHA or date stamp).
+
+2. For the Phase 1.5 implementation plan (next session), require a
+   "Verified contracts" section that probes and cites:
+   - The live `eq-structured-graph-ingest-rule` EventBridge rule
+     filter pattern (`aws events describe-rule`)
+   - The live `action-item-graph-rule` EventBridge rule filter pattern
+   - The consumer-side `EnvelopeV1` Pydantic model in BOTH downstream
+     repos (read the actual file, cite the enum values)
+   - The Neon database schemas for any tables the new code writes
+     (`information_schema.columns`)
+   - The `eq-agent-action-core` `/openapi.json` for the agent endpoint
+     the workflow calls
+
+3. Add a `scripts/verify_consumer_contracts.py` helper (analogous to
+   the proposed `scripts/verify_schema.py` from Item 4) that takes a
+   source value / detail-type / event-type and checks it against the
+   live EventBridge rules + consumer Pydantic models. Output: pass/fail
+   per consumer, with the rejection reason cited inline.
+
+### Acceptance criteria
+
+- `/review` checklist updated with "Cross-service contracts" section.
+- New helper script exists and checks at least: EventBridge rule
+  patterns, downstream Pydantic enum coverage.
+- The next session's Phase 1.5 implementation plan includes the
+  "Verified contracts" section with live citations.
+- Future PRs that touch event-emission code MUST include verified
+  contract citations in the PR description.
+
+### Estimated effort
+
+Half-session. The helper script is small; the discipline change is
+documentation + checklist updates.
+
+### Dependency / sequencing
+
+This item is HIGH PRIORITY for the rethink-execution session because
+the new architecture (DBOS, decided D7) emits EventBridge events from
+the final workflow step. Without this discipline, the same class of
+bug ships again on a different surface.
+
+---
+
 ## Cross-cutting note
 
-These four items don't independently fix the systemic issue. They compose:
+These five items don't independently fix the systemic issue. They compose:
 
 - Item 1 closes the COVERAGE gap (real-substrate tests for in-service primitives).
 - Item 2 closes the E2E SCOPE gap (per-branch happy paths).
 - Item 3 closes the SILENT-DEGRADATION gap (broad excepts swallow bugs).
-- Item 4 closes the DESIGN-TIME gap (probe schema before writing SQL).
+- Item 4 closes the DESIGN-TIME gap (probe internal database schema before writing SQL).
+- Item 5 closes the CROSS-SERVICE CONTRACT gap (probe downstream consumer artifacts before emitting new wire formats).
 
-Any one of them alone would have caught the specific account_lookup bug. All four together substantially reduce the probability of a similar class of bug shipping again.
+Any one of them alone would have caught one of the specific bugs we
+observed. All five together substantially reduce the probability of
+the silent-regression class of bug shipping again — internally OR
+across service boundaries.
 
-The architecture rethink session should explicitly NOT bake "another broad try/except" into whatever new substrate is picked. If the new architecture (Inngest, Temporal, Restate, etc.) provides framework-level retry/error-handling, that REPLACES our try/except — not adds to it. And the same test-discipline gaps (Items 1-2) apply to the new architecture's code: if we add new in-service functions or new branches, they need real-substrate coverage and per-branch E2E.
+The architecture rethink session decided on DBOS (D7, 2026-05-15) as
+the new substrate. The implementation plan MUST explicitly NOT bake
+"another broad try/except" into the DBOS workflow code — DBOS
+provides retry semantics, so a try/except inside a workflow step is
+the wrong layer. The plan MUST also bake the cross-service contract
+verification (Item 5) into the design-time review for every workflow
+step that emits to EventBridge, calls eq-agent-action-core, or writes
+to Neon. The same test-discipline gaps (Items 1-3) apply to the DBOS
+code: any new in-service primitives need real-substrate coverage,
+new branches need per-branch E2E, and broad excepts get flagged.

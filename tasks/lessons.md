@@ -482,3 +482,131 @@ All three prior lessons remain true. They just don't compose to "this
 bug should have been caught." This new lesson explicitly closes the
 composition gap.
 
+## Cross-service contract verification at design time (2026-05-15)
+
+Roughly an hour after the `account_lookup.py` silent regression was
+fixed, a downstream agent in `action-item-graph` flagged 422 errors on
+its `/process` endpoint and initially hypothesized that PR #13's outbox
+publisher was emitting AccountProvisioning events that were leaking
+through an unfiltered Lambda forwarder. Independent verification (live
+deployment logs, `railway.json` start command, and a SELECT against
+`account_provisioning_outbox` showing zero rows) proved the outbox
+publisher has never fired in production — the worker process isn't
+deployed. The actual cause was a different cross-service contract gap:
+`action-item-graph`'s `SourceType` enum (at
+`src/action_item_graph/models/envelope.py:34-43`) is missing `zoom` and
+`generic` — two values listed as canonically valid in
+`tasks/lessons.md:6-14`. A synthetic injection test emitted EnvelopeV1
+events with one of those source values; the downstream consumer
+rejected them with 422; the DLQ accumulated 11 stuck messages.
+
+This is the SAME failure mode as `account_lookup.py`, but on a
+different surface: a contract assumption (the downstream `SourceType`
+enum) was not verified against the live consumer artifact at design
+time. The Pydantic model lives in a separate repo, was authored
+without `zoom` and `generic`, and drifted from upstream's documented
+canonical set. Nothing in our review process required probing it.
+
+The principle that survives is broader than "probe external service
+contracts" (2026-05-14) and broader than "probe live schema" (2026-05-15).
+**The composed principle is: any contract between us and another
+system — internal or external, schema or behavior, database or HTTP
+or message-bus — must be verified against the actual artifact, not
+its documentation, not its expected shape, not its name.** Three
+incidents now corroborate the principle on three different surfaces:
+
+1. **External HTTP contract** (`eq-agent-action-core` enrich endpoint,
+   2026-05-14) — `OpenAPI.json` probe would have caught the worker's
+   imagined contract before code was written. Cost ~700 LoC + 6 review
+   rounds.
+2. **Internal database schema** (`account_lookup.py` SQL, 2026-05-15) —
+   `information_schema.columns` probe via Neon MCP would have caught
+   `accounts.domain` vs `account_domains` before code was written.
+   Cost ~24 hours of production silently-broken behavior.
+3. **Cross-service Pydantic model contract** (`action-item-graph`
+   SourceType enum, 2026-05-15) — reading the downstream consumer's
+   `models/envelope.py` would have surfaced the missing `zoom`/`generic`
+   values. Cost 11 stuck DLQ messages + downstream regression triage.
+
+### How to apply
+
+The unified rule for any plan that emits or consumes data across a
+service or system boundary:
+
+1. **List every contract boundary the plan crosses.** A boundary is
+   any place where one component's output becomes another's input via
+   a wire format. Common boundaries:
+   - Database schemas (Postgres / Neo4j / etc.)
+   - HTTP / GraphQL / gRPC API contracts (request + response shapes)
+   - Message-bus envelopes (EventBridge / Kinesis / Kafka / SQS)
+   - Consumer-side Pydantic / JSONSchema models in OTHER repos
+   - EventBridge rule patterns (filters between bus and consumer)
+   - Function signatures across module boundaries (less critical but
+     same principle)
+
+2. **For each boundary, cite the verified artifact inline.** Don't
+   say "the consumer accepts EnvelopeV1" — say "the consumer at
+   `action-item-graph/src/action_item_graph/models/envelope.py:34-43`
+   accepts `SourceType ∈ {web-mic, upload, api, import, email-pipeline,
+   gmail, outlook}` as of 2026-05-15 (commit SHA)." This makes drift
+   auditable at future review time.
+
+3. **Probe the artifact at design time, not deploy time.** Concrete
+   probes per surface:
+   - Postgres schema → `information_schema.columns` / `pg_constraint` /
+     `pg_indexes` via Neon MCP
+   - HTTP contracts → `/openapi.json` curl or live request
+   - EventBridge rules → `aws events list-rules` + `describe-rule`
+   - Consumer Pydantic models → grep / read the consumer repo's
+     `models/*.py` and quote the relevant enum / field definitions
+
+4. **EventBridge has two contract layers, not one.** The wire format
+   (Source / DetailType / Detail) is the OUTER contract; the
+   consumer's Pydantic model is the INNER contract. The outer
+   contract decides whether an event reaches a consumer (via rule
+   patterns); the inner contract decides whether the consumer accepts
+   it. Both can fail independently. Verify both.
+
+5. **Verification scope expands with the change surface.** A change
+   to a single in-service function that doesn't cross boundaries
+   doesn't need cross-service probing. A change that emits a new
+   event type / source value / detail-type, or that consumes from a
+   new source, or that adds a new field to a wire format — needs the
+   full boundary audit.
+
+### How this composes with the four systemic quality gaps
+
+The "Four systemic quality gaps" lesson (2026-05-15) covered:
+
+1. Live-schema verification at design time
+2. Real-substrate coverage for in-service primitives
+3. Per-branch E2E coverage
+4. Narrow exception handling
+
+This lesson generalizes #1 to "all contract verification at design
+time," and adds a new architectural concern: **EventBridge rule
+patterns are a contract surface in their own right**. The
+`action-item-graph-rule` already filters on `source:
+["com.yourapp.transcription", "com.eq.email-pipeline"]` — verifying
+this saved triage time when validating the downstream agent's
+analysis. Future implementation plans that emit to EventBridge MUST
+list every consumer rule pattern they expect to flow through, with
+the rule names + filters cited.
+
+### Concrete implication for the Phase 1.5 implementation plan
+
+The new architecture (DBOS, decided D7 2026-05-15) emits EventBridge
+events from the final workflow step. The implementation plan must
+include a "verified contracts" section that explicitly cites:
+
+- The live `eq-structured-graph-ingest-rule` filter pattern + the
+  consumer's live `EnvelopeV1` model
+- The live `action-item-graph-rule` filter pattern + the consumer's
+  live `EnvelopeV1` model
+- The Neon `pending_account_mappings` + `account_provisioning_outbox`
+  + related-table schemas via `information_schema.columns`
+- The `eq-agent-action-core` `/openapi.json` for any new agent calls
+
+Plans that don't include this section are repeating the exact
+mistake all three incidents share.
+
