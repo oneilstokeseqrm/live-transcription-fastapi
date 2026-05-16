@@ -83,7 +83,7 @@ INSERT_SIGNAL_SQL = text("""
         (gen_random_uuid(), :tenant_id, :queue_id, :source_type, :source_user_id,
          :interaction_id, :calendar_event_id,
          :contact_email, :contact_display_name, :contact_role, NOW())
-    ON CONFLICT ON CONSTRAINT pending_signal_dedup DO NOTHING
+    ON CONFLICT (queue_id, contact_email, source_type, interaction_id, calendar_event_id) DO NOTHING
 """)
 
 

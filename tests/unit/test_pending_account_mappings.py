@@ -3,11 +3,22 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from services.pending_account_mappings import (
+    INSERT_SIGNAL_SQL,
     upsert_queue_entry,
     insert_signal,
     SignalProposal,
     QueueRow,
 )
+
+
+def test_insert_signal_sql_uses_column_tuple_conflict_target():
+    # Prisma's @@unique(..., map: "pending_signal_dedup") generates a unique
+    # INDEX, not a named CONSTRAINT. Postgres ON CONFLICT ON CONSTRAINT requires
+    # a named constraint and throws UndefinedObjectError against an index alone.
+    # Use the column-tuple form so the arbiter is matched by the unique index.
+    sql = INSERT_SIGNAL_SQL.text
+    assert "ON CONFLICT ON CONSTRAINT" not in sql
+    assert "ON CONFLICT (queue_id, contact_email, source_type, interaction_id, calendar_event_id)" in sql
 
 
 @pytest.mark.asyncio
