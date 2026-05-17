@@ -328,8 +328,7 @@ SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
     JOIN interaction_summaries summ ON summ.summary_id = l.interaction_id
     JOIN contacts c ON c.id = l.contact_id
     LEFT JOIN pending_account_mapping_signals s
-           ON s.queue_id = CAST(:queue_id AS uuid)
-          AND s.interaction_id = CAST(:raw_interaction_id AS uuid)
+           ON s.interaction_id = CAST(:raw_interaction_id AS uuid)
           AND lower(s.contact_email) = lower(c.email)
           AND s.archived_at IS NULL
     WHERE summ.interaction_id = CAST(:raw_interaction_id AS uuid)
@@ -350,6 +349,16 @@ SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
 #    produce duplicate contact entries in extras.contacts with
 #    potentially conflicting roles. DISTINCT ON picks the most
 #    recent signal's role.
+#
+# Cross-queue roles (Codex M2 round-5 P2): the prior ``s.queue_id =
+# $queue_id`` constraint was REMOVED. After M2's Step 5 cross-queue link
+# batch, an interaction can have linked contacts from OTHER queues
+# (the §8.6 cross-queue cold-inbound case). With the queue_id constraint
+# the role for those cross-queue contacts came back NULL, even though
+# their signal exists in another queue. Scoping the role lookup by
+# interaction_id only (no queue_id) lets the JOIN find the cross-queue
+# signal's role. The interaction_id constraint still prevents Cartesian
+# fan-out across unrelated interactions (point 1 above).
 
 
 async def fetch_interactions_for_emit(

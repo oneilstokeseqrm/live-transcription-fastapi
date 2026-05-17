@@ -213,7 +213,7 @@ SELECT_PENDING_TO_PROMOTE_SQL = text("""
 PROMOTE_INSERT_RAW_INTERACTIONS_SQL = text("""
     INSERT INTO raw_interactions (
         interaction_id, tenant_id, account_id, interaction_type, raw_text,
-        created_at, updated_at
+        user_id, created_at, updated_at
     )
     SELECT
         interaction_id,
@@ -221,6 +221,7 @@ PROMOTE_INSERT_RAW_INTERACTIONS_SQL = text("""
         CAST(:account_id AS uuid),
         'email',
         raw_text,
+        connected_user_id,
         created_at,
         NOW()
     FROM pending_interactions
@@ -232,6 +233,11 @@ PROMOTE_INSERT_RAW_INTERACTIONS_SQL = text("""
 # Step 4a (plan §5.2): preserve the pre-allocated interaction_id (identity
 # continuity through promotion). ON CONFLICT DO NOTHING makes this idempotent
 # under DBOS step retry — a partial-success replay re-runs cleanly.
+#
+# Mailbox user attribution (Codex M2 round-5 P2): copy pending_interactions.
+# connected_user_id into raw_interactions.user_id so build_envelope() emits
+# EnvelopeV1.email with the actual mailbox user rather than falling back to
+# tenant_id. Downstream consumers attribute interactions correctly to the user.
 #
 # ID-scoped filter (Codex M2 round-3 P1): the IDs captured by
 # SELECT_PENDING_TO_PROMOTE_SQL are the only rows the Python Step 4c loop
