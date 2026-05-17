@@ -28,6 +28,7 @@ from typing import Any, Iterable
 from uuid import UUID
 
 import boto3
+from botocore.exceptions import NoCredentialsError
 from sqlalchemy import text
 
 from models.envelope import ContentModel, EnvelopeV1
@@ -146,15 +147,38 @@ def _serialize_envelope(envelope: EnvelopeV1) -> str:
     return envelope.model_dump_json()
 
 
-def _build_eventbridge_client() -> Any:
-    """Build a fresh boto3 EventBridge client.
+def _build_eventbridge_client() -> Any | None:
+    """Build a fresh boto3 EventBridge client; returns ``None`` if
+    credentials are unavailable (dev/CI without AWS configured).
 
     Built per-call rather than module-singleton so a step retry under
     DBOS picks up rotated credentials (Railway / IAM) and so unit tests
     can patch the boto3 factory directly.
+
+    Mirrors ``services.aws_event_publisher.AWSEventPublisher._init_eventbridge_client``'s
+    graceful-degradation pattern: in environments where EventBridge is
+    intentionally disabled (no AWS creds in env), build returns
+    ``None`` and the emit step logs + skips rather than crashing.
+    Production deploys (Railway) have credentials in env; local dev
+    + CI without secrets get a no-op emission path. Codex P2 2026-05-16.
     """
     region = os.environ.get("AWS_REGION", "us-east-1")
-    return boto3.client("events", region_name=region)
+    try:
+        return boto3.client("events", region_name=region)
+    except NoCredentialsError:
+        logger.warning(
+            "EventBridge client not built: AWS credentials missing. "
+            "Account-provisioning emissions will be skipped. Set "
+            "AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY to enable."
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "EventBridge client failed to initialize: %s. Account-"
+            "provisioning emissions will be skipped.",
+            exc,
+        )
+        return None
 
 
 async def emit_envelopes_for_materialization(
@@ -176,6 +200,21 @@ async def emit_envelopes_for_materialization(
     """
     bus_name = os.environ.get("EVENTBRIDGE_BUS_NAME", "default")
     client = boto3_factory()
+    if client is None:
+        # Graceful no-op when EventBridge is intentionally disabled
+        # (no AWS credentials in env). Caller treats this as success:
+        # /map returns 200, the workflow's Step 6 records empty
+        # emissions, and DBOS proceeds to workflow_status='success'.
+        # In production where emission failure would be a real bug,
+        # the boto3 client builds successfully and a put_events
+        # failure surfaces via FailedEntryCount → EventBridgeEmissionError.
+        logger.info(
+            "EventBridge emission skipped (client unavailable): "
+            "interaction_count=%d. This is expected in dev/CI without "
+            "AWS credentials.",
+            sum(1 for _ in interactions),
+        )
+        return []
     emissions: list[EmissionRecord] = []
 
     for interaction in interactions:
@@ -306,18 +345,12 @@ async def fetch_interactions_for_emit(
     gets its OWN contacts list, filtered by signal.interaction_id so
     multi-touchpoint contacts don't bleed roles across interactions.
 
-    Codex P2 2026-05-16: placeholder interaction_ids (created by
-    materialization when Lane 2 hadn't yet written the real
-    raw_interactions row) are excluded. Emitting placeholders would
-    send empty downstream envelopes with the wrong
-    ``interaction_type``. Lane 2's real-row write will arrive later;
-    M5's verify_consumer_contracts tool replays missed emissions then.
+    Materialization (round-5 Codex P1 fix) now requires real
+    ``raw_interactions`` rows before materializing, so every
+    interaction_id here is guaranteed emit-safe (no placeholder
+    filtering needed).
     """
-    placeholder_set = set(materialization.placeholder_interaction_ids)
-    emit_interaction_ids = [
-        i for i in materialization.interaction_ids if i not in placeholder_set
-    ]
-    if not emit_interaction_ids:
+    if not materialization.interaction_ids:
         return []
 
     interactions: list[InteractionForEmit] = []
@@ -326,7 +359,7 @@ async def fetch_interactions_for_emit(
             await session.execute(
                 SELECT_INTERACTIONS_FOR_EMIT_SQL,
                 {
-                    "interaction_ids": emit_interaction_ids,
+                    "interaction_ids": materialization.interaction_ids,
                     "tenant_id": materialization.tenant_id,
                 },
             )

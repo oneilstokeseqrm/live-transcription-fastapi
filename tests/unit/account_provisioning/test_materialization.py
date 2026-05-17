@@ -28,12 +28,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.account_provisioning import materialization as M
 from services.account_provisioning.materialization import (
+    CHECK_RAW_INTERACTION_EXISTS_SQL,
     INSERT_CONTACT_SQL,
     INSERT_LINK_SQL,
     SELECT_SIGNALS_SQL,
     UPDATE_QUEUE_SQL,
     UPSERT_PLACEHOLDER_SUMMARY_SQL,
-    UPSERT_RAW_INTERACTION_SQL,
     _split_name,
     materialize_account_approval,
 )
@@ -123,9 +123,14 @@ class TestSqlTextSanity:
         assert "linked_pairs: set" not in body
         assert "linked_pairs = set()" not in body
 
-    def test_upsert_raw_interaction_uses_pk_conflict(self):
-        sql = str(UPSERT_RAW_INTERACTION_SQL.text)
-        assert "ON CONFLICT (interaction_id) DO NOTHING" in sql
+    def test_check_raw_interaction_exists_is_existence_probe(self):
+        """The round-5 Codex P1 fix replaced the placeholder upsert with
+        an existence check. Materialization fails loud if Lane 2 hasn't
+        written the real raw_interactions row yet.
+        """
+        sql = str(CHECK_RAW_INTERACTION_EXISTS_SQL.text)
+        assert "SELECT 1 FROM raw_interactions" in sql
+        assert "WHERE interaction_id" in sql
 
     def test_upsert_summary_uses_unique_interaction_id_index(self):
         sql = str(UPSERT_PLACEHOLDER_SUMMARY_SQL.text)

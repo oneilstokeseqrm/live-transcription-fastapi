@@ -41,15 +41,24 @@ CHECK_RAW_INTERACTION_EXISTS_SQL = text("""
     WHERE interaction_id = :interaction_id
     LIMIT 1
 """)
-# Codex P2 2026-05-16: detect whether raw_interactions has a real
-# row before the materialization writes the placeholder. Placeholder
-# rows carry hard-coded interaction_type='meeting' + empty raw_text;
-# emitting them downstream would corrupt the EnvelopeV1 contract
-# (wrong DetailType, empty content). The MaterializationResult
-# tracks placeholder interaction_ids so the emit step can skip them.
-# The DB writes for placeholders still happen (interaction_contact_links
-# needs a parent summary which needs a parent raw_interactions row);
-# only the downstream emission is filtered.
+# Codex P1 2026-05-16 (round 5): the prior fix (track placeholder
+# interaction_ids in MaterializationResult) wasn't sufficient — a
+# subsequent approval for a different queue entry referencing the
+# same interaction_id would see the prior placeholder exists and
+# NOT mark it as placeholder, then emit a broken envelope.
+#
+# Architecturally correct fix: don't write placeholders at all. If
+# raw_interactions doesn't have a real row for the signal's
+# interaction_id, materialization fails loud. The workflow's Step 5
+# fails → DBOS retries (up to 3 attempts with backoff). The /map
+# path returns 503 → client retries. Either way, the system waits
+# until Lane 2 (intelligence_service) has written the real row
+# before materializing.
+#
+# In normal operation Lane 2 writes raw_interactions when the
+# transcript is processed — which is the SAME event that creates
+# the queue signal. So the race window where the signal exists
+# but raw_interactions doesn't is narrow and self-resolving.
 
 
 INSERT_CONTACT_SQL = text("""
@@ -72,20 +81,6 @@ INSERT_CONTACT_SQL = text("""
 # RETURNED account_id against the materialization's input account_id. A
 # mismatch means the contact already belongs to a different account
 # (cross-account reassignment is Phase 3 scope — fail loud).
-
-
-UPSERT_RAW_INTERACTION_SQL = text("""
-    INSERT INTO raw_interactions (
-        interaction_id, tenant_id, account_id, interaction_type, updated_at
-    ) VALUES (
-        :interaction_id, :tenant_id, :account_id, :interaction_type, NOW()
-    )
-    ON CONFLICT (interaction_id) DO NOTHING
-""")
-# account_id is included because raw_interactions.account_id is NOT NULL
-# (enforced in Phase 1.5 schema). For backfill cases (the queue's signal
-# references an interaction that doesn't have a raw_interactions row yet),
-# we use the materialization's account_id as the anchor.
 
 
 UPSERT_PLACEHOLDER_SUMMARY_SQL = text("""
@@ -183,7 +178,6 @@ async def materialize_account_approval(
 
     contact_ids: list[str] = []
     interaction_ids: list[str] = []
-    placeholder_interaction_ids: set[str] = set()
     # Lazy cache: at most one placeholder interaction_summaries row per
     # raw_interaction_id, created on first reference. All contacts for that
     # interaction link to the same summary_id; the link INSERT uses
@@ -221,18 +215,17 @@ async def materialize_account_approval(
             raw_id = str(s.interaction_id)
             summary_id = summary_id_by_raw_id.get(raw_id)
             if summary_id is None:
-                # Codex P2 2026-05-16: detect whether the upstream
-                # ingestion (Lane 2 / intelligence_service) has
-                # already written a real raw_interactions row. If
-                # NOT, we still need a placeholder for the
-                # interaction_summaries + interaction_contact_links
-                # FK chain — BUT the placeholder's content
-                # (interaction_type='meeting', empty raw_text) is
-                # WRONG for downstream emission. Track the
-                # interaction_id as a placeholder so Step 6's emit
-                # path skips it. Lane 2 will eventually write the
-                # real row; a future re-emission tool (M5) can
-                # backfill the downstream notification.
+                # Codex P1 2026-05-16 (round 5): require Lane 2 to
+                # have written the real raw_interactions row before
+                # materializing. The previous placeholder pattern
+                # (write a synthetic 'meeting' row + track placeholder
+                # ids to filter emission) couldn't distinguish "my
+                # placeholder" from "previous approval's placeholder
+                # for same interaction," so a second approval would
+                # emit a corrupted envelope. Failing loud instead is
+                # the architecturally correct behavior — DBOS retries
+                # the step (up to 3 attempts), /map returns 503, and
+                # the operator retries.
                 existing_check = (
                     await session.execute(
                         CHECK_RAW_INTERACTION_EXISTS_SQL,
@@ -240,18 +233,16 @@ async def materialize_account_approval(
                     )
                 ).first()
                 if existing_check is None:
-                    placeholder_interaction_ids.add(raw_id)
-                # Ensure parent raw_interactions row exists (summaries-writer
-                # may have already created it; ON CONFLICT DO NOTHING is safe).
-                await session.execute(
-                    UPSERT_RAW_INTERACTION_SQL,
-                    {
-                        "interaction_id": s.interaction_id,
-                        "tenant_id": tenant_id,
-                        "account_id": account_id,
-                        "interaction_type": "meeting",
-                    },
-                )
+                    raise ValueError(
+                        f"raw_interactions row for interaction_id="
+                        f"{raw_id!r} does not exist yet. Lane 2 "
+                        f"(intelligence_service.process_transcript) "
+                        f"may still be writing; the materialization "
+                        f"will retry. If this persists across "
+                        f"retries, investigate why the queue signal "
+                        f"references an interaction_id that Lane 2 "
+                        f"never wrote (data-integrity bug upstream)."
+                    )
                 # UPSERT the placeholder summary atomically. The ON CONFLICT
                 # (interaction_id) branch handles the race where the
                 # summaries-writer service inserts a row concurrently — we
@@ -288,5 +279,4 @@ async def materialize_account_approval(
         account_id=account_id,
         contact_ids=list(dict.fromkeys(contact_ids)),
         interaction_ids=list(dict.fromkeys(interaction_ids)),
-        placeholder_interaction_ids=sorted(placeholder_interaction_ids),
     )
