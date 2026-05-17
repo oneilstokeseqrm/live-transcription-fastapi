@@ -250,13 +250,47 @@ PROMOTE_INSERT_EMAILS_SQL = text("""
     WHERE queue_id = CAST(:queue_id AS uuid)
       AND archived_at IS NULL
     ON CONFLICT (tenant_id, internet_message_id) DO NOTHING
+    RETURNING interaction_id::text AS interaction_id
 """)
 # Step 4b (plan §5.2): mirror the existing emails dedup invariant. ON CONFLICT
 # DO NOTHING — replay-safe; an earlier attempt's emails row stays, the
 # WHERE archived_at IS NULL filter on the source pending_interactions excludes
-# already-promoted rows on retry (Step 4e sets archived_at). Note: only rows
-# whose internet_message_id is NULL or not-yet-in-emails reach this point
-# (Step 4-pre archived rows whose internet_message_id is already in emails).
+# already-promoted rows on retry (Step 4e sets archived_at).
+#
+# RETURNING interaction_id is the orphan-detection mechanism (Codex M2 review
+# round-1 P1): if a concurrent workflow inserts an emails row with the same
+# internet_message_id between 4-pre and 4b, this INSERT silently DO NOTHINGs
+# for the conflicting row. Without RETURNING the caller wouldn't know which
+# pending rows actually became emails — and 4a would have inserted orphan
+# raw_interactions rows with no matching email. The caller compares
+# RETURNING ids against the pending set and DELETEs the orphan raw_interactions
+# rows + archives their pending entries as 'duplicate_race_already_in_emails'
+# before 4c/4d run.
+
+
+DELETE_ORPHAN_RAW_INTERACTIONS_SQL = text("""
+    DELETE FROM raw_interactions
+    WHERE interaction_id = ANY(CAST(:ids AS uuid[]))
+""")
+# Orphan cleanup (Codex M2 review round-1 P1): raw_interactions rows that 4a
+# inserted but whose corresponding 4b emails INSERT hit ON CONFLICT (a
+# concurrent workflow committed an emails row with the same
+# internet_message_id between 4-pre and 4b). The rows are brand-new and have
+# no dependents yet (Step 4c/4d haven't run for them), so DELETE is safe.
+
+
+ARCHIVE_RACE_LOSER_PENDING_SQL = text("""
+    UPDATE pending_interactions
+    SET archived_at = NOW(),
+        archive_reason = 'duplicate_race_already_in_emails'
+    WHERE queue_id = CAST(:queue_id AS uuid)
+      AND archived_at IS NULL
+      AND interaction_id = ANY(CAST(:ids AS uuid[]))
+""")
+# Companion to DELETE_ORPHAN_RAW_INTERACTIONS_SQL. The pending row stays as
+# an audit trail — same as Step 4-pre's pre-flight duplicate archive, just
+# with a distinct archive_reason so post-hoc analysis can distinguish
+# pre-flight duplicates from in-txn race-losers.
 
 
 UPSERT_EMAIL_THREAD_SQL = text("""
@@ -505,19 +539,60 @@ async def materialize_account_approval(
         )
 
         # Step 4b: INSERT emails (thread_id=NULL, filled in by Step 4c).
-        await session.execute(
+        # RETURNING tells us which interaction_ids actually got an emails row
+        # — i.e., did NOT hit ON CONFLICT (tenant_id, internet_message_id).
+        # Codex M2 round-1 P1: if a concurrent workflow commits a duplicate
+        # emails row between 4-pre and 4b, 4a's raw_interactions row becomes
+        # an orphan (no matching email). Detect and clean up.
+        emails_inserted_result = await session.execute(
             PROMOTE_INSERT_EMAILS_SQL,
             {"queue_id": queue_id, "account_id": account_id},
         )
+        inserted_email_interaction_ids = {
+            row.interaction_id for row in emails_inserted_result.all()
+        }
 
-        # Step 4d: INSERT interaction_summaries (summary_type='email').
-        # Done BEFORE Step 4c so Step 5's link batch — which JOINs on
-        # interaction_summaries — sees a row even if Step 4c's per-row
-        # loop is partway through under retry.
-        await session.execute(
-            PROMOTE_INSERT_INTERACTION_SUMMARIES_SQL,
-            {"queue_id": queue_id},
-        )
+        # Identify race-losers: pending rows whose 4a raw_interactions was
+        # inserted but whose 4b emails INSERT skipped due to conflict.
+        all_pending_ids = {str(row.interaction_id) for row in pending_rows}
+        race_loser_ids = all_pending_ids - inserted_email_interaction_ids
+
+        if race_loser_ids:
+            race_loser_list = list(race_loser_ids)
+            # Delete the orphan raw_interactions rows (safe: brand-new,
+            # no dependents, IDs known only to this transaction).
+            await session.execute(
+                DELETE_ORPHAN_RAW_INTERACTIONS_SQL,
+                {"ids": race_loser_list},
+            )
+            # Archive the race-loser pending rows so the surviving 4d/4c
+            # WHERE archived_at IS NULL filters exclude them, and Step 4e
+            # doesn't re-touch them.
+            await session.execute(
+                ARCHIVE_RACE_LOSER_PENDING_SQL,
+                {"queue_id": queue_id, "ids": race_loser_list},
+            )
+            # Keep only the actually-promoted rows for the per-row 4c loop.
+            pending_rows = [
+                row for row in pending_rows
+                if str(row.interaction_id) in inserted_email_interaction_ids
+            ]
+
+        # If every row was a race-loser, there is nothing left to promote.
+        if not pending_rows:
+            # Skip 4d/4c/4e for the empty set. promoted_interaction_ids
+            # stays []; the workflow's emit step is a no-op.
+            pass
+        else:
+            # Step 4d: INSERT interaction_summaries (summary_type='email').
+            # Done BEFORE Step 4c so Step 5's link batch — which JOINs on
+            # interaction_summaries — sees a row even if Step 4c's per-row
+            # loop is partway through under retry. The WHERE archived_at IS NULL
+            # filter excludes race-losers archived above.
+            await session.execute(
+                PROMOTE_INSERT_INTERACTION_SUMMARIES_SQL,
+                {"queue_id": queue_id},
+            )
 
         # Step 4c: upsert email_threads ONCE PER PENDING ROW (so
         # message_count increments correctly when multiple promoted
