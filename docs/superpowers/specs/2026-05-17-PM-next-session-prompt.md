@@ -13,12 +13,26 @@ AI-native customer intelligence platform. Phase 1 SHIPPED 2026-05-14.
 Phase 1.5 M0-M5 ALL SHIPPED 2026-05-15 + 2026-05-17. As of last
 session end, Phase 1.5 main code is complete.
 
-Your job THIS session is to address the HIGH-priority finding
-surfaced during M5: eq-email-pipeline silently drops cold inbound
-emails from unknown business senders. Full doc at
-`tasks/downstream/eq-email-pipeline-unknown-sender.md`. This is the
-session's primary scope. Secondary: optional production canary
-(deferred from M3+M4) and optional M3.5 outbox drop.
+Your job THIS session is to FINISH PHASE 1 for the email pipeline.
+The original Phase 1 plan (Task 1.24) committed the orchestrator to
+applying three-state branching for sender/recipient resolution +
+queuing unknown-business senders. Phase 1 PR #6 shipped logic + a
+test for the case where at least one party on the email belongs to
+a known account, but did NOT cover the case where ALL parties are
+unknown. Cold inbound from a totally new prospect is currently
+silently dropped at `insert_email` (raises ValueError → outer
+Exception catches → email lost, no queue signal).
+
+This was a Phase 1 commitment — NOT new scope. Full doc with the 4
+candidate fix approaches at `tasks/downstream/
+eq-email-pipeline-unknown-sender.md`. Recommended approach: C
+(separate `pending_interactions` table — explicit pending state,
+architecturally honest, no misattribution). User's posture
+(2026-05-17 PM): do NOT fake an anchor by tying the email to an
+account it doesn't belong to.
+
+Secondary: optional production canary (deferred from M3+M4) and
+optional M3.5 outbox drop.
 
 Before doing anything else, follow these steps IN ORDER:
 
@@ -89,12 +103,16 @@ Before doing anything else, follow these steps IN ORDER:
    paragraph) before starting work.
 
 7. EXECUTE per `tasks/downstream/eq-email-pipeline-unknown-sender.md`
-   Section "Next steps":
+   Section "Recommended sequence":
 
-   Step 1 — Brainstorm fix approach with the user. This is a
-   product/strategic decision (4 candidates: recipient-as-anchor;
-   NULL account_id; headless table; hybrid). Surface to user via
-   AskUserQuestion; do NOT auto-decide.
+   Step 1 — Brainstorm fix approach with the user. Approach C
+   (separate `pending_interactions` table) is the recommended,
+   cutting-edge-2026, architecturally-honest path. Approach A
+   (recipient-as-anchor) was explicitly REJECTED by the user
+   2026-05-17 PM (misattributes the email to an account it doesn't
+   belong to). Approaches B (NULL account_id) and D (column-level
+   pending state) are alternatives if Approach C is infeasible.
+   Surface to user via AskUserQuestion; do NOT auto-decide.
 
    Step 2 — Codex consult on the chosen approach (CSO discipline —
    design-time review BEFORE writing code). Use `codex review` or

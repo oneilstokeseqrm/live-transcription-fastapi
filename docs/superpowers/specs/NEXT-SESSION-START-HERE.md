@@ -24,38 +24,52 @@ After Phase 1.5 closes: explicit stopping point for comprehensive re-planning be
 
 ---
 
-## THE NEXT SESSION'S PRIMARY SCOPE: eq-email-pipeline unknown-sender drop
+## THE NEXT SESSION'S PRIMARY SCOPE: finishing Phase 1 for the email pipeline
 
-**Discovered:** 2026-05-17 PM during M5 design discussion when the user pushed back on the empty-`content.text` decision and asked to verify the email pipeline's actual behavior.
+**Surfaced + recharacterized:** 2026-05-17 PM. Original handoff framed this as "newly discovered." User pointed out this was actually part of the original Phase 1 plan (Task 1.24) — the orchestrator was supposed to apply three-state branching to email sender/recipient resolution + queue unknown-business senders. Phase 1 PR #6 shipped logic + tests for the case where at least one party on the email belongs to a known account, but did NOT cover the case where ALL parties are unknown. **This is finishing committed Phase 1 work, NOT new scope.**
 
-**The gap (full doc at `tasks/downstream/eq-email-pipeline-unknown-sender.md`):**
+### The two scenarios in plain English
 
-`eq-email-pipeline/src/pipeline/orchestrator.py:174-196` resolves the email anchor from the TARGET domain (sender for inbound; first recipient for outbound). If the target domain is unknown, `account_id=None`. Then `eq-email-pipeline/src/persistence/postgres.py:200-204` raises `ValueError("requires a resolved account_id; raw_interactions.account_id is NOT NULL")`. The outer `except Exception` in the orchestrator (line 546-549) catches, logs, returns `status="error"`. **Email is NOT saved, NOT processed, NOT queued.** Pending signal proposals are discarded because they flush AFTER `insert_email` succeeds.
+For any external person on an incoming email, the system needs to handle one of two cases:
 
-**Concrete asymmetry:**
-- Email from `alice@known.com` + cc `bob@unknown.com` → email saved + processed; Bob → queue signal. ✓
-- Email from `bob@unknown.com` to internal user → email DROPPED entirely. Bob NEVER queued. ✗
+1. **The person's email domain maps to an existing account.** → Tie the email to that account, create or update the contact. *(Works today.)*
+2. **The person's email domain doesn't map to any account (but the email passed our spam/relevance filters — it's credible).** → Save the email in a coherent pending state, queue the domain for the user to approve account creation, and on approval: create the account + tie the email to it + materialize the contact. *(This is what's broken when no party on the email is from any known account.)*
 
-This means Phase 1.5's queue mechanism captures unknown-business signals only for SECONDARY participants on emails where the SENDER is known. **Cold inbound from unknown business domains — the actual common business scenario — falls on the floor.**
+### What Phase 1 actually delivered (incomplete)
 
-**Why it wasn't caught in Phase 1:**
-The plan §2 explicitly puts ingestion-path changes out of scope for Phase 1.5. The Phase 1 work that shipped 2026-05-14 added three-state branching for SECONDARY participants but did NOT change the anchor-lookup behavior. The "what do we do when the sender is the unknown party" question is unaddressed in both the design doc and the implementation. Phase 1 design doc §314 says "the interaction is recorded with its anchor account" but doesn't explicitly answer what happens when NO anchor is resolvable.
+`eq-email-pipeline` orchestrator does loop over every external person + classify them. When at least ONE person belongs to a known account, that account anchors the email; any OTHER unknown-business parties get queued. ✅
 
-### 4 candidate fix approaches (documented at `tasks/downstream/eq-email-pipeline-unknown-sender.md`)
+When NO person belongs to any known account (e.g., cold inbound from a totally new prospect), the orchestrator can't find an anchor; `insert_email` raises `ValueError` because `raw_interactions.account_id` is NOT NULL; the outer `Exception` catches, logs, returns `status="error"`. The email is silently dropped; the pending signal proposals built earlier in the function are never flushed (they flush AFTER `insert_email` succeeds). ✗
+
+The Phase 1 acceptance test (`tests/test_orchestrator_three_state.py` in eq-email-pipeline) only covered the case-1 scenario (sender = known acme.com; CC = unknown-startup.io). The case where the SENDER itself is the unknown party was never tested or fixed.
+
+### Why the transcript pipeline doesn't have this gap
+
+(User explicitly accepted this limitation 2026-05-17 PM.) Transcripts are user-initiated. The frontend forces the user to pick an anchor account before recording starts; the backend rejects 400 if no account_id. The "no anchor yet" question never reaches the backend. The dam is in the right place for transcripts.
+
+**Emails are categorically different.** They arrive autonomously from gmail/outlook integration. There's no UI moment to ask "which account?" before the email lands. The backend genuinely needs to handle the no-anchor case for emails.
+
+### Candidate fix approaches (full doc at `tasks/downstream/eq-email-pipeline-unknown-sender.md`)
 
 | Approach | Pros | Cons |
 |---|---|---|
-| A — Recipient-as-anchor for inbound | Email saved + processed; sender becomes signal; downstream gets Day-1 emission with full content | Anchor semantics shift — interaction "anchored to YOU" until approval; backfill must handle anchor-change |
-| B — Allow `account_id NULL` temporarily | Cleanest semantics ("pending anchor") | Touches Phase-1-shipped hard invariant; schema migration; downstream needs to handle NULL |
-| C — Headless `pending_interactions` table | Keeps `raw_interactions` clean | New table + dedup logic + extra hops |
-| D — Hybrid (A for inbound, current for outbound) | Matches user intent (outbound to unknown = user knows the recipient) | Direction-conditional anchor logic |
+| **C — separate `pending_interactions` table** ⭐ **recommended** | Architecturally honest; preserves the `raw_interactions.account_id NOT NULL` invariant; symmetric with Phase 2 identity state machine; no misattribution risk | New table → Prisma migration → `/map` needs awareness; workflow gains a "promote pending → raw" step |
+| B — allow `account_id NULL` temporarily | Single materialization path; no new table | Violates Phase 1 hard invariant; downstream needs to handle NULL envelopes; existing queries need auditing |
+| D — column-level pending state on `raw_interactions` | Minor schema change | Requires a synthetic "pending sentinel" account — same misattribution critique |
+| ~~A — recipient-as-anchor for inbound~~ | (rejected) | Misattributes external emails to user's own org; analytics/billing/graph relationships inherit the wrong attribution |
 
-**Recommended sequence for the next session:**
-1. Brainstorm fix approach with user (this is a product/strategic decision)
-2. Codex consult on the chosen approach (CSO discipline — design-time review)
-3. Write implementation plan in `eq-email-pipeline/docs/superpowers/plans/`
-4. Schema migration in `eq-frontend` if Approach B is chosen
-5. Production E2E that asserts a cold-inbound-from-unknown email gets queued, then approved → contact materialized → backfill envelope fires
+**The right pattern (2026 AI-native posture):** explicit pending state, not a fake anchor. Approach C mirrors what Phase 2 was already going to introduce for contacts (`shell / emerging / partial / resolved / verified`) — an interaction whose account is in-flight gets an explicit state, not a hack.
+
+### Recommended sequence for the next session
+
+1. **Brainstorm with user** — surface Approach C as the recommended; confirm direction. Product/strategic decision; do NOT auto-decide.
+2. **Codex consult on the chosen approach** (CSO discipline — design-time review BEFORE writing code).
+3. **Write a focused implementation plan** at `eq-email-pipeline/docs/superpowers/plans/2026-05-XX-pending-interactions.md`.
+4. **Schema migration in eq-frontend** Prisma if Approach C — new `pending_interactions` table.
+5. **Implement** in eq-email-pipeline: orchestrator branches to pending_interactions when no party is known.
+6. **Implement** in live-transcription-fastapi: workflow's emit step learns to promote pending → raw + emit envelope on approval.
+7. **Production E2E** that asserts cold-inbound-from-unknown email → queue entry → user approves → contact materialized → email becomes a normal interaction → downstream Neo4j MERGE visible.
+8. **Use `scripts/verify_consumer_contracts.py` + `scripts/verify_schema.py`** (M5 tooling) as the pre-merge gate.
 
 ---
 
