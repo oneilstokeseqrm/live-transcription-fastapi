@@ -19,6 +19,7 @@ from dbos import DBOS, Queue
 
 from services.account_provisioning.steps import (
     call_agent_enrich,
+    emit_email_promoted_events,
     emit_eventbridge_events,
     materialize_signals,
     resolve_or_create_account,
@@ -60,7 +61,14 @@ async def account_provisioning_workflow(
       4. Resolve or create account (account_domains-keyed idempotency).
       5. Materialize signals (contacts UPSERT, raw_interactions UPSERT,
          summaries UPSERT, links INSERT ON CONFLICT, queue → 'mapped').
+         Includes Phase-1-email-pipeline M2 Step 4: promote any
+         cold-inbound emails from pending_interactions and capture the
+         promoted interaction_ids on the result.
       6. Emit per-interaction EnvelopeV1 events to EventBridge.
+      7. Emit per-promoted-interaction EmailPromoted events to
+         EventBridge (M2; eq-email-pipeline subscribes and runs full
+         local enrichment retroactively). No-op for queues with no
+         cold-inbound emails attached.
 
     The workflow ID set at the call site is
     ``f"queue-{queue_id}:approval-{approval_attempt_id}"`` (plan §6.2),
@@ -108,16 +116,27 @@ async def account_provisioning_workflow(
         account_id=account_id,
     )
 
-    # Step 6: emit.
+    # Step 6: emit EnvelopeV1 per materialized interaction (including
+    # promoted cold-inbound emails — downstream consumers receive them as
+    # regular EnvelopeV1.email events).
     emissions = await emit_eventbridge_events(materialization=materialization)
+
+    # Step 7: emit EmailPromoted per promoted cold-inbound email (M2). No-op
+    # when this queue had no pending_interactions attached. Appended at
+    # workflow END per DBOS plan §6.8 (safe under deploy-while-in-flight).
+    email_promoted_emissions = await emit_email_promoted_events(
+        materialization=materialization,
+    )
 
     logger.info(
         "account_provisioning_workflow done: queue_id=%s account_id=%s "
-        "contacts=%d interactions=%d emissions=%d",
+        "contacts=%d interactions=%d promoted=%d emissions=%d email_promoted=%d",
         queue_id, account_id,
         len(materialization.contact_ids),
         len(materialization.interaction_ids),
+        len(materialization.promoted_interaction_ids),
         len(emissions),
+        len(email_promoted_emissions),
     )
 
     return AccountProvisioningResult(
@@ -126,5 +145,5 @@ async def account_provisioning_workflow(
         domain=queue_state.domain,
         contact_ids=materialization.contact_ids,
         interaction_ids=materialization.interaction_ids,
-        emissions=emissions,
+        emissions=emissions + email_promoted_emissions,
     )
