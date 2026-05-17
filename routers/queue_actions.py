@@ -787,10 +787,13 @@ REPLAY_INTERACTION_IDS_SQL = text("""
 
 
 REPLAY_PROMOTED_INTERACTION_IDS_SQL = text("""
-    SELECT interaction_id::text AS interaction_id
-    FROM pending_interactions
-    WHERE queue_id = CAST(:queue_id AS uuid)
-      AND archive_reason = 'promoted'
+    SELECT p.interaction_id::text AS interaction_id
+    FROM pending_interactions p
+    JOIN pending_account_mappings m ON m.id = p.queue_id
+    WHERE p.queue_id = CAST(:queue_id AS uuid)
+      AND p.archive_reason = 'promoted'
+      AND m.mapped_at IS NOT NULL
+      AND p.archived_at >= m.mapped_at - INTERVAL '1 second'
 """)
 # M2 (Phase-1-email-pipeline) replay reconstruction: the pending rows that
 # materialize_account_approval promoted on the ORIGINAL /map call carry
@@ -799,6 +802,21 @@ REPLAY_PROMOTED_INTERACTION_IDS_SQL = text("""
 # original /map may have committed materialization but failed both
 # emissions, and the replay needs to surface promoted interactions to the
 # new emit_email_promoted_for_materialization call.
+#
+# Lifecycle scoping (Codex M2 round-2 P2): reopened queues reuse the same
+# queue_id, so a queue that was mapped → reopened → mapped again carries
+# 'promoted' pending rows from BOTH lifecycles. Without scoping, a
+# same-attempt /map replay during the second lifecycle would resurrect
+# the first lifecycle's interaction_ids and re-emit historical events.
+#
+# The lifecycle discriminator is the queue's CURRENT mapped_at: both
+# pending.archived_at and queue.mapped_at are stamped from NOW() inside
+# the same materialize transaction (NOW() returns the start-of-txn
+# timestamp, so they share a value within a cycle). Cycle-1 rows have
+# archived_at = cycle-1 mapped_at; cycle-2 rows have archived_at =
+# cycle-2 mapped_at. Filter pending.archived_at >= queue.mapped_at - 1s
+# tolerance (handles micro-clock-skew + the fact that the archive UPDATE
+# runs slightly before the queue UPDATE within the same txn).
 
 
 REPLAY_CONTACT_IDS_SQL = text("""

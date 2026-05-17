@@ -630,14 +630,23 @@ async def materialize_account_approval(
 
     signals = (await session.execute(SELECT_SIGNALS_SQL, {"queue_id": queue_id})).all()
 
-    # A queue with cold-inbound emails (pending_interactions) but zero signals
-    # is architecturally valid: a totally cold sender with no other queue
-    # context yet. The legacy guard (raise on no signals) would now mis-fire,
-    # so accept the empty-signals case as long as something was promoted.
-    if not signals and not promoted_interaction_ids:
+    # Per plan §4.2: the orchestrator's pending path ALWAYS flushes at least
+    # the sender's signal alongside the pending_interactions row, in the same
+    # transaction. A queue with promoted pending rows but zero active signals
+    # is therefore an upstream data-integrity bug — either the orchestrator
+    # short-circuited the signal flush or signals were archived out from
+    # under us. Either way, materialization without contacts would leave the
+    # promoted email with no link to its sender's contact, breaking the
+    # downstream extras.contacts contract that action-item-graph and
+    # eq-structured-graph-core depend on (Codex M2 round-2 P1). Fail loud
+    # so the upstream bug surfaces instead of writing broken envelopes.
+    if not signals:
         raise ValueError(
-            f"materialize_account_approval called with no active signals AND "
-            f"no pending_interactions for queue_id={queue_id!r}"
+            f"materialize_account_approval called with no active signals "
+            f"for queue_id={queue_id!r} (pending_interactions promoted="
+            f"{len(promoted_interaction_ids)}). Each cold-inbound email "
+            f"should produce at least the sender's signal — investigate "
+            f"the orchestrator path."
         )
 
     contact_ids: list[str] = []
