@@ -793,7 +793,7 @@ REPLAY_PROMOTED_INTERACTION_IDS_SQL = text("""
     WHERE p.queue_id = CAST(:queue_id AS uuid)
       AND p.archive_reason = 'promoted'
       AND m.mapped_at IS NOT NULL
-      AND p.archived_at >= m.mapped_at - INTERVAL '1 second'
+      AND p.archived_at >= m.mapped_at
 """)
 # M2 (Phase-1-email-pipeline) replay reconstruction: the pending rows that
 # materialize_account_approval promoted on the ORIGINAL /map call carry
@@ -814,9 +814,10 @@ REPLAY_PROMOTED_INTERACTION_IDS_SQL = text("""
 # the same materialize transaction (NOW() returns the start-of-txn
 # timestamp, so they share a value within a cycle). Cycle-1 rows have
 # archived_at = cycle-1 mapped_at; cycle-2 rows have archived_at =
-# cycle-2 mapped_at. Filter pending.archived_at >= queue.mapped_at - 1s
-# tolerance (handles micro-clock-skew + the fact that the archive UPDATE
-# runs slightly before the queue UPDATE within the same txn).
+# cycle-2 mapped_at. Codex M2 round-4 P2 tightening: no slack needed —
+# both NOW() calls in the same txn return the exact same value, so
+# `>= m.mapped_at` is precise. The earlier 1-second tolerance admitted
+# prior-lifecycle rows for fast remap cycles.
 
 
 REPLAY_CONTACT_IDS_SQL = text("""

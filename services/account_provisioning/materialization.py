@@ -135,6 +135,30 @@ UPSERT_PLACEHOLDER_SUMMARY_SQL = text("""
 # ---------------------------------------------------------------------------
 
 
+REPOINT_SIGNALS_FOR_DUPLICATE_PENDING_SQL = text("""
+    UPDATE pending_account_mapping_signals sig
+    SET interaction_id = e.interaction_id
+    FROM pending_interactions p
+    JOIN emails e
+        ON e.tenant_id = p.tenant_id
+        AND e.internet_message_id = p.internet_message_id
+    WHERE p.queue_id = CAST(:queue_id AS uuid)
+      AND p.archived_at IS NULL
+      AND p.internet_message_id IS NOT NULL
+      AND sig.interaction_id = p.interaction_id
+""")
+# Step 4-pre-1 (Codex M2 round-4 P1): BEFORE archiving the duplicate pending
+# row, re-point any signals that referenced its pre-allocated interaction_id
+# to the existing emails row's interaction_id. Without this, the legacy
+# per-signal loop later in materialize_account_approval hits
+# CHECK_RAW_INTERACTION_EXISTS_SQL with the duplicate's now-dead interaction_id
+# and raises permanently — approving a queue with a duplicate cold-inbound
+# would never succeed. Re-pointing lets the existing email pick up the
+# duplicate's contact links via the standard signal-loop path AND through
+# the new Step 5 cross-queue batch (the re-pointed signal now references a
+# raw_interactions row that already exists).
+
+
 ARCHIVE_PENDING_DUPLICATES_SQL = text("""
     UPDATE pending_interactions p
     SET archived_at = NOW(),
@@ -148,7 +172,7 @@ ARCHIVE_PENDING_DUPLICATES_SQL = text("""
           AND e.internet_message_id = p.internet_message_id
       )
 """)
-# Step 4-pre (plan §5.2): a rare race — the orchestrator's dedup vs an in-flight
+# Step 4-pre-2 (plan §5.2): a rare race — the orchestrator's dedup vs an in-flight
 # pending row that a sibling workflow promoted first. Archive the duplicate
 # without promoting; EXCLUDED from 4a/4b/4c/4d below by the
 # ``archived_at IS NULL`` filter so we don't INSERT raw_interactions without a
@@ -536,7 +560,15 @@ async def materialize_account_approval(
     # attached — the legacy meeting-only path is unaffected.
     # ---------------------------------------------------------------------
 
-    # Step 4-pre: archive any pending rows whose internet_message_id already
+    # Step 4-pre-1 (Codex M2 round-4 P1): re-point any signals that referenced
+    # a duplicate pending row's pre-allocated interaction_id to the existing
+    # emails row's interaction_id. MUST run BEFORE ARCHIVE_PENDING_DUPLICATES_SQL
+    # so the JOIN to pending_interactions still finds the duplicate rows.
+    await session.execute(
+        REPOINT_SIGNALS_FOR_DUPLICATE_PENDING_SQL, {"queue_id": queue_id},
+    )
+
+    # Step 4-pre-2: archive any pending rows whose internet_message_id already
     # exists in emails. Prevents the inconsistent state where 4a inserts
     # raw_interactions but 4b's ON CONFLICT skips the emails INSERT.
     await session.execute(ARCHIVE_PENDING_DUPLICATES_SQL, {"queue_id": queue_id})
