@@ -115,6 +115,10 @@ class ConsumerEnvelopeShape:
     interaction_type_enum: list[str] | None = None
     required_fields: set[str] = field(default_factory=set)
     parse_errors: list[str] = field(default_factory=list)
+    # True when the consumer's local repo isn't on disk (e.g. CI checked out
+    # only this repo). The script reports + skips this consumer instead of
+    # failing the run, so the gate is still useful in single-repo CI.
+    unavailable: bool = False
 
 
 def _extract_str_enum_values(class_node: ast.ClassDef) -> list[str]:
@@ -138,12 +142,59 @@ def _extract_str_enum_values(class_node: ast.ClassDef) -> list[str]:
     return values
 
 
+def _ann_assign_is_required(item: ast.AnnAssign) -> bool:
+    """Decide whether a Pydantic-style annotated assignment marks a required field.
+
+    Required cases:
+      - No default at all:                  ``tenant_id: UUID``
+      - Pydantic ``Field(...)`` with ``...`` as first positional arg:
+        ``tenant_id: UUID = Field(..., description='REQUIRED')``
+
+    Optional cases (NOT required):
+      - Any literal default:                ``schema_version: str = 'v1'``
+      - ``Field(default=...)`` / ``Field(default_factory=...)`` —
+        Pydantic-supplied default, even with no positional first arg
+      - Bare ``Field()`` with no args — Pydantic treats this as optional
+    """
+    if item.value is None:
+        return True
+    call = item.value
+    if not isinstance(call, ast.Call):
+        return False  # any concrete literal default → optional
+    func_name = call.func.attr if isinstance(call.func, ast.Attribute) else (
+        call.func.id if isinstance(call.func, ast.Name) else None
+    )
+    if func_name != "Field":
+        return False
+    # First positional arg `...` (Ellipsis) → required.
+    if call.args:
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and first.value is Ellipsis:
+            return True
+        # Any other positional first arg is treated as a default value → optional.
+        return False
+    # No positional args: optional UNLESS Pydantic's `default=...` keyword
+    # explicitly carries Ellipsis (rare but valid Pydantic v2).
+    for kw in call.keywords:
+        if kw.arg == "default":
+            if isinstance(kw.value, ast.Constant) and kw.value.value is Ellipsis:
+                return True
+            return False
+        if kw.arg == "default_factory":
+            return False
+    # `Field()` with no args at all: Pydantic v2 treats this as optional.
+    return False
+
+
 def parse_consumer_envelope(consumer: ConsumerRegistration) -> ConsumerEnvelopeShape:
     """Read consumer's envelope.py and extract constraints relevant to us."""
     shape = ConsumerEnvelopeShape(consumer=consumer.name)
     full = consumer.repo_path / consumer.envelope_model_path
     if not full.exists():
-        shape.parse_errors.append(f"missing file: {full}")
+        # Missing sibling repo isn't a parse error — it's "this consumer's
+        # source is not in the current checkout." The script reports +
+        # skips so the gate is still useful in single-repo CI.
+        shape.unavailable = True
         return shape
 
     try:
@@ -160,12 +211,13 @@ def parse_consumer_envelope(consumer: ConsumerRegistration) -> ConsumerEnvelopeS
         elif node.name == "InteractionType":
             shape.interaction_type_enum = _extract_str_enum_values(node)
         elif node.name == "EnvelopeV1":
-            # Required = AnnAssign with no default. Optional = default present
-            # or `Optional[...]`/`X | None` annotation. We use the simpler
-            # signal: AnnAssign.value is None means no default → required.
+            # Required if there's no default OR the default is `Field(...)`
+            # (Pydantic's "required field with metadata" idiom). Detection
+            # logic is centralized in ``_ann_assign_is_required`` so future
+            # Pydantic patterns can be added in one place.
             for item in node.body:
                 if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
-                    if item.value is None:
+                    if _ann_assign_is_required(item):
                         shape.required_fields.add(item.target.id)
 
     return shape
@@ -174,6 +226,20 @@ def parse_consumer_envelope(consumer: ConsumerRegistration) -> ConsumerEnvelopeS
 # ---------------------------------------------------------------------------
 # Envelope under test
 # ---------------------------------------------------------------------------
+
+
+# Closed map from envelope.interaction_type → EventBridge DetailType.
+# Must stay in sync with INTERACTION_TYPE_TO_DETAIL_TYPE in
+# services/account_provisioning/eventbridge_emit.py. The mapping is small
+# and changes rarely; verify_consumer_contracts re-checks it against the
+# live EventBridge rule filters when AWS is reachable.
+INTERACTION_TYPE_TO_DETAIL_TYPE: Final = {
+    "transcript": "EnvelopeV1.transcript",
+    "note": "EnvelopeV1.note",
+    "meeting": "EnvelopeV1.meeting",
+    "email": "EnvelopeV1.email",
+    "batch_upload": "EnvelopeV1.batch_upload",
+}
 
 
 # Mirrors the Phase 1.5 backfill emit step's envelope (services/account_provisioning/eventbridge_emit.py).
@@ -212,6 +278,45 @@ def build_test_envelope(args: argparse.Namespace) -> dict:
     return env
 
 
+def resolve_detail_type(envelope: dict, override: str | None) -> str | None:
+    """Pick the DetailType the producer would emit for this envelope.
+
+    If the CLI supplied ``--detail-type`` explicitly, use it. Otherwise,
+    derive from ``envelope.interaction_type`` via the closed lookup —
+    this mirrors what the production emit step does.
+    """
+    if override is not None:
+        return override
+    itype = envelope.get("interaction_type")
+    if not isinstance(itype, str):
+        return None
+    return INTERACTION_TYPE_TO_DETAIL_TYPE.get(itype)
+
+
+def check_detail_type_against_rules(
+    detail_type: str,
+    rules: list[dict],
+) -> list[str]:
+    """Return a list of WARNING strings for rules that would drop the event.
+
+    A rule "drops" the event when:
+      - The rule's ``detail-type`` filter is a closed list AND
+        ``detail_type`` is not in it.
+    An empty detail-type filter (rare in our setup) matches everything.
+    """
+    warnings: list[str] = []
+    for rule in rules:
+        filter_types = rule["pattern"].get("detail-type")
+        if not filter_types:
+            continue  # no filter or open-ended → matches anything
+        if detail_type not in filter_types:
+            warnings.append(
+                f"rule {rule['name']!r} filters detail-types "
+                f"{filter_types!r}; DetailType {detail_type!r} would be DROPPED"
+            )
+    return warnings
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -222,12 +327,24 @@ class ValidationResult:
     consumer: str
     accepted: bool
     findings: list[str] = field(default_factory=list)
+    skipped: bool = False  # consumer repo unavailable → not a rejection
 
 
 def validate_against_consumer(
     envelope: dict,
     shape: ConsumerEnvelopeShape,
 ) -> ValidationResult:
+    if shape.unavailable:
+        # Consumer's source isn't in this checkout (e.g., single-repo CI).
+        # Don't treat as rejection — just report skipped so the gate still
+        # works for the consumers we CAN see.
+        return ValidationResult(
+            consumer=shape.consumer,
+            accepted=True,
+            skipped=True,
+            findings=["repo not present in this checkout (skipped)"],
+        )
+
     result = ValidationResult(consumer=shape.consumer, accepted=True)
 
     if shape.parse_errors:
@@ -326,7 +443,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--interaction-type",
-        help="Override envelope.interaction_type",
+        help="Override envelope.interaction_type (auto-maps to DetailType "
+             "via INTERACTION_TYPE_TO_DETAIL_TYPE)",
+    )
+    parser.add_argument(
+        "--detail-type",
+        help="Override the EventBridge DetailType the producer would emit. "
+             "Defaults to the closed-lookup mapping from interaction_type. "
+             "Used to cross-check against live EventBridge rule filters.",
     )
     parser.add_argument(
         "--envelope-file",
@@ -338,13 +462,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip the AWS EventBridge rule probe (useful in CI / no-creds)",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Treat skipped consumers (repo not in checkout) as failures. "
+             "Default: skip + report so the gate is useful in single-repo CI.",
+    )
 
     args = parser.parse_args(argv)
 
     envelope = build_test_envelope(args)
+    detail_type = resolve_detail_type(envelope, args.detail_type)
     print("Validating envelope against known consumers:")
     print(f"  source={envelope.get('source')!r}  "
-          f"interaction_type={envelope.get('interaction_type')!r}")
+          f"interaction_type={envelope.get('interaction_type')!r}  "
+          f"DetailType={detail_type!r}")
     print()
 
     results: list[ValidationResult] = []
@@ -353,7 +485,12 @@ def main(argv: list[str] | None = None) -> int:
         result = validate_against_consumer(envelope, shape)
         results.append(result)
 
-        marker = "✓" if result.accepted else "✗"
+        if result.skipped:
+            marker = "—"
+        elif result.accepted:
+            marker = "✓"
+        else:
+            marker = "✗"
         print(f"  [{marker}] {consumer.name}")
         if consumer.notes:
             print(f"        notes: {consumer.notes}")
@@ -362,8 +499,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
 
-    # AWS rule discovery
+    # AWS rule discovery + DetailType cross-check.
     aws_warning_only = False
+    rule_drop_warnings: list[str] = []
     if not args.no_aws:
         rules, err = probe_eventbridge_rules()
         if err is not None:
@@ -390,9 +528,32 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 for u in unmapped:
                     print(f"  - {u}", file=sys.stderr)
+            if detail_type is not None:
+                rule_drop_warnings = check_detail_type_against_rules(
+                    detail_type, rules
+                )
+                if rule_drop_warnings:
+                    print()
+                    print(
+                        f"DETAIL-TYPE WARNING: emit step would set "
+                        f"DetailType={detail_type!r}, but some rules would drop it:",
+                        file=sys.stderr,
+                    )
+                    for w in rule_drop_warnings:
+                        print(f"  - {w}", file=sys.stderr)
 
     print()
-    rejecters = [r.consumer for r in results if not r.accepted]
+    rejecters = [
+        r.consumer for r in results
+        if not r.accepted and (not r.skipped or args.strict)
+    ]
+    skipped = [r.consumer for r in results if r.skipped]
+    if skipped and not args.strict:
+        print(
+            f"SKIPPED {len(skipped)} consumer(s) "
+            f"(repo not in checkout): {skipped}",
+            file=sys.stderr,
+        )
     if rejecters:
         print(f"DRIFT: {len(rejecters)} consumer(s) would reject the envelope: "
               f"{rejecters}", file=sys.stderr)

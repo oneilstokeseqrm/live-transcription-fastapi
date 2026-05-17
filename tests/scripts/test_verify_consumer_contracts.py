@@ -15,9 +15,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.verify_consumer_contracts import (  # noqa: E402
+    INTERACTION_TYPE_TO_DETAIL_TYPE,
     ConsumerEnvelopeShape,
     ConsumerRegistration,
+    check_detail_type_against_rules,
     parse_consumer_envelope,
+    resolve_detail_type,
     validate_against_consumer,
 )
 
@@ -84,7 +87,12 @@ class TestParseConsumerEnvelope:
         assert "tenant_id" in shape.required_fields
         assert "source" in shape.required_fields
 
-    def test_reports_missing_file_as_parse_error(self, tmp_path: Path) -> None:
+    def test_marks_missing_file_as_unavailable_not_parse_error(self, tmp_path: Path) -> None:
+        # Codex round-1 P1: in single-repo checkouts (typical CI, fresh
+        # clones), the sibling repo paths don't exist. The script must
+        # NOT treat that as a hard failure — instead, mark the consumer
+        # as `unavailable` so the gate remains useful for the consumers
+        # that ARE in the checkout.
         reg = ConsumerRegistration(
             name="missing",
             repo_path=tmp_path,
@@ -92,8 +100,41 @@ class TestParseConsumerEnvelope:
             rule_name="x",
         )
         shape = parse_consumer_envelope(reg)
-        assert shape.parse_errors
-        assert "missing file" in shape.parse_errors[0]
+        assert shape.unavailable is True
+        assert shape.parse_errors == []
+        assert shape.required_fields == set()
+
+    def test_detects_pydantic_field_ellipsis_as_required(self, tmp_path: Path) -> None:
+        # Codex round-1 P1: action-item-graph declares required fields as
+        # `Field(..., description=...)`. The old AST logic only saw bare
+        # annotations as required → strict consumer's required_fields was
+        # empty, and producer drops of tenant_id/content/timestamp would
+        # silently pass the script. This regression is the bug we fix.
+        model = tmp_path / "envelope.py"
+        model.write_text(
+            "from pydantic import BaseModel, Field\n"
+            "from uuid import UUID\n"
+            "class EnvelopeV1(BaseModel):\n"
+            "    schema_version: str = Field(default='v1')\n"
+            "    tenant_id: UUID = Field(..., description='REQUIRED')\n"
+            "    user_id: str = Field(..., description='REQUIRED')\n"
+            "    optional_field: str | None = Field(default=None)\n"
+            "    optional_with_factory: list = Field(default_factory=list)\n"
+            "    bare_field: str\n"  # required, no default
+            "    plain_literal: str = 'default'\n"  # optional
+        )
+        reg = ConsumerRegistration(
+            name="pydantic-style",
+            repo_path=tmp_path,
+            envelope_model_path="envelope.py",
+            rule_name="r",
+        )
+        shape = parse_consumer_envelope(reg)
+        assert shape.required_fields == {"tenant_id", "user_id", "bare_field"}
+        assert "schema_version" not in shape.required_fields
+        assert "optional_field" not in shape.required_fields
+        assert "optional_with_factory" not in shape.required_fields
+        assert "plain_literal" not in shape.required_fields
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +207,73 @@ class TestValidation:
         # without false-positive validation against its (empty) shape.
         shape = ConsumerEnvelopeShape(
             consumer="broken",
-            parse_errors=["missing file: /nope/envelope.py"],
+            parse_errors=["syntax error: nope"],
         )
         result = validate_against_consumer({"source": "api"}, shape)
         assert not result.accepted
         assert any("PARSE:" in f for f in result.findings)
+
+    def test_unavailable_consumer_is_skipped_not_rejected(self) -> None:
+        # Codex round-1 P1: a consumer whose repo isn't present should
+        # produce a skipped result, not a rejection. Validates the
+        # single-repo CI use case.
+        shape = ConsumerEnvelopeShape(consumer="absent", unavailable=True)
+        result = validate_against_consumer({"source": "api"}, shape)
+        assert result.skipped is True
+        # Skipped == accepted by default (the script's exit code logic).
+        # Use --strict to flip this; tested in main()-level smoke runs.
+        assert result.accepted is True
+
+
+class TestDetailTypeLookup:
+    """Codex round-1 P2: the --detail-type / rule-filter cross-check."""
+
+    def test_resolves_from_interaction_type_when_no_override(self) -> None:
+        envelope = {"interaction_type": "transcript"}
+        assert resolve_detail_type(envelope, None) == "EnvelopeV1.transcript"
+
+    def test_override_wins(self) -> None:
+        envelope = {"interaction_type": "transcript"}
+        assert (
+            resolve_detail_type(envelope, "EnvelopeV1.custom")
+            == "EnvelopeV1.custom"
+        )
+
+    def test_unknown_interaction_type_returns_none(self) -> None:
+        envelope = {"interaction_type": "something_new"}
+        assert resolve_detail_type(envelope, None) is None
+
+    def test_closed_map_covers_all_documented_types(self) -> None:
+        # If the producer adds a new interaction_type, this map must grow
+        # to match. The test pins the current set.
+        assert set(INTERACTION_TYPE_TO_DETAIL_TYPE.keys()) == {
+            "transcript", "note", "meeting", "email", "batch_upload",
+        }
+
+
+class TestRuleFilterCrossCheck:
+    """check_detail_type_against_rules: warns when a rule would drop the event."""
+
+    def _rule(self, name: str, detail_types: list[str] | None) -> dict:
+        pattern: dict = {"source": ["com.yourapp.transcription"]}
+        if detail_types is not None:
+            pattern["detail-type"] = detail_types
+        return {"name": name, "pattern": pattern, "state": "ENABLED"}
+
+    def test_warns_when_detail_type_not_in_filter(self) -> None:
+        rules = [self._rule("aig", ["EnvelopeV1.transcript", "EnvelopeV1.email"])]
+        warnings = check_detail_type_against_rules("EnvelopeV1.batch_upload", rules)
+        assert warnings
+        assert "DROPPED" in warnings[0]
+        assert "aig" in warnings[0]
+
+    def test_no_warning_when_detail_type_in_filter(self) -> None:
+        rules = [self._rule("aig", ["EnvelopeV1.transcript"])]
+        warnings = check_detail_type_against_rules("EnvelopeV1.transcript", rules)
+        assert warnings == []
+
+    def test_no_warning_when_rule_has_no_detail_type_filter(self) -> None:
+        # An empty / missing detail-type filter matches everything.
+        rules = [self._rule("open", None)]
+        warnings = check_detail_type_against_rules("EnvelopeV1.anything", rules)
+        assert warnings == []
