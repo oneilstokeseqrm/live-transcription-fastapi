@@ -32,6 +32,32 @@ Exit codes:
     1 = At least one consumer would reject (drift detected)
     2 = AWS probe / config error (only when --aws is required)
     3 = CLI argument error
+
+DESIGN-INTENT SCOPE — what this script catches (and what it does NOT):
+
+  Catches (the "contract surface drift" bug class):
+    - source value not in the consumer's SourceType enum
+    - interaction_type not in the consumer's InteractionType enum
+    - content.format not in the consumer's ContentFormat enum
+    - missing required top-level fields
+    - null required top-level fields
+    - missing / null nested content fields
+    - DetailType the producer would emit not in any live rule's filter
+    - EventBridge rules not registered in the local CONSUMERS map
+
+  Out of scope (intentionally — a separate / different tool):
+    - Full Pydantic *type* validation (e.g. tenant_id must be a UUID,
+      timestamp must be an ISO-8601 datetime). For that, run the
+      consumer repo's tests against a sample envelope, or import its
+      Pydantic model in an integration test. Pulling Pydantic + the
+      consumer's transitive deps into a CLI gate defeats the
+      "lightweight pre-merge gate" property.
+    - Schema-level constraints expressed in JSON Schema or in code
+      paths beyond the consumer's envelope.py (e.g. nested @validator
+      methods).
+
+  The gate is intentionally STATIC: no runtime imports of producer or
+  consumer modules (except a producer-lookup sync test in pytest).
 """
 from __future__ import annotations
 
@@ -525,6 +551,12 @@ def probe_eventbridge_rules() -> tuple[list[dict], str | None]:
     except ImportError as exc:
         return [], f"boto3 not installed: {exc}"
 
+    # Round-5 P1 fix: probe the SAME bus the producer emits to. The
+    # producer reads ``EVENTBRIDGE_BUS_NAME`` (see
+    # services/account_provisioning/eventbridge_emit.py); if this script
+    # hardcodes "default" while the producer uses a different bus, the
+    # script reads the wrong ruleset and reports a false green.
+    bus_name = os.environ.get("EVENTBRIDGE_BUS_NAME", "default")
     try:
         client = boto3.client(
             "events",
@@ -537,7 +569,7 @@ def probe_eventbridge_rules() -> tuple[list[dict], str | None]:
         # without meaningful cost.
         all_rules: list[dict] = []
         paginator = client.get_paginator("list_rules")
-        for page in paginator.paginate(EventBusName="default"):
+        for page in paginator.paginate(EventBusName=bus_name):
             all_rules.extend(page.get("Rules", []))
     except Exception as exc:  # noqa: BLE001 — surface any AWS error verbatim
         return [], f"AWS probe failed: {type(exc).__name__}: {exc}"

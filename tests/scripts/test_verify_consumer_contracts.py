@@ -419,6 +419,71 @@ class TestDetailTypeLookup:
         assert INTERACTION_TYPE_TO_DETAIL_TYPE == PRODUCER_LOOKUP
 
 
+class TestAwsProbeBusName:
+    """Codex round-5 P1: probe_eventbridge_rules must respect
+    EVENTBRIDGE_BUS_NAME so the script validates against the SAME bus
+    the producer emits to. Hardcoding 'default' silently reads the
+    wrong ruleset in non-default deployments."""
+
+    def test_uses_eventbridge_bus_name_env_var(self, monkeypatch) -> None:
+        from scripts import verify_consumer_contracts as mod
+
+        captured: dict = {}
+
+        class _Paginator:
+            def paginate(self, **kwargs):
+                captured["kwargs"] = kwargs
+                return iter([{"Rules": []}])
+
+        class _Client:
+            def get_paginator(self, op_name: str):
+                captured["op"] = op_name
+                return _Paginator()
+
+        class _Boto3:
+            def client(self, service: str, region_name: str):
+                captured["service"] = service
+                captured["region"] = region_name
+                return _Client()
+
+        monkeypatch.setenv("EVENTBRIDGE_BUS_NAME", "my-bus")
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        monkeypatch.setitem(sys.modules, "boto3", _Boto3())
+
+        rules, err = mod.probe_eventbridge_rules()
+        assert err is None
+        assert rules == []
+        assert captured["service"] == "events"
+        assert captured["region"] == "us-west-2"
+        assert captured["op"] == "list_rules"
+        assert captured["kwargs"]["EventBusName"] == "my-bus"
+
+    def test_falls_back_to_default_bus_when_env_unset(self, monkeypatch) -> None:
+        from scripts import verify_consumer_contracts as mod
+
+        captured: dict = {}
+
+        class _Paginator:
+            def paginate(self, **kwargs):
+                captured["kwargs"] = kwargs
+                return iter([{"Rules": []}])
+
+        class _Client:
+            def get_paginator(self, op_name: str):
+                return _Paginator()
+
+        class _Boto3:
+            def client(self, service: str, region_name: str):
+                return _Client()
+
+        monkeypatch.delenv("EVENTBRIDGE_BUS_NAME", raising=False)
+        monkeypatch.setitem(sys.modules, "boto3", _Boto3())
+
+        rules, err = mod.probe_eventbridge_rules()
+        assert err is None
+        assert captured["kwargs"]["EventBusName"] == "default"
+
+
 class TestRuleFilterCrossCheck:
     """check_detail_type_against_rules: warns when a rule would drop the event."""
 
