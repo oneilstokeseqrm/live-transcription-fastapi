@@ -1,171 +1,187 @@
 # Next Session — Start Here
 
 **Project:** Contact Quality and Account-Anchoring Initiative — a multi-phase data-quality foundation for an AI-native customer intelligence platform.
-**Last session:** 2026-05-15 PM (M0 + M1 + M2 + M1-hotfix shipped to production, all empirically verified including a live `/listen` smoke test).
-**Status:** ✅ **PHASE_1.5_M0_M1_M2_SHIPPED_M3_NEXT** — DBOS substrate is installed and running in production. Two database changes are live in production Neon. Live transcription path verified post-hotfix. The runway for M3 is clean. **This session executes M3 (the biggest remaining milestone). Code execution IS in scope.**
+**Last session:** 2026-05-17 (M3 workflow + M4 /approve cutover shipped together as PR #17).
+**Status:** ✅ **PHASE_1.5_M3_M4_SHIPPED_M5_NEXT** — DBOS workflow + /approve route wired + 75+ tests + 6 Codex rounds folded. PR #17 open (or merged, depending on session timing). This session verifies deploy → runs production canary → ships M5 (tooling + content fix) → optionally M3.5 (drop outbox).
 
 ---
 
 ## CRITICAL — this is a multi-session, multi-repo, long-arc project
 
-The Contact Quality Initiative is foundational hardening of the contact + account entity layer that the entire AI-native customer intelligence platform stands on. Phase 1 SHIPPED 2026-05-14 (silent regression fixed 2026-05-15 at `31f513f`). Phase 1.5 is what this session implements. Phase 2 + Phase 3 are documented for architectural coherence and explicitly out of scope.
+The Contact Quality Initiative is foundational hardening of the contact + account entity layer that the entire AI-native customer intelligence platform stands on. Phase 1 SHIPPED 2026-05-14. Phase 1.5 milestones M0/M1/M2/M1-hotfix SHIPPED 2026-05-15. M3 (workflow) + M4 (/approve cutover) shipped together 2026-05-17 in PR #17 (M4 brought forward to resolve a Codex pre-merge P1).
 
-Decisions made for Phase 1.5 compound across Phase 2 + Phase 3. The DBOS substrate was chosen specifically because it carries all three phases on the same primitives. M1 + M2 + M1-hotfix are now SHIPPED and stable in production — M3 is the workflow code that uses the substrate.
+**Remaining for Phase 1.5:** M3.5 (drop account_provisioning_outbox) + M5 (verified-contract tooling + empty-content.text backfill fix).
+
+After Phase 1.5: explicit stopping point for comprehensive re-planning before Phase 2 (identity state machine + progressive enrichment) or Phase 3 (advanced conflict resolution).
+
+---
+
+## Production credentials + IDs (load-bearing reference)
+
+Locked across the initiative. Re-stated here so the prompt is self-contained:
+
+- **Neon Postgres (eq-dev):** project `super-glitter-11265514`, branch `production`, database `neondb`. Direct connection (no `-pooler`) for `DBOS_SYSTEM_DATABASE_URL`.
+- **Test tenant:** `11111111-1111-4111-8111-111111111111` (column is `tenants.id`). All data under this tenant is test data.
+- **Test user (FK target for `pending_account_mappings.owner_user_id`):** `b0000000-0000-4000-8000-000000000002`.
+- **Railway FastAPI service:** project `inspiring-upliftment` (`847cfa5a-b77c-4fb0-95e4-b20e8773c23e`), service `59a69f3d-9a24-4041-942a-891c4a81c5fb`, env `e4c5ec15-1931-4632-9e58-92d9c6be4261`, URL `https://live-transcription-fastapi-production.up.railway.app`.
+- **Railway eq-agent-action-core:** URL `https://eq-agent-action-core-production.up.railway.app`, service `3036ea0f-afc9-4bc4-889d-c98617d81e96`.
+- **Internal JWT:** HS256, `INTERNAL_JWT_SECRET`, `iss=eq-frontend`, `aud=eq-backend`, claims: `tenant_id`, `user_id`, optional `pg_user_id`.
+- **AWS:** EventBridge bus `default` (configurable via `EVENTBRIDGE_BUS_NAME`); `AWS_REGION=us-east-1`; access keys in Railway env.
+- **Neo4j:** Aura instance `c6171c63`, URI `neo4j+s://c6171c63.databases.neo4j.io`. Shared across graph services.
+
+## ⚠️ Test tenant state at session end
+
+The shared test tenant `11111111-1111-4111-8111-111111111111` is **EMPTY** at the end of the PR #17 session. The session ran multiple destructive ops:
+- A one-shot 8-DELETE FK-chain cleanup (mid-session, after test data accumulated)
+- Multiple `RUN_DESTRUCTIVE_TESTS=1` pytest runs (each fires conftest teardown after every DB-touching test → deletes accounts → opportunities CASCADE-delete)
+
+User flagged this at session end as "cleaned my account and opportunities again." Acknowledged. The lesson: the `requires_db_write` marker prevents accidental writes by *other* agents but doesn't prevent *me* from wiping the user's own seed data when I knowingly opt in. **Going forward (LOCKED 2026-05-17):** ask the user PER ACTION before destructive ops on the shared test tenant, including before each batch of `RUN_DESTRUCTIVE_TESTS=1` runs. Env-var gating is necessary but not sufficient.
+
+If the user has re-seeded data between sessions, treat it as live — do not run destructive cleanup or DB-write tests without explicit confirmation.
 
 ---
 
 ## Pre-flight (one-time, before any work)
 
-1. **`/context-restore`** — should load the checkpoint `20260515-132118-phase-1.5-m0-m1-m2-shipped-plus-hotfix-m3-next.md`. **This is the load-bearing handoff** — it captures every decision, drift, lesson, and production state at session end.
+1. **`/context-restore`** — should load the checkpoint
+   `<timestamp>-phase-1.5-m3-m4-shipped-as-pr-17.md`. This is the
+   load-bearing handoff — it captures every decision, the 6 Codex
+   rounds, the shared-tenant-collision incident, and the production
+   state at session end.
 
-2. **Confirm MEMORY.md status reads `PHASE_1.5_M0_M1_M2_SHIPPED_M3_NEXT`.** If anything else, STOP and surface.
+2. **Confirm MEMORY.md status reads `PHASE_1.5_M3_M4_SHIPPED_M5_NEXT`.**
+   If anything else, STOP and surface.
 
-3. **Verify repo state:**
+3. **Verify PR #17 + repo state:**
    ```bash
+   gh pr view 17 --json state,mergedAt,reviews,statusCheckRollup
    git -C /Users/peteroneil/EQ-CORE/live-transcription-fastapi status
-   # Should be: on `main` at `e334638`, working tree clean, 0/0 with origin
+   git -C /Users/peteroneil/EQ-CORE/live-transcription-fastapi log --oneline -5
    git -C /Users/peteroneil/EQ-CORE/live-transcription-fastapi stash list
-   # Should show 2 entries; stash@{0} is "M2 split correction for plan §20 v4"
-   ```
-
-4. **Verify production is healthy:**
-   ```bash
    curl -sS -o /dev/null -w "%{http_code}\n" https://live-transcription-fastapi-production.up.railway.app/health
-   # Should be 200
    ```
 
-5. **Pop the stash IMMEDIATELY** — it's the plan v4 §20 update documenting M2's split and other M1 drifts:
+4. **If PR #17 is NOT merged yet:** review it. Address any post-session
+   feedback. Then merge. **If it IS merged:** verify production deploy
+   succeeded (Railway dashboard, or `mcp__railway__deployment_status`)
+   AND that DBOS launch banner appears in logs.
+
+5. **SHARED-TENANT-COLLISION CHECK (LOCKED 2026-05-16):**
+   Before ANY destructive SQL or test that triggers conftest teardown:
    ```bash
-   git -C /Users/peteroneil/EQ-CORE/live-transcription-fastapi stash pop stash@{0}
+   ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl | head -10
    ```
-   This puts the plan-doc update into your working tree. Commit it as part of M3's first commit.
+   Files modified in last hour = hazard. The
+   `eq-synthetic-date-generation` agent had an active inject during
+   the 2026-05-16 session that was wiped by tenant-scoped DELETEs.
+   Pause + ask user if any concurrent activity is detected.
 
 ---
 
 ## Mandatory read order at session start
 
-Approximate total reading time: 30 minutes. Tight but every doc is load-bearing for a different reason.
+Approximate total reading time: 25 minutes. Tight but every doc is load-bearing for a different reason.
 
-1. **The checkpoint** (already loaded via /context-restore) — full record of M0/M1/M2/hotfix decisions + production state + 3 new lessons captured.
+1. **The checkpoint** (loaded via /context-restore) — full record of M3+M4 decisions + 6 Codex rounds + production state + the shared-tenant-collision incident.
 
-2. **`docs/superpowers/specs/2026-05-15-initiative-context-snapshot.md`** (~8 min) — standalone entry point for the WHOLE initiative. Section 5 reflects the locked DBOS decision. Section 6 has 30 numbered hard invariants any implementation must preserve.
+2. **THIS document** (~3 min) — wayfinding + M5 scope.
 
-3. **THIS document** (~3 min) — wayfinding + M3 scope.
+3. **`docs/superpowers/specs/2026-05-15-initiative-context-snapshot.md`** (~8 min) — standalone entry point for the WHOLE initiative.
 
-4. **`docs/superpowers/plans/2026-05-15-async-orchestration-dbos.md`** (~15 min, ~1200 lines after v4 amendments) — **THE LOAD-BEARING IMPLEMENTATION PLAN.** Read in full. For M3 specifically: **§5 (file-by-file plan), §6 (workflow detail), §7 (test-discipline expectations per component), §13 M3 (acceptance criteria), §14 (component × test-discipline matrix).** §20 (revision history; v4 documents M1's API drift + M2's split + M1-hotfix Codex P1s) records every correction so you don't re-derive.
+4. **`docs/superpowers/plans/2026-05-15-async-orchestration-dbos.md`** (~10 min) — THE LOAD-BEARING IMPLEMENTATION PLAN. For M5: **§11 M5 + §13 M5 acceptance + §10.5 tooling list**. For the empty-content.text fix: **§3.4 + §6.6**. §20 v5+v6 documents the M3+M4 session's drifts and Codex fold-ins.
 
-5. **`docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`** (~5 min) — locked single-replica V1 + multi-replica-ready posture. **Do NOT revisit `--workers 1` decision** unless a Phase-2 trigger fires.
+5. **`tasks/lessons.md`** (~5 min) — bottom entries. **CRITICAL: the shared-infrastructure collision lesson (2026-05-16)** + the 3 lessons added at start of M3 (Codex pre-merge gate, kwarg removals in transitive deps, multi-repo schema migration sequencing).
 
-6. **`tasks/downstream/test-discipline-gaps-2026-05-15.md`** (~3 min) — all five expectations the plan addresses. M3 implements Items 1, 2, 3 in the workflow's test coverage.
+6. **PR #17 description** — comprehensive narrative of what shipped, the 6 Codex rounds + their fold-ins, the known limitations deferred to M5.
 
 **On-demand reference (read when work requires it):**
-- `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md` — design doc; Sections 1, 7.2, 8.5 reflect the DBOS architecture
-- `tasks/downstream/action-item-graph.md` + `tasks/downstream/eq-structured-graph-core.md` — consumer change briefs (relevant for M3 emit-step coding; the `extras.contacts` requirement is locked there)
-- The previous session's checkpoint at `20260515-155911-phase-1.5-m0-m1-m2-shipped.md` (mid-session save; superseded by the latest one but has fuller M0/M1/M2 narrative if needed)
+
+- `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md` — locked single-replica V1. Do NOT revisit `--workers 1`.
+- `docs/superpowers/specs/2026-05-17-next-session-prompt.md` — the paste-ready opening prompt for this session, mirrors the 2026-05-15 PM prompt's structure.
+- `tasks/downstream/test-discipline-gaps-2026-05-15.md` — five expectations. M5 implements **Items 4 + 5**.
+- `tasks/downstream/action-item-graph.md` + `eq-structured-graph-core.md` — consumer change briefs.
 
 ---
 
-## This session's work — execute M3 (and ideally M3.5)
+## This session's work — M5 (and optionally M3.5)
 
-### M3 — Workflow definition + tests (1 PR in live-transcription-fastapi)
+### STEP 1 — Verify PR #17 production deploy
 
-**Plan §11 explicitly calls M3 "probably a session by itself."** Pace accordingly.
+- Railway deployed the merge commit.
+- DBOS launched with `executor_id` matching `RAILWAY_REPLICA_ID`.
+- `/health` returns 200.
+- If deploy failed: investigate before proceeding.
 
-**Scope:**
+### STEP 2 — Production canary (deferred from M3+M4)
 
-1. **Create `services/account_provisioning/` package** with these new files:
-   - `__init__.py`
-   - `workflow.py` — the `@DBOS.workflow()` function with 7 steps per plan §4.1
-   - `steps.py` — the 6 `@DBOS.step()` functions per plan §6.1 (revalidate, transition, agent_enrich, resolve_or_create_account, materialize_signals, emit_eventbridge_events)
-   - `types.py` — Pydantic models including `AccountProfile`, `AccountProvisioningResult`, `MaterializationResult`, `EmissionRecord`
-   - `eventbridge_emit.py` — the emit step's per-interaction logic with `INTERACTION_TYPE_TO_DETAIL_TYPE` closed lookup (plan §3.3, §6.6)
-   - `materialization.py` — **moved** from `workers/materialization.py`. SQL stays the same EXCEPT:
-     - Remove `INSERT_OUTBOX_SQL` write (lines 230-251 of the current `workers/materialization.py`)
-     - Remove the in-memory `linked_pairs` dedup at line 161
-     - Change link INSERT to `ON CONFLICT (interaction_id, contact_id) DO NOTHING` (the M2 unique index is live)
+Plan §11 M4 + §12 lists this. Canary discipline:
 
-2. **Update `routers/queue_actions.py`** — change the import path from `workers.materialization` to `services.account_provisioning.materialization`. `/map`'s inline materialization call uses the moved function. (Do NOT wire `/approve` to the workflow yet — that's M4.)
+1. **Announce the Neon writes to the user FIRST** + verify no concurrent agents in other repos (the shared-tenant protocol).
+2. Seed a synthetic queue entry via Neon MCP under test tenant `11111111-1111-4111-8111-111111111111`.
+3. Mint an internal JWT for the test tenant.
+4. `POST /queue/{id}/approve` with the JWT.
+5. Verify 202 response + `workflow_id`.
+6. Poll Neon's `dbos.workflow_status` for the workflow_id until terminal state (success/error). Expected runtime: 30-90s.
+7. Verify: `accounts` row + `account_domains` row + `contacts` rows + `interaction_contact_links` rows all exist for the workflow.
+8. Verify EventBridge emission (CloudTrail OR synthetic SQS consumer).
+9. **Teardown the test rows.** Mandatory.
 
-3. **Rewrite `services/agent_action_core_client.py`** per plan §5.3 + §3.2. New contract:
-   ```python
-   class AgentActionCoreClient:
-       async def enrich(self, *, url: str, effort: Literal["low","medium","high"]="medium", jwt: str) -> AccountProfile
-       async def get_run(self, *, run_id: str, jwt: str) -> AccountProfile
-   ```
-   Call body: `{url, effort}` (per agent's `/openapi.json`). Auth: Bearer JWT. Stream=false for blocking JSON response.
+### STEP 3 — Ship M5
 
-4. **Write all tests** per plan §7 + §13 M3:
-   - `tests/unit/account_provisioning/test_workflow.py` — workflow-level unit tests
-   - `tests/unit/account_provisioning/test_steps.py` — per-step unit tests against a real SQLAlchemy session (NO `MagicMock` for the session per Item 1)
-   - `tests/unit/account_provisioning/test_eventbridge_emit.py` — emit step covers closed-lookup fail-loud, extras.contacts inclusion
-   - `tests/unit/account_provisioning/test_agent_client.py` — agent client rewrite
-   - `tests/contract/test_agent_enrich_response_shape.py` — **contract-pinning test** against the live production agent (plan §3.2 finding). This is the load-bearing guard for the agent's response shape until they publish AccountProfile in OpenAPI.
-   - `tests/integration/account_provisioning/test_workflow_e2e.py` — full workflow E2E against production Neon (test-tenant scoped per the decided test-infrastructure pattern)
-   - `tests/integration/account_provisioning/test_reopen.py` — reopen-path coverage (Codex P3)
-   - `tests/integration/account_provisioning/test_crash_recovery.py` — DBOS crash-recovery (Codex P3)
+Three sub-deliverables in one PR:
 
-5. **Workflow is DEAD CODE at end of M3.** No route wires to it yet. The /approve cutover is M4. The /map keeps its inline materialization (no workflow needed for /map).
+**(i) `scripts/verify_schema.py`** (test-discipline-gaps Item 4)
+- Runs EXPLAIN against the live Neon project for an arbitrary SQL text
+- Reports missing-column/missing-table errors
+- Catches the class of bug that produced the 2026-05-15 silent regression at design time
+- Plan §10.5
 
-6. **Fold the stashed plan v4 §20 update** into the first commit of M3's PR. Add a v5 entry if M3 surfaces any new design drifts.
+**(ii) `scripts/verify_consumer_contracts.py`** (Item 5)
+- Validates a proposed envelope (source + detail-type + extras shape) against live EventBridge rules + downstream Pydantic models
+- Catches the class of bug that produced the action-item-graph SourceType drift incident
+- Plan §10.5
 
-7. **Capture the 3 new lessons from prior session into `tasks/lessons.md`** as part of M3's PR:
-   - "Run Codex review BEFORE merging, not after" — Codex review is a merge gate, not a follow-up
-   - "Imports don't catch keyword-arg removals in transitive dependency upgrades" — smoke-test call sites at runtime
-   - "Coordinated multi-repo schema migrations need explicit code-lifecycle sequencing" — additions are forward-compat; removals must follow code that no longer depends on them
+**(iii) Empty-content.text fix for backfill emission**
+PR #17 documented this as a deferred limitation. Three approaches (surface to user before picking):
+- (a) Pull content from `interaction_summaries.summary_content` (Lane 2's post-processing output)
+- (b) Add an extras flag `is_backfill=true` + coordinate with downstream consumers (action-item-graph, eq-structured-graph-core) to detect + skip content-dependent processing
+- (c) Some other approach surfaced by re-reading the consumer change briefs
 
-**Acceptance criteria (plan §13 M3, must all check):**
-- [ ] All `@DBOS.step` functions covered by real-substrate unit tests against production Neon (test-tenant scoped).
-- [ ] Contract-pinning test passes against the live production agent.
-- [ ] Materialization no longer writes outbox; no in-memory link-dedup.
-- [ ] `/map` route's import updated; `/map` integration tests still pass.
+### STEP 4 — `/review` skill checklist update
 
-**Pre-merge ritual (lesson from prior session, codified):**
-- **Run `/codex review` on the M3 diff BEFORE requesting merge.** This is the new gate. If Codex finds P1s, fold them in before merge — not after as a hotfix.
-- Re-probe plan §3 contracts before writing SQL (per Item 4 of test-discipline-gaps).
+Add "Live schema probe" + "Cross-service contracts" sections to the project's review checklist. ~half-session of documentation work.
 
-### M3.5 — Drop `account_provisioning_outbox` (small follow-up, cross-repo)
+### STEP 5 (optional) — M3.5: drop `account_provisioning_outbox`
 
-Ships AFTER M3 deploys (when no code writes to outbox anymore). Cross-repo PR in eq-frontend:
-
-1. New Prisma migration directory: `prisma/migrations/{timestamp}_drop_account_provisioning_outbox/migration.sql`
-2. Contents: `DROP TABLE IF EXISTS "account_provisioning_outbox" CASCADE;`
-3. Apply via Neon MCP prepare/complete flow.
-
-Acceptance: outbox table removed from production Neon; no references in code (verified by `grep -rn account_provisioning_outbox` returning zero hits).
-
-### M4 — Queue route cutover + production canary (RISK milestone — next next session)
-
-Out of scope for this session unless M3 finishes fast. Per plan §11 M4:
-- Refactor `routers/queue_actions.py` `/approve`: reserve row synchronously then start workflow via `SetWorkflowID(f"queue-{queue_id}:approval-{approval_attempt_id}")`.
-- Delete `workers/__main__.py`, `workers/account_provisioning_worker.py`, `workers/outbox_publisher.py`, `workers/advisory_lock.py` + their dedicated tests.
-- **Production canary BEFORE traffic depends on the workflow** (plan §12 + plan §13 M4 acceptance): seed synthetic queue entry via Neon MCP, start workflow via `DBOS.start_workflow_async`, assert end-to-end completion + downstream Neo4j visibility.
-- Codex review on the diff before merging.
-
-### M5 — Verified-contract tooling + checklist updates (~half session)
-
-- Ship `scripts/verify_schema.py` and `scripts/verify_consumer_contracts.py` (Items 4 + 5 of test-discipline-gaps).
-- Update `/review` skill checklist with "Cross-service contracts" + "Live schema probe" sections.
+Coordinated Prisma migration in eq-frontend. The outbox is dead code (no writers in M3); the drop is safe. Acceptance: `grep -rn account_provisioning_outbox` returns zero hits across all repos.
 
 ---
 
 ## Decisions that are LOCKED — do NOT re-litigate
 
-These are baked in from prior sessions. If you find NEW evidence contradicting one, STOP and surface.
+17 locked decisions (grew from 14 in PR #17 + one more post-session).
 
-1. **Substrate is DBOS.** Locked at D7 in the rethink session. Codex confirmed sound. M1 deployed it; runtime verified.
-2. **`--workers 1`, single replica V1, multi-replica-ready via `executor_id=RAILWAY_REPLICA_ID`.** Locked in `docs/superpowers/specs/2026-05-15-dbos-scaling-decisions.md`. Do NOT switch to `--workers 2` or multi-replica until a Phase-2 trigger fires.
-3. **Path A for EventBridge emission** (`EnvelopeV1.*` events, `Source=com.yourapp.transcription`). Locked in plan §3.3.
-4. **Workflow ID = `f"queue-{queue_id}:approval-{approval_attempt_id}"`.** Locked in plan §6.2.
-5. **`/approve` reserves the row synchronously before starting the workflow.** Locked in plan §5.3.
-6. **`account_provisioning_outbox` is DROPPED post-M3.** Locked. Already deferred from M2.
-7. **Account creation idempotency key is `account_domains.(tenant_id, domain)`.** NOT `accounts.name`. Locked in plan §6.4.
-8. **Emit `extras.contacts` metadata** per downstream change briefs. Locked in plan §6.6.
-9. **Closed `INTERACTION_TYPE_TO_DETAIL_TYPE` lookup, fails-loud on unknown types.** Locked in plan §3.3.
-10. **Test infrastructure for M3: Option B (test-tenant scoping in production)** with mandatory teardown per test. Locked 2026-05-15 PM by user. Migration to Option A (Neon test branch) gated on "first real customer data lands."
-11. **DBOS v2.x API is sync `launch()` / `destroy()` (NOT async variants).** Confirmed empirically in M1 deploy. Plan v4 §20 documents.
-12. **websockets pin: 14.2** (knock-on from DBOS). Compat shim in `services/deepgram_websockets_compat.py` handles deepgram-sdk 2.12.0 calling `extra_headers=`. Production-verified.
-13. **`DBOS_SYSTEM_DATABASE_URL` is REQUIRED.** `build_dbos_config()` raises `RuntimeError` if unset. Production env var IS set (M0).
-14. **Codex review BEFORE merging** is now the gate (not after). Lesson from M1 hotfix.
+Full list:
+
+1. **Substrate is DBOS.** Locked at D7 of the 2026-05-15 rethink.
+2. **Single Railway replica V1 + `executor_id=RAILWAY_REPLICA_ID`.** Multi-replica-ready by config; orphan-detector deferred to Phase 2.
+3. **EventBridge Path A** (`EnvelopeV1.*` events with `Source=com.yourapp.transcription`).
+4. **Workflow ID** = `f"queue-{queue_id}:approval-{approval_attempt_id}"`.
+5. **`/approve` reserves the row synchronously then enqueues the workflow** via `SetWorkflowID + APPROVAL_QUEUE.enqueue_async`.
+6. **`account_provisioning_outbox` is dropped** post-M3 (M3.5).
+7. **Account creation idempotency anchor** is `account_domains.(tenant_id, domain)`. NOT `accounts.name` (no unique index there).
+8. **Emit `extras.contacts` metadata** per downstream change briefs.
+9. **Closed `INTERACTION_TYPE_TO_DETAIL_TYPE` lookup** (5 entries: transcript / meeting / note / email / batch_upload). Unknown types FAIL LOUD.
+10. **Test infrastructure:** Option B (test-tenant scoping in production Neon) + `@pytest.mark.requires_db_write` opt-in marker + mandatory teardown per test.
+11. **DBOS v2.x API:** sync `DBOS.launch()`/`DBOS.destroy()` at FastAPI lifespan; **async** `get_event_async`/`set_event_async` INSIDE `@DBOS.step` functions (Codex P0 round-4 fix).
+12. **websockets pin 14.2** + deepgram compat shim in `services/deepgram_websockets_compat.py`.
+13. **`DBOS_SYSTEM_DATABASE_URL` is REQUIRED.** `build_dbos_config()` raises if unset.
+14. **Codex review BEFORE merging** is the gate. Soft cap: **4 rounds** before surfacing diminishing-returns trade-off to user. PR #17 hit 6 (user explicitly stopped at 6).
+15. **SQLAlchemy 2.0.49 bindparam truncation** — `text("WHERE id = :name::uuid")` parses bindname as `name_minus_one_char`. Use `CAST(:name AS uuid)` everywhere. (NEW in PR #17.)
+16. **Materialization REQUIRES real `raw_interactions` row** before materializing. Placeholder pattern REMOVED. If absent → raise ValueError → DBOS retry OR `/map` 503. (NEW in PR #17.)
+17. **Per-action confirmation for destructive ops on shared test tenant.** Env-var gating (`RUN_DESTRUCTIVE_TESTS=1`) is necessary but not sufficient — the marker prevents accidental writes by other agents but does NOT prevent ME from wiping the user's own seed data. Ask the user PER BATCH of destructive runs. (NEW 2026-05-17 post-PR-#17.)
+
+**Codex 4-round soft cap reasoning:** rounds 1-3 typically catch the real architectural P1s. Rounds 4+ find increasingly narrow edges (P2/P3). PR #17 took 6 rounds because we kept finding genuine bugs (placeholder pattern, batch_upload mapping, async event APIs) but the user surfaced "context is heavy" at round 6. Default to surfacing the trade-off after round 4 — let the user decide whether to keep iterating.
 
 ---
 
@@ -173,10 +189,9 @@ These are baked in from prior sessions. If you find NEW evidence contradicting o
 
 - **No Phase 2 design.** Sketched in plan §9; don't expand.
 - **No re-evaluating `--workers 1`** unless Phase-2 trigger fires.
-- **No touching `action-item-graph` or `eq-structured-graph-core` directly.** Those repos have their own agents.
-- **No M4** unless M3 finishes with substantial context budget remaining.
-- **No fixing the 50 pre-existing test failures.** Tracked separately under test-discipline-gaps Items 1-3.
-- **No touching the eq-frontend `feat/deal-health-v8-chrome` branch** (it's marked `[gone]` on remote; the other agent moved on; do not clean up unless asked).
+- **No touching `action-item-graph` or `eq-structured-graph-core`** directly. M5 ships tooling that VALIDATES against those repos' contracts; coordination on their content changes goes through their own agents.
+- **No fixing the 50 pre-existing test failures.** Tracked separately.
+- **No `feat/deal-health-v8-chrome` cleanup** in eq-frontend.
 
 ---
 
@@ -185,68 +200,89 @@ These are baked in from prior sessions. If you find NEW evidence contradicting o
 The user is a non-developer founder.
 
 - **Make confident technical decisions.** Surface only product or strategic decisions.
-- **Work without stopping for clarifying questions.** Make the reasonable call and continue; the user redirects if needed.
-- **The user cares about:** cutting-edge 2026 AI-native architecture; architectural correctness over short-term shortcuts; strict OSS only (no SSPL, no BSL); multi-session continuity; **robust planning + live smoke tests** (explicitly emphasized prior session).
-- **The user does NOT care about:** sunk-cost preservation; hitting deadlines over correctness; patterns not representing 2026 best practice.
+- **Work without stopping for clarifying questions** unless a stop condition fires.
+- **Strict OSS only** (no SSPL, no BSL).
+- **Architectural correctness over short-term shortcuts.**
+- **Context economy matters.** Surfaced in the M3+M4 session: 6 Codex rounds were felt as heavy. Honor the 4-round soft cap.
+- **No production users** (all data is test data) — short-term limitations are acceptable that would block a production ship. PR #17 deferred the empty-content.text limitation on this basis.
 
 ---
 
-## Verified-contracts discipline (re-probe before writing SQL)
+## Verified-contracts discipline (re-probe before writing SQL or ANY emission code)
 
-Plan §3 contracts were probed 2026-05-15. Time has passed; the M2 migration changed one of them (UNIQUE INDEX added). Before writing SQL that touches a table the plan cites, **re-probe via `mcp__neon__run_sql`** against project `super-glitter-11265514`. The plan calls this out explicitly. Same for the agent's OpenAPI (the response shape is undeclared in their spec; M3's contract-pinning test is the guard).
+Plan §3 contracts were probed 2026-05-15 + re-probed 2026-05-15 PM + verified-unchanged 2026-05-17 (PR #17). For M5 you re-probe AGAIN before writing — discipline is non-substitutable per `tasks/lessons.md` "Cross-service contract verification at design time."
 
-For M3 specifically:
-- Probe `interaction_contact_links` to confirm UNIQUE INDEX `(interaction_id, contact_id)` is still there (should be — it's in production from M2).
-- Probe `account_provisioning_outbox` to confirm it's still there (it is — drop deferred to M3.5).
-- Probe `accounts`, `account_domains`, `contacts`, `raw_interactions`, `interaction_summaries`, `pending_account_mappings`, `pending_account_mapping_signals` before writing the workflow's SQL.
-- Re-fetch `https://eq-agent-action-core-production.up.railway.app/openapi.json` to confirm the `/api/enrich` contract hasn't drifted.
+**Tables to re-probe via `mcp__neon__run_sql` (project `super-glitter-11265514`, branch `production`, database `neondb`):**
+
+| Table | Why M5 cares |
+|---|---|
+| `pending_account_mappings` | verify_schema.py target; queue lifecycle columns |
+| `pending_account_mapping_signals` | M5 emit-fix may pull source_type for downstream type mapping |
+| `accounts` | verify_schema.py probes this; FK target for many things |
+| `account_domains` | UNIQUE INDEX `(tenant_id, domain)` is the canonical idempotency anchor (LOCKED decision 7) |
+| `contacts` | verify_schema.py target |
+| `raw_interactions` | M5 P1 fix candidate: confirm whether `raw_text` column exists and how it's populated (currently NULL per intelligence_service.py) |
+| `interaction_summaries` | UNIQUE INDEX `interaction_summaries_interaction_id_key`; potential source of `content.text` for M5 backfill fix |
+| `interaction_contact_links` | M2 UNIQUE INDEX `(interaction_id, contact_id)` MUST still be live |
+| `interaction_account_links` | tenant-less link table; teardown chain dependency |
+| `account_provisioning_outbox` | M3.5 drop target; confirm still present |
+
+**External contracts to re-probe:**
+
+- `https://eq-agent-action-core-production.up.railway.app/openapi.json` — for verify_consumer_contracts.py validation rules + `AccountProfile` schema (still missing per plan §10.1; coordinate or treat the M3 contract-pinning test as the load-bearing definition)
+- EventBridge rules via `mcp__aws-api__call_aws "aws events list-rules --event-bus-name default"`. The two live rules to verify unchanged are `action-item-graph-rule` and `eq-structured-graph-rule`. BOTH filter on `source: ["com.yourapp.transcription", "com.eq.email-pipeline"]` + `detail-type: ["EnvelopeV1.transcript", "EnvelopeV1.note", "EnvelopeV1.meeting", "EnvelopeV1.email"]`. Plan §3.3 documented; PR #17's INTERACTION_TYPE_TO_DETAIL_TYPE depends on this.
+- Consumer Pydantic models:
+  - `action-item-graph/src/action_item_graph/models/envelope.py:34-43` (SourceType enum — `zoom`+`generic` were missing 2026-05-15; in-flight fix by that repo's agent — independent of M5)
+  - `eq-structured-graph-core/app/models/envelope.py:23-42` (EnvelopeV1; loose `source: str`, no enum constraint)
+
+If ANY of these contracts has drifted from what PR #17's code assumes, that's a P0 finding for M5 — fix before merging.
 
 ---
 
-## Stop conditions
+## Stop conditions — STOP and surface to user if ANY fire
 
-Stop and surface to the user if:
+**Hard stops (do NOT proceed without user OK):**
 
-- `/context-restore` returns NO_CHECKPOINTS or the wrong checkpoint.
-- MEMORY.md status string isn't `PHASE_1.5_M0_M1_M2_SHIPPED_M3_NEXT`.
-- Pre-flight reveals state different from this prompt (e.g., git not clean, production unhealthy, stash missing).
-- Live contract probes return results that contradict §3 of the plan in a way that would change architectural decisions.
-- Codex review on M3 diff substantively disagrees with the plan in a way the plan didn't anticipate.
-- You discover anything that suggests one of the 14 LOCKED decisions needs reconsideration with NEW evidence.
-- M3.5/M4 production canary fails or shows unexpected behavior.
-- Any handoff doc references files that don't exist (sync gap).
+- `/context-restore` returns NO_CHECKPOINTS or wrong checkpoint
+- MEMORY.md status string isn't `PHASE_1.5_M3_M4_SHIPPED_M5_NEXT`
+- **Codex review on the M5 PR substantively disagrees with the plan in a way the plan didn't anticipate.** This is how M1-hotfix's 2 P1s were caught + M3+M4's 6-round cycle surfaced real bugs. Treat new contract-drift findings as P0 even if Codex marks them lower.
+- Production deploy from PR #17 merge FAILED or DBOS launch banner missing from logs
+- Canary fails or shows unexpected behavior (likely indicates design gap, not bug — surface)
+- More than **4 Codex rounds** during M5 without P1-clean — surface the diminishing-returns trade-off
+- You discover NEW evidence that any of the **16 LOCKED decisions** needs reconsideration
+- **Empty-content.text fix decision** (the round-6 P1 deferred from PR #17): three approaches in scope (pull from interaction_summaries / add `is_backfill` flag + downstream coord / accept limitation). Surface options before picking — strategic decision.
+- **ANY destructive op on the shared test tenant.** Not just "check the ls"; surface to the user *per action* if you suspect the user has seed data in the tenant. The PR #17 session ran multiple destructive cleanups + tests that wiped test-tenant accounts/contacts/opportunities. User flagged this 2026-05-17. New rule: per-action confirmation, not just env-var gating.
+
+**Soft signals (consider surfacing):**
+
+- PR #17 has unmerged conflicts (likely benign — rebase + resolve)
+- Codex round 1-3 with progressive narrowing (normal; keep going)
+- Plan §3 contract probe shows minor drift (note in plan §20; continue)
 
 ---
 
 ## Per-milestone deliverables
 
-When M3 finishes:
-1. PR opened (with Codex review BEFORE requesting merge).
-2. Acceptance criteria from plan §13 M3 checked off in PR description.
+When M5 finishes:
+1. PR opened (with codex review BEFORE requesting merge).
+2. Acceptance criteria from plan §13 M5 checked off.
 3. Test suite passing (delta tracked vs main).
-4. Commit pushed; merge after Codex pass + your review.
-5. Production redeploy verified (no behavior change since workflow is dead code).
-6. MEMORY.md status updated.
-7. Save a /context-save checkpoint at end of session.
-8. Update this handoff for the next session.
+4. Production redeploy verified (M5 is tooling + a content fix; the tooling itself is dev-time only).
+5. MEMORY.md status updated.
+6. /context-save checkpoint at end of session.
+7. New paste-ready prompt for the next session.
 
 ---
 
-## Open coordination items (parallel to M3, non-blocking)
+## Open coordination items (parallel to M5, non-blocking)
 
-- **Agent team** — coordinate with `eq-agent-action-core` team to publish `AccountProfile` schema in their OpenAPI. Currently the response is bare `{}`. Our contract-pinning test in M3 is the load-bearing backup, but architecturally the contract should be declared. Open an issue or small PR in their repo. Non-blocking for M3.
-- **eq-frontend `Live DB Tests` CI** — broken on every PR since 2026-05-11 (DATABASE_URL env var unset in workflow). Worth flagging to whoever owns eq-frontend CI. Not blocking us.
+- **Agent team** — coordinate with `eq-agent-action-core` team to publish `AccountProfile` schema in their OpenAPI. The contract-pinning test from M3 is the load-bearing backup but the architectural correct answer is for them to declare the contract. Open an issue or small PR in their repo. Non-blocking.
+- **eq-frontend `Live DB Tests` CI** — broken on every PR since 2026-05-11. Worth flagging to whoever owns eq-frontend CI. Not blocking M5.
 
 ---
 
 ## Final note
 
-The plan is the load-bearing artifact. Every M3 component maps to all 5 test-discipline expectations in plan §14. Verified-contracts discipline (plan §3) is baked into design time, not deploy time. Re-probe contracts before writing SQL that touches a table the plan cites.
+The plan is the load-bearing artifact. PR #17 is the narrative of what shipped. The shared-infrastructure-collision lesson is load-bearing for any write to production Neon's test tenant. The 4-round Codex soft cap is load-bearing for context economy.
 
-The scaling-decisions spec is the load-bearing artifact for any decision about replica count > 1. Don't bump replicas without shipping the orphan-detector first.
-
-**Codex review BEFORE merging is the gate.** Run it on the M3 diff before requesting merge.
-
-When in doubt, read the plan. When the plan is silent, read the scaling-decisions spec. When still in doubt, surface to the user as a product/strategic decision.
-
-The user is paying for thinking + correct execution, not typing. M3 is the substantial-thinking milestone. Pace accordingly.
+**When in doubt, read the plan. When the plan is silent, surface to user.** The user pays for thinking + correct execution + careful coordination, not typing.
