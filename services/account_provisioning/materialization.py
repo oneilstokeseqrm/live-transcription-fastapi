@@ -202,11 +202,21 @@ PROMOTE_INSERT_RAW_INTERACTIONS_SQL = text("""
     FROM pending_interactions
     WHERE queue_id = CAST(:queue_id AS uuid)
       AND archived_at IS NULL
+      AND interaction_id = ANY(CAST(:ids AS uuid[]))
     ON CONFLICT (interaction_id) DO NOTHING
 """)
 # Step 4a (plan §5.2): preserve the pre-allocated interaction_id (identity
 # continuity through promotion). ON CONFLICT DO NOTHING makes this idempotent
 # under DBOS step retry — a partial-success replay re-runs cleanly.
+#
+# ID-scoped filter (Codex M2 round-3 P1): the IDs captured by
+# SELECT_PENDING_TO_PROMOTE_SQL are the only rows the Python Step 4c loop
+# can upsert threads for. Scoping the SQL queries to that same ID set
+# prevents a concurrently-inserted pending row (arriving between SELECT and
+# this INSERT under READ COMMITTED) from being promoted half-way: the
+# new row would be invisible to Step 4c (no thread_id assignment) but
+# visible to a WHERE-archived_at-IS-NULL query, leaving an archived
+# 'promoted' row with NULL thread_id.
 
 
 PROMOTE_INSERT_EMAILS_SQL = text("""
@@ -249,6 +259,7 @@ PROMOTE_INSERT_EMAILS_SQL = text("""
     FROM pending_interactions
     WHERE queue_id = CAST(:queue_id AS uuid)
       AND archived_at IS NULL
+      AND interaction_id = ANY(CAST(:ids AS uuid[]))
     ON CONFLICT (tenant_id, internet_message_id) DO NOTHING
     RETURNING interaction_id::text AS interaction_id
 """)
@@ -361,6 +372,7 @@ PROMOTE_INSERT_INTERACTION_SUMMARIES_SQL = text("""
     FROM pending_interactions
     WHERE queue_id = CAST(:queue_id AS uuid)
       AND archived_at IS NULL
+      AND interaction_id = ANY(CAST(:ids AS uuid[]))
     ON CONFLICT (tenant_id, interaction_id, summary_type) DO NOTHING
 """)
 # Step 4d (plan §5.2): required by Step 5's link table inserts. Composite
@@ -376,10 +388,14 @@ ARCHIVE_PROMOTED_PENDING_SQL = text("""
         archive_reason = 'promoted'
     WHERE queue_id = CAST(:queue_id AS uuid)
       AND archived_at IS NULL
+      AND interaction_id = ANY(CAST(:ids AS uuid[]))
 """)
 # Step 4e (plan §5.2): archive (NOT delete) the rows we just promoted. The
 # Step 4 SELECTs use ``archived_at IS NULL``, so a DBOS step retry that re-runs
 # the whole materialization will skip already-promoted rows (idempotency).
+# ID-scoped (Codex M2 round-3 P1): only archive the rows the Step 4c loop
+# actually processed; a concurrent INSERT into pending_interactions for this
+# queue under READ COMMITTED would otherwise be archived without a thread_id.
 
 
 # ---------------------------------------------------------------------------
@@ -405,11 +421,7 @@ BATCH_LINK_EMAIL_SUMMARIES_SQL = text("""
         sig.archived_at IS NULL
         AND (
             sig.queue_id = CAST(:queue_id AS uuid)
-            OR sig.interaction_id IN (
-                SELECT interaction_id FROM pending_interactions
-                WHERE queue_id = CAST(:queue_id AS uuid)
-                  AND archive_reason = 'promoted'
-            )
+            OR sig.interaction_id = ANY(CAST(:promoted_ids AS uuid[]))
         )
     ON CONFLICT (interaction_id, contact_id) DO NOTHING
 """)
@@ -418,6 +430,14 @@ BATCH_LINK_EMAIL_SUMMARIES_SQL = text("""
 # OR clause picks up signals on OTHER queues whose interaction_id was just
 # promoted by THIS approval, so contacts materialized on other queues get
 # linked to the now-promoted interaction.
+#
+# Lifecycle scoping (Codex M2 round-3 P2): the cross-queue clause uses the
+# in-memory ``promoted_interaction_ids`` list from this txn instead of a
+# SQL subquery over pending_interactions WHERE archive_reason='promoted'.
+# The subquery form would catch ALL historical promoted rows for the queue
+# — including prior lifecycles for a reopened queue — and add stale
+# contact links that downstream emit (Step 6/7) wouldn't fire for. Passing
+# the explicit ID set is lifecycle-correct by construction.
 #
 # Filter ``summary_type = 'email'`` keeps this batch focused on the email-
 # pipeline path and prevents fan-out across multiple summary variants that
@@ -532,10 +552,17 @@ async def materialize_account_approval(
     promoted_interaction_ids: list[str] = []
 
     if pending_rows:
+        # Capture the explicit set of pending interaction_ids the rest of
+        # Step 4 will operate on. Codex M2 round-3 P1: scoping the Step 4
+        # SQL queries to this exact list prevents a concurrent INSERT into
+        # pending_interactions (under READ COMMITTED) from leaking into
+        # 4a/4b/4d/4e while remaining invisible to Step 4c's Python loop.
+        pending_ids = [str(row.interaction_id) for row in pending_rows]
+
         # Step 4a: INSERT raw_interactions (preserved interaction_id).
         await session.execute(
             PROMOTE_INSERT_RAW_INTERACTIONS_SQL,
-            {"queue_id": queue_id, "account_id": account_id},
+            {"queue_id": queue_id, "account_id": account_id, "ids": pending_ids},
         )
 
         # Step 4b: INSERT emails (thread_id=NULL, filled in by Step 4c).
@@ -546,7 +573,7 @@ async def materialize_account_approval(
         # an orphan (no matching email). Detect and clean up.
         emails_inserted_result = await session.execute(
             PROMOTE_INSERT_EMAILS_SQL,
-            {"queue_id": queue_id, "account_id": account_id},
+            {"queue_id": queue_id, "account_id": account_id, "ids": pending_ids},
         )
         inserted_email_interaction_ids = {
             row.interaction_id for row in emails_inserted_result.all()
@@ -578,6 +605,12 @@ async def materialize_account_approval(
                 if str(row.interaction_id) in inserted_email_interaction_ids
             ]
 
+        # The IDs that actually survived 4b's ON CONFLICT (and weren't
+        # race-losers) — these are what 4d/4e operate on.
+        promoted_ids_list = [
+            str(row.interaction_id) for row in pending_rows
+        ]
+
         # If every row was a race-loser, there is nothing left to promote.
         if not pending_rows:
             # Skip 4d/4c/4e for the empty set. promoted_interaction_ids
@@ -587,11 +620,11 @@ async def materialize_account_approval(
             # Step 4d: INSERT interaction_summaries (summary_type='email').
             # Done BEFORE Step 4c so Step 5's link batch — which JOINs on
             # interaction_summaries — sees a row even if Step 4c's per-row
-            # loop is partway through under retry. The WHERE archived_at IS NULL
-            # filter excludes race-losers archived above.
+            # loop is partway through under retry. ID-scoped per Codex M2
+            # round-3 P1.
             await session.execute(
                 PROMOTE_INSERT_INTERACTION_SUMMARIES_SQL,
-                {"queue_id": queue_id},
+                {"queue_id": queue_id, "ids": promoted_ids_list},
             )
 
         # Step 4c: upsert email_threads ONCE PER PENDING ROW (so
@@ -617,11 +650,14 @@ async def materialize_account_approval(
             )
             promoted_interaction_ids.append(str(row.interaction_id))
 
-        # Step 4e: archive the rows we just promoted.
-        await session.execute(
-            ARCHIVE_PROMOTED_PENDING_SQL,
-            {"queue_id": queue_id},
-        )
+        # Step 4e: archive the rows we just promoted. ID-scoped per
+        # Codex M2 round-3 P1 — only the rows we explicitly captured at
+        # SELECT time, not concurrently-inserted new rows.
+        if promoted_ids_list:
+            await session.execute(
+                ARCHIVE_PROMOTED_PENDING_SQL,
+                {"queue_id": queue_id, "ids": promoted_ids_list},
+            )
 
     # ---------------------------------------------------------------------
     # Signal-driven contact materialization + per-signal meeting-summary
@@ -754,7 +790,11 @@ async def materialize_account_approval(
     if promoted_interaction_ids:
         await session.execute(
             BATCH_LINK_EMAIL_SUMMARIES_SQL,
-            {"queue_id": queue_id, "tenant_id": tenant_id},
+            {
+                "queue_id": queue_id,
+                "tenant_id": tenant_id,
+                "promoted_ids": promoted_interaction_ids,
+            },
         )
 
     await session.execute(
