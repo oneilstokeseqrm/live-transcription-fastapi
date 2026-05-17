@@ -814,26 +814,35 @@ async def materialize_account_approval(
             interaction_ids.append(raw_id)
 
     # ---------------------------------------------------------------------
-    # Step 5 (M2): batch link insert for email summaries (cross-queue safe).
-    # Picks up signals on THIS queue whose interaction was just promoted
-    # AND signals on OTHER queues whose interaction was just promoted
-    # (the §8.6 cross-queue cold-inbound case). Meeting-summary links are
-    # handled by the per-signal loop above. The SQL is a no-op when no
-    # email summaries exist for any signal, so it's safe to run
-    # unconditionally — but skipping it when no emails were promoted
-    # AND no email summaries pre-exist is a measurable hot-path win
-    # for the legacy meeting-only case.
+    # Step 5 (M2): batch link insert for email summaries.
+    # Picks up signals on THIS queue whose interaction is linked to an
+    # email summary (newly promoted this txn OR pre-existing — covering
+    # the §8.6 cross-queue cold-inbound case AND the round-4 re-pointed-
+    # signals case where 4-pre redirected this queue's signals to an
+    # already-promoted email's interaction_id). Also picks up signals on
+    # OTHER queues whose interaction was just promoted by this approval.
+    #
+    # Codex M2 round-6 P2: ALWAYS run this batch, not gated on
+    # promoted_interaction_ids — the cross-queue + re-pointed cases have
+    # promoted_interaction_ids=[] but still need the email-summary link
+    # to fire so the queue's contacts link to the right summary. The
+    # legacy per-signal loop creates a 'meeting' summary + link as a
+    # cosmetic-but-not-functionally-broken side effect for re-pointed
+    # email signals (downstream consumers that filter
+    # interaction_contact_links by summary_type='email' get the right
+    # link from this batch; a future cleanup could make the legacy loop
+    # type-aware to drop the duplicate 'meeting' summary). The query is
+    # cheap when no email summaries match the signals (returns 0 rows).
     # ---------------------------------------------------------------------
 
-    if promoted_interaction_ids:
-        await session.execute(
-            BATCH_LINK_EMAIL_SUMMARIES_SQL,
-            {
-                "queue_id": queue_id,
-                "tenant_id": tenant_id,
-                "promoted_ids": promoted_interaction_ids,
-            },
-        )
+    await session.execute(
+        BATCH_LINK_EMAIL_SUMMARIES_SQL,
+        {
+            "queue_id": queue_id,
+            "tenant_id": tenant_id,
+            "promoted_ids": promoted_interaction_ids,
+        },
+    )
 
     await session.execute(
         UPDATE_QUEUE_SQL,
