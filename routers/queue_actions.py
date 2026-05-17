@@ -459,6 +459,14 @@ async def approve_entry(queue_id: str, body: ApproveRequest, request: Request):
     # the caller receives the REAL workflow_id (not a phantom keyed on
     # their losing attempt_id) — Codex P2 finding 2026-05-16.
     winning_attempt_id = body.approval_attempt_id
+    # Codex P2 2026-05-16 (round 6): rows materialized via /map
+    # carry an approval_attempt_id (MAP_RESERVE_SQL stamps it) but
+    # have NO corresponding DBOS workflow. If /approve hits such a
+    # row on the idempotent-satisfaction path, we must NOT return a
+    # workflow_id (would be a phantom). Detect by checking row.status
+    # == 'mapped' — only the /map route flips status to 'mapped'
+    # without a workflow.
+    mapped_via_map_route = False
 
     async with get_async_session() as session:
         async with session.begin():
@@ -511,6 +519,11 @@ async def approve_entry(queue_id: str, body: ApproveRequest, request: Request):
                 # DBOS state.
                 if current.approval_attempt_id:
                     winning_attempt_id = current.approval_attempt_id
+                # If the row was materialized via /map (NOT /approve),
+                # no DBOS workflow exists. Don't return a phantom
+                # workflow_id.
+                if current.status == "mapped":
+                    mapped_via_map_route = True
 
     # Workflow start AFTER the route's transaction commits. Plan §5.3:
     # this ordering preserves the contract that the row is durably
@@ -560,12 +573,18 @@ async def approve_entry(queue_id: str, body: ApproveRequest, request: Request):
                 ),
             ) from exc
 
-    return {
+    response_body: dict = {
         "status": "approved",
         "queue_id": queue_id,
-        "workflow_id": workflow_id,
         "approval_attempt_id": body.approval_attempt_id,
     }
+    # Only include workflow_id when an actual DBOS workflow exists for
+    # this row. Mapped-via-/map rows have no workflow; a phantom
+    # workflow_id would send polling clients to a nonexistent DBOS
+    # state.
+    if not mapped_via_map_route:
+        response_body["workflow_id"] = workflow_id
+    return response_body
 
 
 @router.post("/{queue_id}/map")
@@ -752,7 +771,13 @@ REPLAY_INTERACTION_IDS_SQL = text("""
     FROM pending_account_mapping_signals
     WHERE queue_id = CAST(:queue_id AS uuid)
       AND interaction_id IS NOT NULL
+      AND archived_at IS NULL
 """)
+# Codex P2 2026-05-16 (round 6): reopened queues keep the same
+# queue_id but old signals stay archived. materialize_account_approval
+# correctly ignores archived signals (SELECT_SIGNALS_SQL filter); the
+# replay reconstruction MUST match that filter so the same-attempt
+# /map replay doesn't re-emit interactions from a prior lifecycle.
 
 
 REPLAY_CONTACT_IDS_SQL = text("""
@@ -762,6 +787,7 @@ REPLAY_CONTACT_IDS_SQL = text("""
         ON lower(s.contact_email) = lower(c.email)
         AND s.tenant_id = c.tenant_id
     WHERE s.queue_id = CAST(:queue_id AS uuid)
+      AND s.archived_at IS NULL
       AND c.account_id = CAST(:account_id AS uuid)
       AND c.tenant_id = CAST(:tenant_id AS uuid)
 """)

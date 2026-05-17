@@ -202,12 +202,7 @@ async def emit_envelopes_for_materialization(
     client = boto3_factory()
     if client is None:
         # Graceful no-op when EventBridge is intentionally disabled
-        # (no AWS credentials in env). Caller treats this as success:
-        # /map returns 200, the workflow's Step 6 records empty
-        # emissions, and DBOS proceeds to workflow_status='success'.
-        # In production where emission failure would be a real bug,
-        # the boto3 client builds successfully and a put_events
-        # failure surfaces via FailedEntryCount → EventBridgeEmissionError.
+        # (no AWS credentials in env, factory returned None).
         logger.info(
             "EventBridge emission skipped (client unavailable): "
             "interaction_count=%d. This is expected in dev/CI without "
@@ -233,7 +228,21 @@ async def emit_envelopes_for_materialization(
         }
         # boto3 is sync; bridge into the async workflow without blocking
         # the event loop. Plan §5.2 + Codex P2 finding.
-        response = await asyncio.to_thread(client.put_events, Entries=[entry])
+        # Codex P3 2026-05-16 (round 6): boto3.client("events") does
+        # NOT validate credentials at construction time —
+        # NoCredentialsError fires at the first API call. Catch it
+        # here so dev/CI without AWS creds gets the same graceful
+        # no-op behavior as when the client builder itself fails.
+        try:
+            response = await asyncio.to_thread(client.put_events, Entries=[entry])
+        except NoCredentialsError:
+            logger.info(
+                "EventBridge put_events: AWS credentials missing at "
+                "call time. Skipping remaining emissions (returning "
+                "%d records collected so far).",
+                len(emissions),
+            )
+            return emissions
 
         failed_count = response.get("FailedEntryCount", 0)
         if failed_count:
