@@ -6,6 +6,19 @@
 
 ---
 
+## HARD CONSTRAINT FOR THIS SESSION
+
+**This session is plan-writing, NOT implementation.** The user explicitly clarified 2026-05-17 PM. The eq-email-pipeline fix involves a new schema (new `pending_interactions` table or equivalent), cross-repo coordination (eq-frontend Prisma + eq-email-pipeline orchestrator + live-transcription-fastapi workflow), and at least a dozen open design questions (listed below). Compressing design + implementation into one session will produce half-baked work or run out of context.
+
+The execution session is a separate ship that happens AFTER:
+1. The user agrees with the chosen approach
+2. Codex consult on the design passes
+3. The implementation plan is written
+
+If you finish plan-writing fast with substantial context remaining, the secondary unfinished items can be addressed (see "Unfinished Phase 1 + 1.5 — full list" below). But do NOT cram implementation work into this session at the expense of the plan quality.
+
+---
+
 ## CRITICAL — multi-session, multi-repo, long-arc project
 
 The Contact Quality Initiative is foundational hardening of the contact + account entity layer the AI-native platform stands on. Phase 1 SHIPPED 2026-05-14. Phase 1.5 milestones:
@@ -60,16 +73,71 @@ The Phase 1 acceptance test (`tests/test_orchestrator_three_state.py` in eq-emai
 
 **The right pattern (2026 AI-native posture):** explicit pending state, not a fake anchor. Approach C mirrors what Phase 2 was already going to introduce for contacts (`shell / emerging / partial / resolved / verified`) — an interaction whose account is in-flight gets an explicit state, not a hack.
 
-### Recommended sequence for the next session
+### Recommended sequence for the next session (PLAN-WRITING ONLY)
 
 1. **Brainstorm with user** — surface Approach C as the recommended; confirm direction. Product/strategic decision; do NOT auto-decide.
-2. **Codex consult on the chosen approach** (CSO discipline — design-time review BEFORE writing code).
-3. **Write a focused implementation plan** at `eq-email-pipeline/docs/superpowers/plans/2026-05-XX-pending-interactions.md`.
-4. **Schema migration in eq-frontend** Prisma if Approach C — new `pending_interactions` table.
-5. **Implement** in eq-email-pipeline: orchestrator branches to pending_interactions when no party is known.
-6. **Implement** in live-transcription-fastapi: workflow's emit step learns to promote pending → raw + emit envelope on approval.
-7. **Production E2E** that asserts cold-inbound-from-unknown email → queue entry → user approves → contact materialized → email becomes a normal interaction → downstream Neo4j MERGE visible.
-8. **Use `scripts/verify_consumer_contracts.py` + `scripts/verify_schema.py`** (M5 tooling) as the pre-merge gate.
+2. **Work through open design questions** (below) with the user. Surface the most consequential; don't try to answer all alone.
+3. **Codex consult on the chosen approach** (CSO discipline — design-time review BEFORE writing code).
+4. **Iterate on the design** per Codex feedback. 4-round soft cap (LOCKED-14).
+5. **Write the implementation plan** at `eq-email-pipeline/docs/superpowers/plans/2026-05-XX-pending-interactions.md`.
+6. **STOP. /context-save + handoff for the execution session.**
+
+Steps 7-10 (schema migration, orchestrator code, workflow promote step, production E2E) happen in a separate EXECUTION session — NOT this one.
+
+### Open design questions for the plan-writing session
+
+The next agent should NOT try to answer all of these alone. Surface the most consequential to the user for direction; capture the resolved answers in the implementation plan.
+
+**Most consequential (raise with user):**
+- **Schema for `pending_interactions`** — mirror `raw_interactions` exactly, or a leaner subset (just `interaction_id` + `tenant_id` + the body fields + a foreign key to the queue entry)?
+- **Promote pending → raw mechanics** — new DBOS step in the workflow, or modify the existing materialization step? On promote, is it INSERT + DELETE, or a state transition on the same row?
+- **`/map` vs `/approve` behavior** — when the user clicks Map (map to existing account) instead of Approve (create new), does promotion happen in both cases? It probably should.
+- **EventBridge emission timing** — emit on promote (so downstream sees a "new interaction" event), OR once promoted to raw_interactions normally? Affects every downstream consumer's Day-1-vs-backfill behavior.
+- **TTL / auto-archive on `pending_interactions`** — 30 days? 90 days? Aligned with the queue entry's TTL? Hard delete or archive?
+
+**Less consequential but plan-needed:**
+- Dedup semantics: multiple emails from the same unknown sender pile up before approval — all preserved, or first-only, or sliding window?
+- Cross-repo migration ordering: schema in eq-frontend, then orchestrator branch in eq-email-pipeline, then promotion step in live-transcription-fastapi. What's the rollback story if any step fails?
+- Production E2E acceptance criteria — the test that proves the fix actually works.
+- Queue UI integration in eq-frontend `app/(workspace)/agent-queue` — does it need to surface pending_interactions to the user, or just the pending_account_mappings queue entry as today?
+- Migration path: are there existing dropped emails to backfill? Probably not (test data only), but worth confirming with user.
+- How does this interact with Phase 2's identity state machine for contacts (`shell / emerging / partial / resolved / verified`)? The pending_interaction state is the symmetric construct.
+
+---
+
+## Verified cross-repo state (2026-05-17 PM)
+
+| Item | Status |
+|---|---|
+| eq-email-pipeline re-open trigger | ✅ DELIVERED. `orchestrator.py:342` calls `reopen_archived_entry`; helper at `pending_account_mappings.py:112`. |
+| eq-frontend `/dashboard/organization/email-pipeline` admin route | ✅ EXISTS (the admin prototype from design §29). |
+| eq-frontend `app/(workspace)/agent-queue` user-facing UI | ✅ EXISTS — verify current state in the next session if relevant to the plan. |
+| eq-agent-action-core `worker_attempt_id` idempotency | ❌ NOT in production OpenAPI — BUT N/A in the DBOS world. DBOS step caching + the agent's `run_id` (via `GET /api/enrich/{run_id}`) provide idempotency. The "agent accepts worker_attempt_id" line was inherited from the pre-rethink polling-worker design. |
+| eq-structured-graph-core consumer runtime behavior | ⚠️ Envelope contract verified via M5 `verify_consumer_contracts.py`. Runtime `_merge_contact()` MERGE behavior is a production-canary question (deferred). |
+
+---
+
+## Unfinished Phase 1 + 1.5 — full list
+
+**PRIMARY (this session's plan-writing scope):**
+
+1. **eq-email-pipeline cold-inbound-unknown-sender drop fix** (Phase 1 Task 1.24 incomplete). Approach C recommended. Plan-writing only this session.
+
+**SECONDARY (other unfinished items; NOT this session's scope unless plan-writing finishes early with substantial context remaining):**
+
+2. **Test-discipline-gaps Item 1** — audit + de-mock integration tests that mock `lookup_account_by_domain` at import level. The 2026-05-15 Phase 1 silent regression shipped because these mocks made the import-level patching invisible. M5 added schema-probe tooling to catch this design-time, but the existing tests still mock and the audit was never done.
+3. **Test-discipline-gaps Item 2** (partial) — complete per-attendee branching happy paths in the production E2E suite (all four ingestion paths × known/unknown/personal/internal matrix).
+4. **Test-discipline-gaps Item 3** — narrow the outer `except Exception:` block in `services/transcript_enrichment.py:399-405` (the swallow that hid the Phase 1 silent regression). Similar broad excepts exist elsewhere.
+5. **Production canary** (deferred from M3+M4 + M5). Per-batch destructive-op confirmation required. Would also verify eq-structured-graph-core MERGE behavior runtime.
+6. **M3.5 outbox drop** — optional Prisma migration in eq-frontend; cross-repo coordination needed; truly optional cleanup.
+
+**Phase 2 (post-Phase-1.5; explicit stopping point per 2026-05-15 plan):**
+
+- Identity state machine + progressive enrichment for contacts (`shell / emerging / partial / resolved / verified`). The pending_interactions pattern this session designs is the symmetric construct for interactions — design it with Phase 2 in mind.
+
+**Phase 3 (post-Phase-2):**
+
+- Conflict resolution + multi-account history + fuzzy matching.
 
 ---
 
