@@ -31,6 +31,13 @@ from services.account_provisioning.steps import (
 from services.account_provisioning.types import AccountProfile
 
 
+# All tests in this module use the ``session`` fixture, which writes to
+# the shared production Neon test tenant and DELETEs on teardown. The
+# shared-infrastructure-collision lesson (2026-05-16, tasks/lessons.md)
+# means these tests must be opt-in via ``RUN_DESTRUCTIVE_TESTS=1``.
+pytestmark = pytest.mark.requires_db_write
+
+
 async def _seed_pending_account_mapping(
     session: AsyncSession,
     *,

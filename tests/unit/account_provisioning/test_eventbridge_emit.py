@@ -335,6 +335,7 @@ async def test_emit_raises_on_failed_entry_count():
         )
 
 
+@pytest.mark.requires_db_write
 @pytest.mark.asyncio
 async def test_fetch_interactions_constrains_signal_role_to_interaction(
     session, test_tenant_id, test_user_id,

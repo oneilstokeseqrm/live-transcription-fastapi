@@ -59,6 +59,10 @@ from services.account_provisioning.eventbridge_emit import (
     emit_for_materialization_result,
 )
 from services.account_provisioning.materialization import materialize_account_approval
+from services.account_provisioning.workflow import (
+    APPROVAL_QUEUE,
+    account_provisioning_workflow,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -145,10 +149,14 @@ SELECT_QUEUE_SQL = text("""
            status,
            approval_attempt_id::text AS approval_attempt_id,
            resolved_account_id::text AS resolved_account_id,
-           archived_at
+           archived_at,
+           re_open_count
     FROM pending_account_mappings
     WHERE id = :queue_id
 """)
+# re_open_count is read for the workflow's input (logged in Step 1; not
+# load-bearing — workflow_id strategy keys on approval_attempt_id, not
+# re_open_count).
 
 
 # Idempotency: WHERE matches when NO attempt_id has been recorded yet OR
@@ -413,17 +421,37 @@ def _effective_user_id(ctx) -> str:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/{queue_id}/approve")
+@router.post("/{queue_id}/approve", status_code=202)
 async def approve_entry(queue_id: str, body: ApproveRequest, request: Request):
-    """Approve a queue entry; the worker picks it up to materialize.
+    """Approve a queue entry and start the account-provisioning workflow.
 
-    Idempotency: replaying with the same `approval_attempt_id` returns 200.
+    Two-phase: reserve the queue row synchronously inside the route's
+    transaction (status='approved' + approval_attempt_id stamped), THEN
+    enqueue the DBOS workflow on the ``APPROVAL_QUEUE`` after the txn
+    commits.
+
+    The workflow ID is ``f"queue-{queue_id}:approval-{approval_attempt_id}"``
+    (plan §6.2), so:
+
+    - Replays of the same `/approve` call with the same approval_attempt_id
+      return 202 and DBOS deduplicates the workflow start (the existing
+      handle is returned).
+    - Reopen lifecycles produce a NEW approval_attempt_id → distinct
+      workflow ID → fresh workflow run, no collision.
+
+    Idempotency: replaying with the same `approval_attempt_id` returns 202.
     Calling with a different `approval_attempt_id` on a row that's already
-    been approved returns 200 if the row IS in `approved` (or beyond), and
-    409 otherwise.
+    been approved returns 202 if the row IS in approved/creating/mapped
+    (idempotent satisfaction of "this queue entry is approved"), 409
+    otherwise.
     """
+    from dbos import SetWorkflowID
+
     ctx = get_auth_context_polling(request)
     _validate_uuid_path_param(queue_id, "queue_id")
+
+    re_open_count = 0
+    enqueue_workflow = False
 
     async with get_async_session() as session:
         async with session.begin():
@@ -440,34 +468,65 @@ async def approve_entry(queue_id: str, body: ApproveRequest, request: Request):
             updated_row = update_result.one_or_none()
 
             if updated_row is not None:
-                # 1 row → either first approve, or replay with same attempt_id.
-                return {"status": "approved", "queue_id": queue_id}
+                # 1 row → either first approve, or replay with same
+                # attempt_id. Re-read for the workflow's input
+                # (re_open_count is logged but not load-bearing — Step 1
+                # re-reads it from the DB on workflow start).
+                fresh = (await session.execute(
+                    SELECT_QUEUE_SQL, {"queue_id": queue_id},
+                )).one()
+                re_open_count = fresh.re_open_count
+                enqueue_workflow = True
+            else:
+                # 0 rows → either (a) row got an approval with a DIFFERENT
+                # attempt_id, or (b) row vanished between SELECT and UPDATE.
+                # Re-SELECT to discriminate.
+                re_result = await session.execute(SELECT_QUEUE_SQL, {"queue_id": queue_id})
+                current = re_result.one_or_none()
+                if current is None:
+                    raise HTTPException(status_code=404, detail="Queue entry not found")
 
-            # 0 rows → either (a) row got an approval with a DIFFERENT
-            # attempt_id, or (b) row vanished between SELECT and UPDATE.
-            # Re-SELECT to discriminate.
-            re_result = await session.execute(SELECT_QUEUE_SQL, {"queue_id": queue_id})
-            current = re_result.one_or_none()
-            if current is None:
-                # Vanished mid-flight — treat as not found.
-                raise HTTPException(status_code=404, detail="Queue entry not found")
+                if current.status not in ("approved", "creating", "mapped"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Approve conflict: queue entry is in "
+                            f"status='{current.status}' with a different "
+                            f"approval_attempt_id recorded. Reload the queue "
+                            f"entry and retry with the latest state."
+                        ),
+                    )
+                # Idempotent satisfaction: the queue is approved (or
+                # beyond) under SOME attempt_id. We do NOT enqueue a
+                # second workflow — SetWorkflowID would dedupe on the
+                # winner's attempt_id anyway. Return 202 with the
+                # request's attempt_id for the caller's bookkeeping.
 
-            # If the row IS approved (or any status beyond pending where the
-            # caller's intent is satisfied), return 200. The client cares
-            # that the row IS approved, not which attempt_id won.
-            if current.status in ("approved", "creating", "mapped"):
-                return {"status": "approved", "queue_id": queue_id}
-
-            # Otherwise — entry is in an unexpected state. 409 Conflict so
-            # the caller can investigate (rare edge case).
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Approve conflict: queue entry is in status='{current.status}' "
-                    f"with a different approval_attempt_id recorded. Reload the "
-                    f"queue entry and retry with the latest state."
-                ),
+    # Workflow start AFTER the route's transaction commits. Plan §5.3:
+    # this ordering preserves the contract that the row is durably
+    # 'approved' before any background work begins, AND keeps the
+    # workflow's failure modes separable from the route's reservation.
+    workflow_id = f"queue-{queue_id}:approval-{body.approval_attempt_id}"
+    if enqueue_workflow:
+        # SetWorkflowID makes the enqueue idempotent on retries of the
+        # same (queue_id, approval_attempt_id) pair. Concurrent /approve
+        # calls with the same attempt_id will produce the same
+        # workflow_id; DBOS deduplicates.
+        with SetWorkflowID(workflow_id):
+            await APPROVAL_QUEUE.enqueue_async(
+                account_provisioning_workflow,
+                queue_id=str(queue_id),
+                tenant_id=ctx.tenant_id,
+                approval_attempt_id=body.approval_attempt_id,
+                re_open_count=re_open_count,
             )
+
+    return {
+        "status": "approved",
+        "queue_id": queue_id,
+        "workflow_id": workflow_id,
+        "approval_attempt_id": body.approval_attempt_id,
+    }
 
 
 @router.post("/{queue_id}/map")

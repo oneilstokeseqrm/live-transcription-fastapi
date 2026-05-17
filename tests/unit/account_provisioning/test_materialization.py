@@ -237,6 +237,7 @@ async def _create_test_account(
     return account_id
 
 
+@pytest.mark.requires_db_write
 @pytest.mark.asyncio
 async def test_materialize_empty_signals_fails_loud(
     session: AsyncSession, test_tenant_id: str, test_user_id: str,
@@ -264,6 +265,7 @@ async def test_materialize_empty_signals_fails_loud(
             )
 
 
+@pytest.mark.requires_db_write
 @pytest.mark.asyncio
 async def test_materialize_single_signal_creates_contact(
     session: AsyncSession, test_tenant_id: str, test_user_id: str,
@@ -311,6 +313,7 @@ async def test_materialize_single_signal_creates_contact(
     assert queue_row.resolved_account_id == account_id
 
 
+@pytest.mark.requires_db_write
 @pytest.mark.asyncio
 async def test_materialize_replay_safe_link_insert(
     session: AsyncSession, test_tenant_id: str, test_user_id: str,
@@ -398,6 +401,7 @@ async def test_materialize_replay_safe_link_insert(
     assert link_count == 1, f"expected 1 link row, found {link_count} (replay-safety broken)"
 
 
+@pytest.mark.requires_db_write
 @pytest.mark.asyncio
 async def test_materialize_cross_account_collision_raises(
     session: AsyncSession, test_tenant_id: str, test_user_id: str,

@@ -767,3 +767,99 @@ This is the third rule in the family: **deployments are sequenced,
 not atomic**; the migration's safety window depends on which
 service's code is "ahead" at any given moment.
 
+---
+
+## Tenant-scoped DELETE is NOT session-scoped on shared test infrastructure (2026-05-16)
+
+### Lesson
+
+A correctly-scoped `DELETE FROM table WHERE tenant_id=:test_tenant`
+is safe in isolation. It is NOT safe when multiple agents — across
+multiple repos — share that test tenant as their working surface.
+"Scoped to a tenant" means "scoped to everyone using that tenant,"
+not "scoped to my own work." Before any destructive operation on
+shared test infrastructure, check for concurrent agents and either
+pause for explicit user confirmation or use isolation (Neon branches,
+advisory locks).
+
+### Why
+
+2026-05-15 session: ran an 8-table cleanup transaction three times
+against test tenant `11111111-1111-4111-8111-111111111111` to clean
+up leftover data from failing test runs. The DELETE was correctly
+tenant-scoped. But the eq-synthetic-date-generation agent in another
+repo had an active inject running in the same test tenant — it had
+just seeded a Palantir account row, four contacts, eight email_threads,
+and was about to write summary entries + intelligence insights.
+
+Forensic trail (from the affected agent's investigation):
+- Cascade fingerprint: 8 email_threads rows with `account_id IS NULL`
+  (SET NULL cascade signature that only fires when parent accounts
+  row is DELETEd).
+- pg_stat_user_tables.last_autovacuum on accounts = 7 minutes after
+  the last DELETE cycle.
+- Timing: 10 summary_entries + 20 insights written with NULL
+  account_id correspond to transcripts processed BEFORE the first
+  DELETE fired — the only Lane 2 writes that survived the FK
+  requirement.
+
+My session-log timestamps for the three DELETE cycles correlate
+exactly with their incident window. The other agent's Bug #1
+verification failed as collateral damage.
+
+The misconception that caused this: I asked "did my WHERE clause
+scope correctly?" (answer: yes) instead of "could my correctly-
+scoped DELETE have collided with another active session's work on
+the same scope?" (answer: yes, any time the scope is shared
+infrastructure).
+
+The `feedback_destructive_ops_blast_radius.md` auto-memory rule
+("verify FK cascade chain and confirm with user before TRUNCATE /
+DROP / DELETE / CASCADE — even on test data") was in force AND
+was violated. The session ran three DELETE cycles without
+confirming once. The rule needed to be specific about
+shared-infrastructure collisions, not just FK cascade chains.
+
+### How to apply
+
+Before ANY destructive SQL on shared test infrastructure (the
+`11111111-1111-4111-8111-111111111111` tenant, or anything else
+shared across repos):
+
+1. **Check for active sessions in other repos:**
+   ```bash
+   ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl | head -10
+   ```
+   Any file modified in the last hour is a hazard signal. Look
+   especially for the eq-synthetic-date-generation,
+   eq-email-pipeline, and eq-frontend project directories.
+
+2. **Honor advisory locks where they exist.** The
+   eq-synthetic-date-generation repo's cleanup script uses
+   `pg_advisory_lock(hashtext('eq-cleanup-test-tenant'))` to
+   serialize destructive cleanup. Raw SQL via Neon MCP doesn't
+   acquire that lock — it bypasses the serialization. Either
+   acquire the same lock OR pause and ask the user.
+
+3. **Prefer Neon branches for write-heavy test isolation.**
+   `mcp__neon__create_branch` creates an isolated branch in
+   seconds. Work targets the branch; the user merges or discards
+   when done. Zero collision risk.
+
+4. **Test fixtures that DELETE on teardown** (the pattern in
+   `tests/conftest.py:_teardown_test_tenant_rows`) inherit the
+   same collision risk. Either:
+   - Run them only when no other agent is active
+   - Switch them to a Neon-branch-per-test-session strategy
+   - Replace with insert-only fixtures + accept some data accumulation
+
+5. **For one-shot cleanup (not in test fixtures):** announce the
+   intent + table list to the user BEFORE running. Wait for
+   explicit confirmation. Do not run if any other agent's session
+   was active in the last hour without that confirmation.
+
+6. **The right self-audit question** is not "did my WHERE clause
+   scope correctly?" but "could my correctly-scoped DELETE have
+   collided with another active session's work on the same scope?"
+   The first is necessary but not sufficient.
+

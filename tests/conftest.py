@@ -63,6 +63,40 @@ def needs_database(item):
     return _needs_database(item)
 
 
+def pytest_collection_modifyitems(config, items):
+    """Skip ``@pytest.mark.requires_db_write`` tests unless explicitly enabled.
+
+    The shared-infrastructure-collision lesson (2026-05-16, see
+    ``tasks/lessons.md``): tests that write to the shared production
+    Neon test tenant can collide with other agents' active injects in
+    OTHER repos. The conftest's session fixture does mass-DELETE on
+    test-tenant rows during teardown — this is the collision vector.
+
+    By default we skip those tests. To run them locally:
+
+        1. Check no other agent is active in any -Users-peteroneil-* repo:
+           ``ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl | head``
+        2. Set ``RUN_DESTRUCTIVE_TESTS=1`` in your environment.
+        3. Run pytest.
+
+    The non-destructive subset (SQL-text sanity, agent client mocks,
+    EventBridge fan-out with mocked boto3, structural workflow tests)
+    runs unconditionally and covers the majority of M3's contract.
+    """
+    if os.environ.get("RUN_DESTRUCTIVE_TESTS") == "1":
+        return
+    skip_marker = pytest.mark.skip(
+        reason=(
+            "Test writes to shared production Neon test tenant. Skipped by "
+            "default. Set RUN_DESTRUCTIVE_TESTS=1 to enable, after checking "
+            "for concurrent agents in other repos (see tasks/lessons.md)."
+        )
+    )
+    for item in items:
+        if "requires_db_write" in item.keywords:
+            item.add_marker(skip_marker)
+
+
 @pytest.fixture
 def test_tenant_id() -> str:
     return TEST_TENANT_ID
@@ -119,6 +153,25 @@ async def _teardown_test_tenant_rows(tenant_id: str) -> None:
                 text("""
                     DELETE FROM interaction_contact_links
                     WHERE interaction_id IN (
+                        SELECT summary_id FROM interaction_summaries
+                        WHERE tenant_id = CAST(:tenant_id AS uuid)
+                    )
+                """),
+                {"tenant_id": tenant_id},
+            )
+            # interaction_account_links: no tenant_id column either; the
+            # account_id + interaction_id BOTH reference tenant-scoped
+            # parents, so we scope via either. Use OR to be FK-safe
+            # regardless of which parent the link's accountside/
+            # interactionside is anchored to.
+            await session.execute(
+                text("""
+                    DELETE FROM interaction_account_links
+                    WHERE account_id IN (
+                        SELECT id FROM accounts
+                        WHERE tenant_id = CAST(:tenant_id AS uuid)
+                    )
+                    OR interaction_id IN (
                         SELECT summary_id FROM interaction_summaries
                         WHERE tenant_id = CAST(:tenant_id AS uuid)
                     )
