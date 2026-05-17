@@ -863,3 +863,66 @@ shared across repos):
    collided with another active session's work on the same scope?"
    The first is necessary but not sufficient.
 
+
+---
+
+## Review gates for this repo's PRs — verified-contract tooling (2026-05-17)
+
+### Lesson
+
+This repo's PRs that touch SQL or EventBridge emission MUST run two
+verification scripts BEFORE merge, in addition to the gstack `/review`
+checklist:
+
+1. **`scripts/verify_schema.py`** — for any new or modified SQL constant.
+   Runs `PREPARE` against the live Neon database; surfaces undefined
+   column / table / function errors at design time. Closes the bug class
+   that produced the 2026-05-15 Phase 1 silent regression (`accounts.domain`
+   referenced after the column had moved to `account_domains`; the SQL
+   error was swallowed by an outer `except Exception`, the response was
+   200, downstream rows were never created).
+
+2. **`scripts/verify_consumer_contracts.py`** — for any change to the
+   envelope shape emitted to EventBridge (source value, detail-type,
+   interaction_type, extras shape). Statically validates the envelope
+   against each downstream consumer's Pydantic model via AST parsing;
+   reports drift per-consumer (e.g., `action-item-graph`'s `SourceType`
+   enum missing a value the producer wants to emit). Closes the bug
+   class that produced the 2026-05-15 action-item-graph SourceType drift.
+
+### Why
+
+Two real Phase 1 / Phase 1.5 incidents shipped because contracts —
+internal SQL and cross-service envelope — were trusted by documentation
+or grep rather than verified against the live artifact at design time.
+Both were exactly the kind of mistake `/codex review` and the static
+test suite miss: SQL constants in Python files don't execute until
+runtime; consumer Pydantic models live in repos that aren't on this
+PR's reviewer's screen.
+
+Codifying both as scripts makes the discipline cheap (one command, ~1s)
+and CI-friendly (exit 1 on drift; fold into pre-merge GH Actions later).
+
+### How to apply
+
+For every PR in this repo:
+
+1. If the diff touches `*.py` files containing SQL strings (look for
+   `sa_text(`, `"""SELECT`, `"""INSERT`, `"""UPDATE`, `"""DELETE`,
+   `"""WITH`), run `scripts/verify_schema.py --sql-text "..."` against
+   each constant. Or pipe each constant in via `--stdin`.
+2. If the diff touches `services/account_provisioning/eventbridge_emit.py`
+   OR introduces a new `source=` or `interaction_type=` value OR a new
+   detail-type, run `scripts/verify_consumer_contracts.py` against the
+   proposed envelope (with `--source` / `--interaction-type` /
+   `--envelope-file` overrides as appropriate).
+3. Cite the verification result in the PR description ("verify_schema:
+   OK on 4 new SQL constants" / "verify_consumer_contracts: all 3
+   consumers accept the envelope").
+4. If `verify_consumer_contracts.py` reports drift, surface to the user
+   — the fix may require a coordinated change in a sibling repo's
+   Pydantic model + EventBridge rule + this repo's emit step. NOT a
+   silent fix.
+
+Future improvement: wire both scripts into a pre-commit hook or CI
+workflow so the gate is automatic.

@@ -113,6 +113,14 @@ def build_envelope(
         tenant_id=UUID(tenant_id),
         user_id=interaction.user_id or tenant_id,
         interaction_type=interaction.interaction_type,
+        # content.text is empty for transcript-source interactions on backfill.
+        # services/intelligence_service.py does not populate raw_interactions.raw_text;
+        # only eq-email-pipeline populates it (from content_text). This is by
+        # design as of M5: backfill envelopes are metadata-update notifications
+        # — the original (Day-1) emission carried the content. Downstream
+        # consumers MERGE on extras.contacts (idempotent); empty content.text
+        # on backfill is expected. Codex round-6 P1 (2026-05-17) reviewed +
+        # documented. See PR #17 + tasks/lessons.md if revisiting.
         content=ContentModel(text=interaction.raw_text or "", format="plain"),
         timestamp=interaction.created_at,
         source="api",
