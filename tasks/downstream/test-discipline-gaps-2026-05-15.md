@@ -233,3 +233,24 @@ step that emits to EventBridge, calls eq-agent-action-core, or writes
 to Neon. The same test-discipline gaps (Items 1-3) apply to the DBOS
 code: any new in-service primitives need real-substrate coverage,
 new branches need per-branch E2E, and broad excepts get flagged.
+
+---
+
+## Status (2026-05-17, M5 ship)
+
+- **Item 1** — pending (existing integration tests still mock at the import level)
+- **Item 2** — partially addressed (Phase 1 + 1.5 production E2E suites)
+- **Item 3** — pending (broad `except Exception` blocks still present in some paths)
+- **Item 4 — SHIPPED.** `scripts/verify_schema.py` lives in this repo with
+  unit tests at `tests/scripts/test_verify_schema.py`. Documentation in
+  `tasks/lessons.md` ("Review gates for this repo's PRs", 2026-05-17).
+- **Item 5 — SHIPPED.** `scripts/verify_consumer_contracts.py` lives in this
+  repo with unit tests at `tests/scripts/test_verify_consumer_contracts.py`.
+  The script enumerates ALL EventBridge rules filtering for our source
+  (catching the documentation gap in plan §3.4, which named only 2 of
+  the 3+ consumers). Documentation in `tasks/lessons.md`.
+
+The gstack `/review` skill is global, so per-project verification gates
+live in `tasks/lessons.md` (loaded at session start). When this repo's
+PRs touch SQL or envelope emission code, the reviewer (human or agent)
+runs the appropriate script before merge.
