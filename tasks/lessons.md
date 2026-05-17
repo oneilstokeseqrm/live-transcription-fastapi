@@ -926,3 +926,136 @@ For every PR in this repo:
 
 Future improvement: wire both scripts into a pre-commit hook or CI
 workflow so the gate is automatic.
+
+## Cross-repo constraint-relaxation requires SQL audit before plan lock (2026-05-17)
+
+The Phase-1-email-pipeline M1 PR (eq-frontend) dropped the single-column
+UNIQUE on `interaction_summaries.interaction_id` to enable a new composite
+UNIQUE. Plan §7 explicitly claimed M1 was "Safe to deploy independently."
+
+That claim was false. The Phase-1.5-M3 materialize code in
+live-transcription-fastapi had been using:
+
+```sql
+INSERT INTO interaction_summaries (...) VALUES (...)
+ON CONFLICT (interaction_id) DO UPDATE ...
+```
+
+That `ON CONFLICT (interaction_id)` clause requires a UNIQUE constraint or
+index matching the exact column tuple. Once M1 deployed and dropped the
+single-column UNIQUE, every meeting approval would have failed at runtime
+with:
+
+```
+ERROR: there is no unique or exclusion constraint matching the
+       ON CONFLICT specification
+```
+
+The plan-writing session missed this because it focused on the new schema,
+not on existing SQL that depended on the old schema. The 4-Codex-round
+plan review missed it for the same reason — reviewers were reading the
+plan, not grep-ing the repos.
+
+**Rule for future plans that drop or relax a UNIQUE constraint:**
+
+Before locking the plan, GREP every repo that talks to this Postgres
+instance for `ON CONFLICT` clauses that reference the constraint's columns
+(in any order). For interaction_summaries.interaction_id specifically:
+
+```bash
+grep -rn "ON CONFLICT.*interaction_id" \
+  /Users/peteroneil/EQ-CORE/live-transcription-fastapi \
+  /Users/peteroneil/eq-email-pipeline \
+  /Users/peteroneil/eq-frontend
+```
+
+Document the affected call sites in the plan and pair each one with the
+update needed for the new constraint. If the update lands in a different
+repo than the migration, document the deploy coordination explicitly.
+
+**What we did when we discovered it mid-execution (M2 session):**
+- M2 included the SQL fix (`ON CONFLICT (interaction_id)` →
+  `ON CONFLICT (tenant_id, interaction_id, summary_type)`).
+- Coordinated merge: M1 merged at 22:28:49Z, M2 merged at 22:29:38Z
+  (49-second window of risk). Window closed cleanly. Test-data only, no
+  real-user impact.
+
+## Codex round-N convergence pattern: extend the 4-round soft cap when severity is decreasing (2026-05-17)
+
+LOCKED-10 says "Codex review BEFORE merging (4-round soft cap; extendable
+when real P1s keep surfacing)." This lesson codifies WHEN extending is
+justified vs. when it's diminishing returns.
+
+Pattern observed during Phase-1-email-pipeline M2 review:
+
+| Round | Findings | Severity |
+|-------|----------|----------|
+| R1 | 2 (1 P1 + 1 P2) | High — orphan race, /map symmetry |
+| R2 | 2 (1 P1 + 1 P2) | High — signals guard, lifecycle scoping |
+| R3 | 2 (2 P1) | High — Step 4 concurrency, Step 5 subquery |
+| R4 | 2 (1 P1 + 1 P2) | High — orphaned signals, lifecycle slack |
+| R5 | 2 (2 P2) | Medium — user attribution, cross-queue roles |
+| R6 | 1 (1 P2) | Medium — email-link batch guard |
+| R7 | 0 | CLEAN |
+
+**The signal that extending past 4 was justified:**
+1. Each round surfaced NEW, non-redundant findings (no false positives;
+   no re-flagging the same issue).
+2. Severity was DECREASING (P1+P1+P1+P1 → P2+P2 → P2 → 0).
+3. Each fix engaged with a specific concrete bug, not a stylistic concern.
+
+**The signal that would have justified stopping early:**
+1. Round-4 false-positive pattern: Codex flags fixes that aren't in the
+   diff yet (this happened during the plan-writing rounds; not during M2).
+2. Findings reduced to nits, naming, or stylistic improvements.
+3. The same issue gets re-flagged with slightly different framing.
+
+**Heuristic:** if rounds N and N+1 both surface real P1s, run round N+2.
+If rounds N+1 and N+2 both produce only P2s or P3s, stop and ship. If
+round N+1 is CLEAN, ship.
+
+Applied this heuristic to M2 R7 (CLEAN) — shipped. Applied to M1 R3
+(CLEAN) — shipped. Both shipped without subsequent regressions.
+
+**Counter-example from earlier sessions:** Phase-1.5 M5 review went 6
+rounds; R5 found a P2 that was scope-creep (type-validation rabbit hole)
+and was rejected, R6 was CLEAN. So extending past 4 is the right default
+when findings are real, but use trajectory analysis (severity decrease +
+non-redundancy) — not just "Codex found something" — as the extension
+signal.
+
+## eq-frontend live-db CI workflow needs DIRECT_DATABASE_URL env var (2026-05-17)
+
+PR #392 (Phase-1-email-pipeline M1) was the first Prisma migration after
+the `live-db` CI workflow was added. The check failed:
+
+```
+Error: Prisma schema validation - (get-config wasm)
+Error code: P1012
+error: Environment variable not found: DIRECT_DATABASE_URL.
+```
+
+The workflow runs `npx prisma migrate deploy` against a Neon branch to
+validate the migration. `prisma/schema.prisma` declares:
+
+```
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+```
+
+Both env vars must be set in the CI environment. The workflow had
+`DATABASE_URL` configured from a GitHub secret but not `DIRECT_DATABASE_URL`.
+
+**Why we merged anyway:** Vercel preview deploy passed (which IS the
+meaningful migration validation against a real preview DB). Main branch
+isn't branch-protected so the failing check didn't block merge. Verified
+post-merge via Neon MCP that the migration applied cleanly.
+
+**Required follow-up:** add `DIRECT_DATABASE_URL` to the `live-db` workflow
+from the same GitHub secret that supplies it to Vercel. Otherwise every
+future Prisma migration PR will trip this check. Small fix; the workflow
+yaml lives in `.github/workflows/` in eq-frontend.
+

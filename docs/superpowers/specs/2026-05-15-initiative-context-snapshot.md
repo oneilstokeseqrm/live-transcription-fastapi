@@ -1,10 +1,52 @@
-# Contact Quality Initiative — Context Snapshot (2026-05-15)
+# Contact Quality Initiative — Context Snapshot (2026-05-15, last updated 2026-05-17 evening)
 
 **Purpose:** This document is the **standalone entry point** for any agent picking up the Contact Quality and Account-Anchoring Initiative cold. A new agent should be able to read this single document and understand: what the project is, why it exists, what's shipped, what's in flight, what's broken, what's next, and where to read the canonical details.
 
 **Audience:** Any future Claude session (architecture rethink, code execution, planning, review). The user is a non-developer founder; the agent makes confident technical decisions and surfaces only product / strategic decisions.
 
 **Use:** Read this first. Then read `NEXT-SESSION-START-HERE.md` for the specific work the next session does. Then read the canonical detail docs as the work requires them.
+
+---
+
+## 0. CURRENT STATE — 2026-05-17 evening (read this section first; the rest is historical)
+
+**Status:** `PHASE_1_EMAIL_PIPELINE_M1_M2_DEPLOYED_M3_NEXT`.
+
+**What changed since this doc was originally written (2026-05-15):**
+
+- **Phase 1.5 fully shipped** across 2026-05-15 and 2026-05-17 — DBOS-based async account-provisioning workflow + verified-contract tooling. M0/M1/M2/M3/M4/M5 all merged and deployed (PRs #14, #15, eq-frontend #373, #17, #18).
+- **Phase-1-email-pipeline** introduced as a new sub-initiative finishing committed Phase 1 work (Task 1.24 acceptance criteria around cold-inbound unknown-sender emails). The plan lives at `eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md` (v4, committed as `033626a`, locked after 4 Codex plan-review rounds + 11 substantive findings).
+  - **M1 (eq-frontend Prisma migration)**: SHIPPED + DEPLOYED 2026-05-17 evening. PR #392, merged as `de586bbc`. Vercel applied the migration; Neon production has the new `pending_interactions` table + 3 new `emails` columns + composite UNIQUE+FK on `interaction_summaries` (replacing single-column UNIQUE that was blocking the multi-variant model) + composite UNIQUE on `raw_interactions`.
+  - **M2 (live-transcription-fastapi workflow promote-step + EmailPromoted emit)**: SHIPPED + DEPLOYED 2026-05-17 evening. PR #19, merged as `756575d7` 49 seconds after M1. Railway deployment `809679fc` SUCCESS; /health 200.
+  - **M3 (eq-email-pipeline EmailPromoted subscriber)**: NEXT. Implementation in `/Users/peteroneil/eq-email-pipeline` per plan §6.2. New helpers + handler with two-layer idempotency guard. Subscriber pattern is **SQS-from-EventBridge** (resolved 2026-05-17 evening — plan §14 #2). Requires AWS infrastructure setup (rule + SQS queue + DLQ + IAM) before deploy — full spec in `NEXT-SESSION-START-HERE.md` section "AWS infrastructure for M3."
+  - **M4 (eq-email-pipeline orchestrator branch + atomic upsert_thread rewrite)**: FUTURE SESSION. FLIPS THE SWITCH on cold-inbound capture.
+  - **M5 (production E2E + rollback drill)**: FUTURE SESSION.
+
+**18 LOCKED decisions** (do NOT re-litigate). Full list in `NEXT-SESSION-START-HERE.md` section "LOCKED decisions" — includes DBOS substrate, EventBridge Path A with closed detail-type lookup, hard rules (no contact / no interaction without account anchor), Approach C (pending_interactions separate table), lean+typed schema (not JSONB), Path B (full reprocess on promote via EmailPromoted), shared-tenant collision protocol, Codex multi-round defaults.
+
+**Verified cross-repo state** (2026-05-17 evening):
+- eq-frontend `main` HEAD includes M1 merge `de586bbc`. Production Neon reflects the schema changes (verified by direct query).
+- live-transcription-fastapi `main` HEAD `cea72cd` (M2 + handoff docs). Production Railway deployment `809679fc` SUCCESS; /health 200.
+- eq-email-pipeline `main` HEAD `033626a` (only the plan doc; no code work yet).
+- Production EventBridge: NO `EmailPromoted` rule exists yet — M3 agent must create it before M3 ships (full AWS CLI spec is in `NEXT-SESSION-START-HERE.md`).
+
+**Acknowledged V1 limitations** (NOT regressions; documented + bounded):
+1. Personal/internal anchor cold-inbound → log+drop. V2: audit log table.
+2. Neo4j build_skeleton + write_flesh partial-retry corruption — mitigated by M3's 2-layer guard (atomic CAS + 5-min soft TTL). V2: MERGE patterns + edge-count thread counters.
+3. `upsert_thread` race — FIXED in M2 for workflow promote path; M4 will fix it for eq-email-pipeline orchestrator known-account path.
+4. Legacy per-signal loop hardcodes `summary_type='meeting'` — for re-pointed email signals creates cosmetic duplicate 'meeting' summary alongside 'email' summary. Cosmetic; downstream filters by summary_type='email' get the correct link. Future cleanup.
+5. eq-frontend `live-db` CI workflow missing `DIRECT_DATABASE_URL` env var. Pre-existing; not a regression. Follow-up PR in eq-frontend.
+
+**Key recent lessons** (codified to `tasks/lessons.md` 2026-05-17 evening):
+- Cross-repo constraint-relaxation requires SQL audit before plan lock — GREP all repos for `ON CONFLICT` clauses referencing the to-be-relaxed UNIQUE before locking the plan.
+- Codex round-N convergence pattern — extend the 4-round soft cap when severity is decreasing AND each round adds NEW non-redundant findings.
+
+**Load-bearing handoff artifacts (2026-05-17 evening):**
+- `docs/superpowers/specs/NEXT-SESSION-START-HERE.md` — wayfinding doc for M3.
+- `docs/superpowers/specs/2026-05-17-evening-m3-next-session-prompt.md` — paste-ready M3 opening prompt (comprehensive; self-contained pre-flight + production credentials + helper signatures + handler skeleton + AWS infra spec).
+- `~/.gstack/projects/oneilstokeseqrm-live-transcription-fastapi/checkpoints/20260517-183707-phase-1-email-pipeline-m1-m2-deployed-m3-next.md` — final checkpoint.
+
+**The rest of this document (sections 1-N below) describes the project as of 2026-05-15.** That historical narrative is still useful for understanding why the initiative exists and what its phases were originally planned to be, but treat anything inconsistent with the section above as superseded.
 
 ---
 

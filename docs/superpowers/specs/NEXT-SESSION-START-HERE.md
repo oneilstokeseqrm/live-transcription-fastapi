@@ -256,6 +256,163 @@ Per plan §12: M4 flips the switch on cold-inbound capture; M5 verifies end-to-e
 
 ---
 
+## AWS infrastructure for M3 — must be created before M3 deploys
+
+Verified end-of-prior-session via `aws events list-rules` against account `211125681610`:
+
+- **NO `EmailPromoted` EventBridge rule exists.** Existing rules cover EnvelopeV1 detail-types only (e.g., `eq-structured-graph-rule`, `action-item-graph-rule`).
+- **AWS account:** `211125681610`.
+- **Default event bus ARN:** `arn:aws:events:us-east-1:211125681610:event-bus/default`.
+- **Existing route-to-sqs pattern** (use as template — see `route-summary-generated-to-sqs`): a single rule with one target ARN of an SQS queue.
+- **SQS naming convention** in this account: `eq-{service}-queue` + `eq-{service}-dlq`. Following the convention, M3 needs `eq-email-promoted-queue` + `eq-email-promoted-dlq`.
+
+### AWS resources M3 needs (recommended order)
+
+1. **Create the DLQ first:**
+   ```
+   aws sqs create-queue --queue-name eq-email-promoted-dlq --region us-east-1
+   ```
+
+2. **Create the main queue with DLQ redrive policy:**
+   ```
+   aws sqs create-queue --queue-name eq-email-promoted-queue --region us-east-1 \
+     --attributes '{
+       "MessageRetentionPeriod": "1209600",
+       "VisibilityTimeout": "300",
+       "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:211125681610:eq-email-promoted-dlq\",\"maxReceiveCount\":\"5\"}"
+     }'
+   ```
+   - 1209600s = 14 days retention.
+   - 300s = 5min VisibilityTimeout: matches the 2-layer guard's soft TTL so an in-flight handler can complete (or hit Layer 2) before re-delivery.
+   - maxReceiveCount=5 = 5 delivery attempts before DLQ.
+
+3. **Configure SQS queue policy to allow EventBridge to send messages:**
+   ```
+   aws sqs set-queue-attributes --queue-url https://sqs.us-east-1.amazonaws.com/211125681610/eq-email-promoted-queue \
+     --attributes Policy='{
+       "Version": "2012-10-17",
+       "Statement": [{
+         "Effect": "Allow",
+         "Principal": {"Service": "events.amazonaws.com"},
+         "Action": "sqs:SendMessage",
+         "Resource": "arn:aws:sqs:us-east-1:211125681610:eq-email-promoted-queue",
+         "Condition": {
+           "ArnEquals": {
+             "aws:SourceArn": "arn:aws:events:us-east-1:211125681610:rule/route-email-promoted-to-sqs"
+           }
+         }
+       }]
+     }'
+   ```
+
+4. **Create the EventBridge rule:**
+   ```
+   aws events put-rule --name route-email-promoted-to-sqs --region us-east-1 \
+     --event-bus-name default \
+     --event-pattern '{"source":["com.yourapp.transcription"],"detail-type":["EmailPromoted"]}' \
+     --description "Routes EmailPromoted events to the eq-email-pipeline subscriber queue" \
+     --state ENABLED
+   ```
+
+5. **Attach the queue as the rule's target:**
+   ```
+   aws events put-targets --rule route-email-promoted-to-sqs --region us-east-1 \
+     --targets '[{
+       "Id": "send-to-email-promoted-queue",
+       "Arn": "arn:aws:sqs:us-east-1:211125681610:eq-email-promoted-queue"
+     }]'
+   ```
+
+6. **Grant eq-email-pipeline's IAM principal SQS read perms** (the Railway service's AWS creds). Add to the existing IAM policy used by eq-email-pipeline:
+   ```
+   {
+     "Effect": "Allow",
+     "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:GetQueueUrl"],
+     "Resource": "arn:aws:sqs:us-east-1:211125681610:eq-email-promoted-queue"
+   }
+   ```
+
+### Verification commands (run after setup, before deploying M3 code)
+
+```
+aws events describe-rule --name route-email-promoted-to-sqs --region us-east-1
+aws events list-targets-by-rule --rule route-email-promoted-to-sqs --region us-east-1
+aws sqs get-queue-attributes --queue-url https://sqs.us-east-1.amazonaws.com/211125681610/eq-email-promoted-queue --attribute-names All --region us-east-1
+```
+
+### End-to-end smoke test (optional, after setup)
+
+Manually fire a synthetic EmailPromoted event and confirm it lands in the queue:
+
+```
+aws events put-events --region us-east-1 \
+  --entries '[{
+    "Source": "com.yourapp.transcription",
+    "DetailType": "EmailPromoted",
+    "Detail": "{\"tenant_id\":\"11111111-1111-4111-8111-111111111111\",\"interaction_id\":\"00000000-0000-4000-8000-000000000001\",\"account_id\":\"00000000-0000-4000-8000-000000000002\",\"queue_id\":\"00000000-0000-4000-8000-000000000003\",\"promoted_at\":\"2026-05-17T23:00:00Z\"}",
+    "EventBusName": "default"
+  }]'
+
+# Verify in queue:
+aws sqs receive-message --queue-url https://sqs.us-east-1.amazonaws.com/211125681610/eq-email-promoted-queue --region us-east-1
+```
+
+### M3's subscriber pattern (decided this prior session)
+
+eq-email-pipeline currently has **NO existing SQS-from-EventBridge OR direct-EventBridge subscriber pattern** — confirmed by source inspection of `src/main.py`, `src/api/webhooks.py`, `src/pipeline/`. Inbound emails come via Gmail/Outlook OAuth pull (background polling tasks in `main.py` lifespan: `email_task` + `calendar_task`). `src/pipeline/emit.py` has `EventPublisher` for OUTBOUND EventBridge writes only.
+
+**M3 introduces a NEW background task** in `main.py`'s lifespan (mirroring `email_task` and `calendar_task` patterns) that long-polls the `eq-email-promoted-queue` SQS queue and dispatches messages to the handler. Reference implementation outline:
+
+```python
+# In src/main.py lifespan, after email_task/calendar_task:
+email_promoted_subscriber = EmailPromotedSubscriber(
+    pg=pg_client,
+    neo4j_driver=neo4j_driver,
+    openai_client=openai_client,
+    embedder=pinecone_embedder,
+    queue_url=settings.email_promoted_queue_url,
+    region=settings.aws_region,
+)
+email_promoted_task = asyncio.create_task(email_promoted_subscriber.run_polling())
+```
+
+The `EmailPromotedSubscriber` class lives in a new `src/pipeline/email_promoted_subscriber.py`. Its `run_polling()` method:
+
+1. Long-polls SQS (`receive_message` with `WaitTimeSeconds=20`).
+2. For each message:
+   - Parse the EventBridge envelope (`{"version":"0","id":"...","source":"com.yourapp.transcription","detail-type":"EmailPromoted","detail":{...}}`).
+   - Extract the `detail` payload → `EmailPromotedEvent`.
+   - Call `handle_email_promoted(event)` (the handler implementing plan §6.2).
+   - On success: `sqs.delete_message(...)`.
+   - On exception: log + DO NOT delete → SQS retries up to 5 times → DLQ.
+
+The handler does NOT need its own retry logic — SQS + handler's two-layer idempotency guard cover it. The 5-min VisibilityTimeout ≈ the 5-min `local_enrichment_started_at` soft TTL, so the guard correctly skips re-deliveries.
+
+### Why SQS-from-EventBridge over direct EventBridge
+
+1. **At-least-once + DLQ semantics** for free, without bespoke retry logic in the subscriber.
+2. **Matches the existing eq-email-pipeline polling pattern** (Gmail/Outlook pull). No new architectural shape.
+3. **Decoupled from EventBridge retry budget** — eq-email-pipeline can be down for up to 14 days (queue retention) and recover.
+4. **Same operational shape** as Phase 1.5 M3's downstream consumers (action-item-graph, eq-structured-graph-core) which use SQS-from-EventBridge.
+
+### Settings additions (eq-email-pipeline)
+
+Add to `src/models/config.py`:
+
+```python
+class Settings(BaseSettings):
+    # ... existing fields ...
+    email_promoted_queue_url: str = Field(
+        default="https://sqs.us-east-1.amazonaws.com/211125681610/eq-email-promoted-queue",
+        alias="EMAIL_PROMOTED_QUEUE_URL",
+    )
+    aws_region: str = Field(default="us-east-1", alias="AWS_REGION")
+```
+
+Railway env vars to set: `EMAIL_PROMOTED_QUEUE_URL`, `AWS_REGION`, plus AWS creds (likely already set from the existing EventBridge publish flow).
+
+---
+
 ## Production credentials + IDs (load-bearing reference)
 
 - **Neon Postgres (eq-dev):** project `super-glitter-11265514`, branch `production`, database `neondb`. Direct connection (no `-pooler`) for `DBOS_SYSTEM_DATABASE_URL`.
