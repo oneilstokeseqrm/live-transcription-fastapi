@@ -248,7 +248,8 @@ SELECT_INTERACTIONS_FOR_EMIT_SQL = text("""
 # ``interaction_id`` join on ``s.interaction_id = :raw_interaction_id``
 # constrains the role to the interaction we're emitting for.
 SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
-    SELECT c.id::text AS contact_id,
+    SELECT DISTINCT ON (c.id)
+           c.id::text AS contact_id,
            c.email,
            CASE
              WHEN c.first_name IS NOT NULL AND c.last_name IS NOT NULL
@@ -268,7 +269,22 @@ SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
           AND s.archived_at IS NULL
     WHERE summ.interaction_id = CAST(:raw_interaction_id AS uuid)
       AND c.tenant_id = CAST(:tenant_id AS uuid)
+    ORDER BY c.id, s.created_at DESC NULLS LAST
 """)
+# Two-layer dedup:
+# 1. ``s.interaction_id = :raw_interaction_id`` (added in the first
+#    Codex pass): blocks Cartesian fan-out across signals for the
+#    SAME contact in DIFFERENT interactions.
+# 2. ``DISTINCT ON (c.id) ... ORDER BY c.id, s.created_at DESC``
+#    (Codex P2 2026-05-16): the ``pending_signal_dedup`` UNIQUE INDEX
+#    on (queue_id, contact_email, source_type, interaction_id,
+#    calendar_event_id) ALLOWS multiple signals for the same
+#    (interaction_id, contact_email) pair if source_type differs
+#    (e.g., one transcript signal + one calendar signal for the same
+#    meeting attendee). Without the DISTINCT ON, those would
+#    produce duplicate contact entries in extras.contacts with
+#    potentially conflicting roles. DISTINCT ON picks the most
+#    recent signal's role.
 
 
 async def fetch_interactions_for_emit(

@@ -452,6 +452,13 @@ async def approve_entry(queue_id: str, body: ApproveRequest, request: Request):
 
     re_open_count = 0
     enqueue_workflow = False
+    # The winning attempt_id is what the workflow ID is keyed on. For
+    # first-approve + same-attempt replays, this equals the request's
+    # attempt_id. For different-attempt replays on an already-approved
+    # row, this comes from the row's recorded approval_attempt_id so
+    # the caller receives the REAL workflow_id (not a phantom keyed on
+    # their losing attempt_id) — Codex P2 finding 2026-05-16.
+    winning_attempt_id = body.approval_attempt_id
 
     async with get_async_session() as session:
         async with session.begin():
@@ -500,26 +507,58 @@ async def approve_entry(queue_id: str, body: ApproveRequest, request: Request):
                 # beyond) under SOME attempt_id. We do NOT enqueue a
                 # second workflow — SetWorkflowID would dedupe on the
                 # winner's attempt_id anyway. Return 202 with the
-                # request's attempt_id for the caller's bookkeeping.
+                # WINNING workflow_id so the caller can poll real
+                # DBOS state.
+                if current.approval_attempt_id:
+                    winning_attempt_id = current.approval_attempt_id
 
     # Workflow start AFTER the route's transaction commits. Plan §5.3:
     # this ordering preserves the contract that the row is durably
-    # 'approved' before any background work begins, AND keeps the
-    # workflow's failure modes separable from the route's reservation.
-    workflow_id = f"queue-{queue_id}:approval-{body.approval_attempt_id}"
+    # 'approved' before any background work begins.
+    #
+    # Stranding window: if the process dies between commit and
+    # enqueue_async, the row is 'approved' with no workflow. The
+    # natural recovery is client-side: same-attempt retry hits the
+    # APPROVE_SQL replay path (1-row match), re-enters this code, and
+    # re-enqueues. For non-retrying clients OR permanent enqueue
+    # failure, an orphan-approval reaper is needed — tracked under
+    # plan §9 Phase-2 trigger conditions. Codex P1 2026-05-16.
+    workflow_id = f"queue-{queue_id}:approval-{winning_attempt_id}"
     if enqueue_workflow:
         # SetWorkflowID makes the enqueue idempotent on retries of the
-        # same (queue_id, approval_attempt_id) pair. Concurrent /approve
-        # calls with the same attempt_id will produce the same
+        # same (queue_id, approval_attempt_id) pair. Concurrent
+        # /approve calls with the same attempt_id produce the same
         # workflow_id; DBOS deduplicates.
-        with SetWorkflowID(workflow_id):
-            await APPROVAL_QUEUE.enqueue_async(
-                account_provisioning_workflow,
-                queue_id=str(queue_id),
-                tenant_id=ctx.tenant_id,
-                approval_attempt_id=body.approval_attempt_id,
-                re_open_count=re_open_count,
+        try:
+            with SetWorkflowID(workflow_id):
+                await APPROVAL_QUEUE.enqueue_async(
+                    account_provisioning_workflow,
+                    queue_id=str(queue_id),
+                    tenant_id=ctx.tenant_id,
+                    approval_attempt_id=body.approval_attempt_id,
+                    re_open_count=re_open_count,
+                )
+        except Exception as exc:
+            # Enqueue failure AFTER the row was reserved. Surface as
+            # 503 so the client retries; the same-attempt retry will
+            # replay through APPROVE_SQL (1-row match) and re-attempt
+            # the enqueue. The row stays in 'approved' state — that's
+            # the desired durability anchor.
+            logger.exception(
+                "DBOS enqueue failed AFTER /approve committed reservation; "
+                "queue_id=%s attempt_id=%s workflow_id=%s. Row remains in "
+                "status='approved'; client should retry with the same "
+                "attempt_id.",
+                queue_id, body.approval_attempt_id, workflow_id,
             )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Queue entry reserved but workflow enqueue failed. "
+                    "Retry the same /approve call with the same "
+                    "approval_attempt_id; reservation is replay-safe."
+                ),
+            ) from exc
 
     return {
         "status": "approved",
@@ -556,6 +595,8 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
     ctx = get_auth_context_polling(request)
     _validate_uuid_path_param(queue_id, "queue_id")
     _validate_uuid_path_param(body.account_id, "account_id")
+
+    is_replay = False  # set in the 0-row branch when this is a replay
 
     async with get_async_session() as session:
         async with session.begin():
@@ -609,73 +650,164 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
                 if (current.status == "mapped"
                         and current.resolved_account_id == body.account_id
                         and current.approval_attempt_id == body.approval_attempt_id):
-                    return {
-                        "status": "mapped",
-                        "queue_id": queue_id,
-                        "account_id": body.account_id,
-                    }
-
-                # Codex Round 3 P1 #1 + Round 4 P2 #3: explicit conflict
-                # messaging. /map only operates on pending entries with a
-                # matching attempt_id for replay. Approved entries are
-                # owned by the worker (advisory-lock isolation); mapped
-                # entries with a different attempt_id signal a different
-                # caller intent. The message names the conflicting status
-                # so operators can diagnose without re-querying.
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Map conflict: queue entry is in status='{current.status}' "
-                        f"with a different approval_attempt_id or resolved_account_id "
-                        f"recorded. /map only operates on pending entries; mapped "
-                        f"entries replay successfully ONLY when the same "
-                        f"approval_attempt_id + account_id are presented. Reload and "
-                        f"retry."
-                    ),
+                    # Codex P1 2026-05-16: replay must re-attempt
+                    # emission. The ORIGINAL /map may have committed
+                    # materialization then failed at emit (transient
+                    # EventBridge outage). Without a re-attempt,
+                    # downstream consumers would never see the event
+                    # even though the API reports success.
+                    # Reconstruct the MaterializationResult from DB
+                    # state (queue's signals + mapped account) and
+                    # re-emit. At-least-once + consumer MERGE = dedup.
+                    materialization = await _materialization_for_replay(
+                        session=session,
+                        queue_id=queue_id,
+                        tenant_id=ctx.tenant_id,
+                        account_id=body.account_id,
+                    )
+                    # Defer the actual emit + return to the post-txn
+                    # block at the bottom of the route. Marker:
+                    # the only way ``materialization`` is set without
+                    # going through reservation is the replay branch.
+                    is_replay = True
+                else:
+                    # Codex Round 3 P1 #1 + Round 4 P2 #3: explicit
+                    # conflict messaging. /map only operates on pending
+                    # entries with a matching attempt_id for replay.
+                    # Approved entries are owned by the workflow;
+                    # mapped entries with a different attempt_id signal
+                    # a different caller intent.
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Map conflict: queue entry is in status='{current.status}' "
+                            f"with a different approval_attempt_id or resolved_account_id "
+                            f"recorded. /map only operates on pending entries; mapped "
+                            f"entries replay successfully ONLY when the same "
+                            f"approval_attempt_id + account_id are presented. Reload and "
+                            f"retry."
+                        ),
+                    )
+            else:
+                # Reservation succeeded — inline-materialize.
+                # UPDATE_QUEUE_SQL inside materialize_account_approval
+                # sets status='mapped' + resolved_account_id. The
+                # context manager auto-commits on clean exit (or rolls
+                # back if materialize_account_approval raises).
+                materialization = await materialize_account_approval(
+                    session=session,
+                    tenant_id=ctx.tenant_id,
+                    queue_id=queue_id,
+                    account_id=body.account_id,
+                    event_type="account_mapped",
                 )
-
-            # Reservation succeeded — inline-materialize. UPDATE_QUEUE_SQL
-            # inside materialize_account_approval sets status='mapped' +
-            # resolved_account_id. The context manager auto-commits on
-            # clean exit (or rolls back if materialize_account_approval
-            # raises).
-            materialization = await materialize_account_approval(
-                session=session,
-                tenant_id=ctx.tenant_id,
-                queue_id=queue_id,
-                account_id=body.account_id,
-                event_type="account_mapped",
-            )
 
     # Emit downstream EnvelopeV1 events for the backfilled interactions
     # AFTER the route's transaction commits (so emission failures cannot
     # roll back the contacts + queue update). Plan §6.6 + Codex P1
     # 2026-05-15: pre-fix /map skipped emission entirely because the
-    # outbox + publisher pair was deleted in M3. Without this call,
-    # downstream consumers (action-item-graph, eq-structured-graph-core)
-    # never learn about /map-materialized contacts.
+    # outbox + publisher pair was deleted in M3.
     #
-    # At-least-once emission; consumer-side MERGE-on-canonical-IDs is
-    # the dedup mechanism (same model as the workflow's Step 6). If
-    # emission fails after the DB commit, the row is in a consistent
-    # 'mapped' state and the operator can replay via a follow-up tool
-    # (M5 ships ``scripts/verify_consumer_contracts.py``).
+    # Codex P1 2026-05-16: on emission failure, raise 503 rather than
+    # swallow + return 200. The DB state is durable ('mapped'); a
+    # same-attempt retry replays the entire /map flow including the
+    # replay-emit path above, giving downstream consumers another
+    # chance to receive the event. Returning 200 with no event silently
+    # breaks the contract that the consumer learns about every
+    # materialized interaction.
     try:
         await emit_for_materialization_result(materialization=materialization)
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Inline /map emission failed AFTER materialization committed; "
-            "queue_id=%s account_id=%s. The DB state is correct (status="
-            "'mapped', contacts created); downstream consumers may miss "
-            "this interaction until a replay tool fires.",
-            queue_id, body.account_id,
+            "queue_id=%s account_id=%s is_replay=%s. DB state is correct "
+            "(status='mapped'); raising 503 so the client retries — replay "
+            "will reconstruct the MaterializationResult from DB state and "
+            "re-emit.",
+            queue_id, body.account_id, is_replay,
         )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Queue entry mapped; downstream emission failed. Retry "
+                "the same /map call with the same approval_attempt_id; "
+                "the replay path re-emits."
+            ),
+        ) from exc
 
     return {
         "status": "mapped",
         "queue_id": queue_id,
         "account_id": body.account_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# /map replay materialization reconstruction
+# ---------------------------------------------------------------------------
+
+
+REPLAY_INTERACTION_IDS_SQL = text("""
+    SELECT DISTINCT interaction_id::text AS interaction_id
+    FROM pending_account_mapping_signals
+    WHERE queue_id = CAST(:queue_id AS uuid)
+      AND interaction_id IS NOT NULL
+""")
+
+
+REPLAY_CONTACT_IDS_SQL = text("""
+    SELECT DISTINCT c.id::text AS contact_id
+    FROM contacts c
+    JOIN pending_account_mapping_signals s
+        ON lower(s.contact_email) = lower(c.email)
+        AND s.tenant_id = c.tenant_id
+    WHERE s.queue_id = CAST(:queue_id AS uuid)
+      AND c.account_id = CAST(:account_id AS uuid)
+      AND c.tenant_id = CAST(:tenant_id AS uuid)
+""")
+
+
+async def _materialization_for_replay(
+    *,
+    session,
+    queue_id: str,
+    tenant_id: str,
+    account_id: str,
+):
+    """Reconstruct ``MaterializationResult`` from DB state for /map replay.
+
+    A same-attempt /map replay can land on an already-mapped row; the
+    original call may have committed materialization but failed
+    emission. To re-emit, we need the contact_ids + interaction_ids
+    the original call produced. We derive them from the queue's
+    signals (which are the source of truth for what the original
+    materialize call processed) joined against contacts under the
+    mapped account.
+    """
+    from services.account_provisioning.types import MaterializationResult
+
+    interaction_rows = await session.execute(
+        REPLAY_INTERACTION_IDS_SQL, {"queue_id": queue_id},
+    )
+    interaction_ids = [r.interaction_id for r in interaction_rows.all()]
+
+    contact_rows = await session.execute(
+        REPLAY_CONTACT_IDS_SQL,
+        {
+            "queue_id": queue_id,
+            "account_id": account_id,
+            "tenant_id": tenant_id,
+        },
+    )
+    contact_ids = [r.contact_id for r in contact_rows.all()]
+
+    return MaterializationResult(
+        queue_id=queue_id,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        contact_ids=contact_ids,
+        interaction_ids=interaction_ids,
+    )
 
 
 @router.post("/{queue_id}/ignore")

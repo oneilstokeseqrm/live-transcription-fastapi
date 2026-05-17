@@ -68,17 +68,20 @@ def test_approve_handler_signature_unchanged():
 
 
 def test_workflow_id_formula_uses_approval_attempt_id():
-    """Plan §6.2: workflow_id = f"queue-{queue_id}:approval-{approval_attempt_id}".
+    """Plan §6.2: workflow_id = f"queue-{queue_id}:approval-{winning_attempt_id}".
 
     The route's enqueue path constructs the workflow_id this way; the
     reopen lifecycle relies on approval_attempt_id being NEW after a
     reopen (so a distinct workflow runs). The literal formula being
     present in the route module is a structural guard against accidental
-    drift.
+    drift. Codex P2 2026-05-16: ``winning_attempt_id`` replaces the
+    request's attempt_id in the formula so different-attempt replays
+    on already-approved rows return the REAL workflow_id (not a
+    phantom keyed on the losing attempt).
     """
     import routers.queue_actions as qa_module
     source = inspect.getsource(qa_module.approve_entry)
-    assert 'f"queue-{queue_id}:approval-{body.approval_attempt_id}"' in source
+    assert 'f"queue-{queue_id}:approval-{winning_attempt_id}"' in source
 
 
 def test_select_queue_sql_now_returns_re_open_count():
