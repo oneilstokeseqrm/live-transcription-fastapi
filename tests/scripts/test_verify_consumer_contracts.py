@@ -18,11 +18,14 @@ from scripts.verify_consumer_contracts import (  # noqa: E402
     INTERACTION_TYPE_TO_DETAIL_TYPE,
     ConsumerEnvelopeShape,
     ConsumerRegistration,
+    UnmappedInteractionTypeError,
     check_detail_type_against_rules,
     parse_consumer_envelope,
     resolve_detail_type,
     validate_against_consumer,
 )
+
+import pytest  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,38 @@ class TestParseConsumerEnvelope:
         assert shape.unavailable is True
         assert shape.parse_errors == []
         assert shape.required_fields == set()
+
+    def test_extracts_nested_content_payload_and_format(self, tmp_path: Path) -> None:
+        # Codex round-2 P2: action-item-graph constrains content via a
+        # nested ContentPayload model + ContentFormat enum. AST scan
+        # must pull both so the validator catches content.text=None or
+        # content.format="html" drift.
+        model = tmp_path / "envelope.py"
+        model.write_text(
+            "from enum import Enum\n"
+            "from pydantic import BaseModel, Field\n"
+            "class ContentFormat(str, Enum):\n"
+            "    PLAIN = 'plain'\n"
+            "    MARKDOWN = 'markdown'\n"
+            "class ContentPayload(BaseModel):\n"
+            "    text: str = Field(..., description='REQUIRED')\n"
+            "    format: ContentFormat = Field(default=ContentFormat.PLAIN)\n"
+            "class EnvelopeV1(BaseModel):\n"
+            "    tenant_id: str\n"
+            "    content: ContentPayload = Field(..., description='REQUIRED')\n"
+        )
+        reg = ConsumerRegistration(
+            name="nested",
+            repo_path=tmp_path,
+            envelope_model_path="envelope.py",
+            rule_name="r",
+        )
+        shape = parse_consumer_envelope(reg)
+        assert shape.content_format_enum is not None
+        assert set(shape.content_format_enum) == {"plain", "markdown"}
+        assert shape.required_content_fields == {"text"}
+        assert "content" in shape.required_fields
+        assert "tenant_id" in shape.required_fields
 
     def test_detects_pydantic_field_ellipsis_as_required(self, tmp_path: Path) -> None:
         # Codex round-1 P1: action-item-graph declares required fields as
@@ -213,6 +248,57 @@ class TestValidation:
         assert not result.accepted
         assert any("PARSE:" in f for f in result.findings)
 
+    def test_missing_content_text_rejected_on_strict_consumer(self) -> None:
+        # Codex round-2 P2: strict consumer declares ContentPayload.text
+        # as required. Producer change like `content={}` would silently
+        # pass before; must fail now.
+        shape = ConsumerEnvelopeShape(
+            consumer="strict",
+            required_fields={"tenant_id", "content"},
+            required_content_fields={"text"},
+            content_format_enum=["plain", "markdown"],
+        )
+        envelope = {"tenant_id": "x", "content": {"format": "plain"}}  # no text
+        result = validate_against_consumer(envelope, shape)
+        assert not result.accepted
+        assert any("missing required content fields" in f for f in result.findings)
+        assert any("text" in f for f in result.findings)
+
+    def test_unknown_content_format_rejected(self) -> None:
+        shape = ConsumerEnvelopeShape(
+            consumer="strict",
+            required_fields={"tenant_id", "content"},
+            required_content_fields={"text"},
+            content_format_enum=["plain", "markdown"],
+        )
+        envelope = {"tenant_id": "x", "content": {"text": "x", "format": "html"}}
+        result = validate_against_consumer(envelope, shape)
+        assert not result.accepted
+        assert any("content.format=" in f and "html" in f for f in result.findings)
+
+    def test_non_dict_content_rejected(self) -> None:
+        shape = ConsumerEnvelopeShape(
+            consumer="strict",
+            required_fields={"tenant_id", "content"},
+            required_content_fields={"text"},
+        )
+        envelope = {"tenant_id": "x", "content": "string-not-object"}
+        result = validate_against_consumer(envelope, shape)
+        assert not result.accepted
+        assert any("content must be an object" in f for f in result.findings)
+
+    def test_loose_consumer_skips_nested_check(self) -> None:
+        # Loose consumer (no ContentPayload model declared) doesn't run
+        # the nested validation. Producer can send any content shape.
+        shape = ConsumerEnvelopeShape(
+            consumer="loose",
+            required_fields={"tenant_id"},
+            required_content_fields=None,
+        )
+        envelope = {"tenant_id": "x", "content": "anything-goes"}
+        result = validate_against_consumer(envelope, shape)
+        assert result.accepted
+
     def test_unavailable_consumer_is_skipped_not_rejected(self) -> None:
         # Codex round-1 P1: a consumer whose repo isn't present should
         # produce a skipped result, not a rejection. Validates the
@@ -226,7 +312,8 @@ class TestValidation:
 
 
 class TestDetailTypeLookup:
-    """Codex round-1 P2: the --detail-type / rule-filter cross-check."""
+    """Codex round-1 P2 + round-2 P1/P2: --detail-type, rule-filter
+    cross-check, and producer-sync semantics."""
 
     def test_resolves_from_interaction_type_when_no_override(self) -> None:
         envelope = {"interaction_type": "transcript"}
@@ -239,16 +326,41 @@ class TestDetailTypeLookup:
             == "EnvelopeV1.custom"
         )
 
-    def test_unknown_interaction_type_returns_none(self) -> None:
+    def test_unknown_interaction_type_raises_like_producer(self) -> None:
+        # Codex round-2 P2: production's resolve_detail_type raises
+        # UnmappedInteractionTypeError. The verifier must do the same
+        # so --interaction-type with a new value doesn't return a false
+        # green when the producer would refuse to emit.
         envelope = {"interaction_type": "something_new"}
-        assert resolve_detail_type(envelope, None) is None
+        with pytest.raises(UnmappedInteractionTypeError) as exc_info:
+            resolve_detail_type(envelope, None)
+        assert "something_new" in str(exc_info.value)
 
-    def test_closed_map_covers_all_documented_types(self) -> None:
-        # If the producer adds a new interaction_type, this map must grow
-        # to match. The test pins the current set.
-        assert set(INTERACTION_TYPE_TO_DETAIL_TYPE.keys()) == {
-            "transcript", "note", "meeting", "email", "batch_upload",
-        }
+    def test_missing_interaction_type_raises(self) -> None:
+        with pytest.raises(UnmappedInteractionTypeError):
+            resolve_detail_type({}, None)
+
+    def test_batch_upload_maps_to_transcript_not_batch_upload(self) -> None:
+        # Codex round-2 P1: the script previously had
+        # batch_upload → EnvelopeV1.batch_upload, but the producer
+        # collapses batch_upload to EnvelopeV1.transcript (per
+        # services/account_provisioning/eventbridge_emit.py:66).
+        # Mismatch caused false-positive rule-drop warnings.
+        envelope = {"interaction_type": "batch_upload"}
+        assert (
+            resolve_detail_type(envelope, None) == "EnvelopeV1.transcript"
+        )
+
+    def test_lookup_stays_in_sync_with_producer(self) -> None:
+        # Single source of truth: production's
+        # services/account_provisioning/eventbridge_emit.py owns the
+        # lookup. The script duplicates it (to avoid pulling boto3 +
+        # sqlalchemy + DBOS into a CLI tool); this test asserts the
+        # two stay byte-identical so drift fails CI immediately.
+        from services.account_provisioning.eventbridge_emit import (  # noqa: E402
+            INTERACTION_TYPE_TO_DETAIL_TYPE as PRODUCER_LOOKUP,
+        )
+        assert INTERACTION_TYPE_TO_DETAIL_TYPE == PRODUCER_LOOKUP
 
 
 class TestRuleFilterCrossCheck:

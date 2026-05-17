@@ -113,6 +113,15 @@ class ConsumerEnvelopeShape:
     consumer: str
     source_enum: list[str] | None = None  # None = no enum (loose `source: str`)
     interaction_type_enum: list[str] | None = None
+    # `content.format` is an enum on the strict consumer (action-item-graph
+    # uses ContentFormat ∈ {plain, markdown, diarized, email}). Loose
+    # consumers don't declare one. None = no enum.
+    content_format_enum: list[str] | None = None
+    # `content` is a nested model on the strict consumer (ContentPayload).
+    # required_content_fields is the set of fields that must appear inside
+    # the envelope's `content` dict. None = no nested model declared (loose
+    # consumers accept any content shape).
+    required_content_fields: set[str] | None = None
     required_fields: set[str] = field(default_factory=set)
     parse_errors: list[str] = field(default_factory=list)
     # True when the consumer's local repo isn't on disk (e.g. CI checked out
@@ -210,6 +219,19 @@ def parse_consumer_envelope(consumer: ConsumerRegistration) -> ConsumerEnvelopeS
             shape.source_enum = _extract_str_enum_values(node)
         elif node.name == "InteractionType":
             shape.interaction_type_enum = _extract_str_enum_values(node)
+        elif node.name == "ContentFormat":
+            # str-enum on action-item-graph: PLAIN/MARKDOWN/DIARIZED/EMAIL.
+            shape.content_format_enum = _extract_str_enum_values(node)
+        elif node.name == "ContentPayload":
+            # Nested model on action-item-graph for the envelope's `content`
+            # field. Catches producer changes like content.text=None or a
+            # bogus content.format that would pass the top-level required-
+            # field check but fail Pydantic at parse time.
+            shape.required_content_fields = set()
+            for item in node.body:
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    if _ann_assign_is_required(item):
+                        shape.required_content_fields.add(item.target.id)
         elif node.name == "EnvelopeV1":
             # Required if there's no default OR the default is `Field(...)`
             # (Pydantic's "required field with metadata" idiom). Detection
@@ -229,17 +251,37 @@ def parse_consumer_envelope(consumer: ConsumerRegistration) -> ConsumerEnvelopeS
 
 
 # Closed map from envelope.interaction_type → EventBridge DetailType.
-# Must stay in sync with INTERACTION_TYPE_TO_DETAIL_TYPE in
-# services/account_provisioning/eventbridge_emit.py. The mapping is small
-# and changes rarely; verify_consumer_contracts re-checks it against the
-# live EventBridge rule filters when AWS is reachable.
+# **DUPLICATED from services/account_provisioning/eventbridge_emit.py.**
+# A unit test (tests/scripts/test_verify_consumer_contracts.py) imports
+# the producer's lookup and asserts equality, so drift fails CI.
+# Importing the producer module directly here would drag in boto3 +
+# sqlalchemy + DBOS, which defeats this script's purpose as a
+# lightweight pre-merge gate runnable in single-repo CI.
+#
+# CRITICAL semantics: ``batch_upload`` maps to ``EnvelopeV1.transcript``,
+# NOT ``EnvelopeV1.batch_upload``. Per the producer's comment:
+# batch_upload is what routers/batch.py + routers/upload.py write to
+# raw_interactions.interaction_type for transcript-content paths
+# (file upload + batch processing); downstream consumers should treat
+# them as transcripts.
 INTERACTION_TYPE_TO_DETAIL_TYPE: Final = {
     "transcript": "EnvelopeV1.transcript",
-    "note": "EnvelopeV1.note",
     "meeting": "EnvelopeV1.meeting",
+    "note": "EnvelopeV1.note",
     "email": "EnvelopeV1.email",
-    "batch_upload": "EnvelopeV1.batch_upload",
+    "batch_upload": "EnvelopeV1.transcript",
 }
+
+
+class UnmappedInteractionTypeError(ValueError):
+    """Raised when ``interaction_type`` is not in the closed lookup.
+
+    Mirrors the producer's ``services.account_provisioning.types``
+    exception. The producer fails loud (no synthetic default) so
+    this verifier must do the same — otherwise a developer could
+    use --interaction-type to vet a new value and get a false green
+    while Step 6 in production would raise.
+    """
 
 
 # Mirrors the Phase 1.5 backfill emit step's envelope (services/account_provisioning/eventbridge_emit.py).
@@ -278,19 +320,34 @@ def build_test_envelope(args: argparse.Namespace) -> dict:
     return env
 
 
-def resolve_detail_type(envelope: dict, override: str | None) -> str | None:
+def resolve_detail_type(envelope: dict, override: str | None) -> str:
     """Pick the DetailType the producer would emit for this envelope.
 
     If the CLI supplied ``--detail-type`` explicitly, use it. Otherwise,
     derive from ``envelope.interaction_type`` via the closed lookup —
-    this mirrors what the production emit step does.
+    mirroring what production's
+    ``services.account_provisioning.eventbridge_emit.resolve_detail_type``
+    does. Raises ``UnmappedInteractionTypeError`` on unknown types so
+    that --interaction-type with a not-yet-mapped value fails the gate
+    instead of returning a misleading green.
     """
     if override is not None:
         return override
     itype = envelope.get("interaction_type")
     if not isinstance(itype, str):
-        return None
-    return INTERACTION_TYPE_TO_DETAIL_TYPE.get(itype)
+        raise UnmappedInteractionTypeError(
+            f"envelope.interaction_type is missing or not a string: {itype!r}"
+        )
+    try:
+        return INTERACTION_TYPE_TO_DETAIL_TYPE[itype]
+    except KeyError as exc:
+        raise UnmappedInteractionTypeError(
+            f"interaction_type={itype!r} is not in the closed "
+            f"INTERACTION_TYPE_TO_DETAIL_TYPE lookup. Either extend the "
+            f"lookup (this script + the producer) AND the live "
+            f"EventBridge rule patterns, or fix the upstream type "
+            f"assignment."
+        ) from exc
 
 
 def check_detail_type_against_rules(
@@ -379,6 +436,36 @@ def validate_against_consumer(
         result.findings.append(
             f"missing required fields: {sorted(missing_required)}"
         )
+
+    # Nested content validation: only when the consumer declares a
+    # ContentPayload-style model (loose consumers skip this check).
+    if shape.required_content_fields is not None:
+        content = envelope.get("content")
+        if content is None:
+            # `content` is itself a required EnvelopeV1 field on strict
+            # consumers; the missing_required check above catches that.
+            # Nothing further to check here.
+            pass
+        elif not isinstance(content, dict):
+            result.accepted = False
+            result.findings.append(
+                f"content must be an object, got {type(content).__name__}"
+            )
+        else:
+            missing_content = shape.required_content_fields - set(content.keys())
+            if missing_content:
+                result.accepted = False
+                result.findings.append(
+                    f"missing required content fields: {sorted(missing_content)}"
+                )
+            if shape.content_format_enum is not None and "format" in content:
+                fmt = content.get("format")
+                if fmt not in shape.content_format_enum:
+                    result.accepted = False
+                    result.findings.append(
+                        f"content.format={fmt!r} NOT in ContentFormat enum "
+                        f"{sorted(shape.content_format_enum)}"
+                    )
 
     return result
 
@@ -472,7 +559,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     envelope = build_test_envelope(args)
-    detail_type = resolve_detail_type(envelope, args.detail_type)
+    try:
+        detail_type = resolve_detail_type(envelope, args.detail_type)
+    except UnmappedInteractionTypeError as exc:
+        # Mirror the production producer: unmapped types are a hard fail,
+        # never a silent default. Avoids the "false green" Codex round-2
+        # P2 flagged when --interaction-type vets a new value the producer
+        # would refuse to emit.
+        print(f"UNMAPPED INTERACTION TYPE: {exc}", file=sys.stderr)
+        return 1
     print("Validating envelope against known consumers:")
     print(f"  source={envelope.get('source')!r}  "
           f"interaction_type={envelope.get('interaction_type')!r}  "
@@ -554,6 +649,17 @@ def main(argv: list[str] | None = None) -> int:
             f"(repo not in checkout): {skipped}",
             file=sys.stderr,
         )
+
+    # Round-2 P1: if AWS surfaced rule-filter drops for the computed
+    # DetailType, fail. Otherwise CI could green-light a PR that
+    # introduces a new detail type the live rules won't forward.
+    if rule_drop_warnings:
+        print(
+            f"DETAIL-TYPE DROP: {len(rule_drop_warnings)} live rule(s) "
+            f"would filter out DetailType={detail_type!r}",
+            file=sys.stderr,
+        )
+        return 1
     if rejecters:
         print(f"DRIFT: {len(rejecters)} consumer(s) would reject the envelope: "
               f"{rejecters}", file=sys.stderr)
