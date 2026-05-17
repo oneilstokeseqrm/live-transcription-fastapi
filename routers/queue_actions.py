@@ -56,6 +56,7 @@ from services.database import get_async_session
 from services.queue_authorization import can_act_on_queue_entry
 from utils.context_utils import get_auth_context_polling
 from services.account_provisioning.eventbridge_emit import (
+    emit_email_promoted_for_materialization,
     emit_for_materialization_result,
 )
 from services.account_provisioning.materialization import materialize_account_approval
@@ -736,6 +737,11 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
     # materialized interaction.
     try:
         await emit_for_materialization_result(materialization=materialization)
+        # M2 (Phase-1-email-pipeline) addition: /map promotes pending_interactions
+        # too — fan-out the EmailPromoted notifications so eq-email-pipeline runs
+        # local enrichment on any promoted cold-inbound emails. No-op for legacy
+        # signal-only queues (empty promoted_interaction_ids).
+        await emit_email_promoted_for_materialization(materialization=materialization)
     except Exception as exc:
         logger.exception(
             "Inline /map emission failed AFTER materialization committed; "
@@ -780,6 +786,40 @@ REPLAY_INTERACTION_IDS_SQL = text("""
 # /map replay doesn't re-emit interactions from a prior lifecycle.
 
 
+REPLAY_PROMOTED_INTERACTION_IDS_SQL = text("""
+    SELECT p.interaction_id::text AS interaction_id
+    FROM pending_interactions p
+    JOIN pending_account_mappings m ON m.id = p.queue_id
+    WHERE p.queue_id = CAST(:queue_id AS uuid)
+      AND p.archive_reason = 'promoted'
+      AND m.mapped_at IS NOT NULL
+      AND p.archived_at >= m.mapped_at
+""")
+# M2 (Phase-1-email-pipeline) replay reconstruction: the pending rows that
+# materialize_account_approval promoted on the ORIGINAL /map call carry
+# archive_reason='promoted' in their archived state. A same-attempt /map
+# replay reads them back so the EmailPromoted emission can re-fire — the
+# original /map may have committed materialization but failed both
+# emissions, and the replay needs to surface promoted interactions to the
+# new emit_email_promoted_for_materialization call.
+#
+# Lifecycle scoping (Codex M2 round-2 P2): reopened queues reuse the same
+# queue_id, so a queue that was mapped → reopened → mapped again carries
+# 'promoted' pending rows from BOTH lifecycles. Without scoping, a
+# same-attempt /map replay during the second lifecycle would resurrect
+# the first lifecycle's interaction_ids and re-emit historical events.
+#
+# The lifecycle discriminator is the queue's CURRENT mapped_at: both
+# pending.archived_at and queue.mapped_at are stamped from NOW() inside
+# the same materialize transaction (NOW() returns the start-of-txn
+# timestamp, so they share a value within a cycle). Cycle-1 rows have
+# archived_at = cycle-1 mapped_at; cycle-2 rows have archived_at =
+# cycle-2 mapped_at. Codex M2 round-4 P2 tightening: no slack needed —
+# both NOW() calls in the same txn return the exact same value, so
+# `>= m.mapped_at` is precise. The earlier 1-second tolerance admitted
+# prior-lifecycle rows for fast remap cycles.
+
+
 REPLAY_CONTACT_IDS_SQL = text("""
     SELECT DISTINCT c.id::text AS contact_id
     FROM contacts c
@@ -815,7 +855,17 @@ async def _materialization_for_replay(
     interaction_rows = await session.execute(
         REPLAY_INTERACTION_IDS_SQL, {"queue_id": queue_id},
     )
-    interaction_ids = [r.interaction_id for r in interaction_rows.all()]
+    signal_interaction_ids = [r.interaction_id for r in interaction_rows.all()]
+
+    promoted_rows = await session.execute(
+        REPLAY_PROMOTED_INTERACTION_IDS_SQL, {"queue_id": queue_id},
+    )
+    promoted_interaction_ids = [r.interaction_id for r in promoted_rows.all()]
+
+    # The fresh-materialize path extends interaction_ids with promoted_ids
+    # so the existing EnvelopeV1.email fan-out covers promoted emails too.
+    # The replay must reconstruct the same union so re-emission is symmetric.
+    interaction_ids = list(dict.fromkeys(signal_interaction_ids + promoted_interaction_ids))
 
     contact_rows = await session.execute(
         REPLAY_CONTACT_IDS_SQL,
@@ -833,6 +883,7 @@ async def _materialization_for_replay(
         account_id=account_id,
         contact_ids=contact_ids,
         interaction_ids=interaction_ids,
+        promoted_interaction_ids=promoted_interaction_ids,
     )
 
 

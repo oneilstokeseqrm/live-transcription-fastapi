@@ -31,6 +31,7 @@ from dbos import DBOS
 from sqlalchemy import text
 
 from services.account_provisioning.eventbridge_emit import (
+    emit_email_promoted_for_materialization,
     emit_for_materialization_result,
 )
 from services.account_provisioning.materialization import (
@@ -473,3 +474,34 @@ async def emit_eventbridge_events(
     DBOS retries are safe at the consumer.
     """
     return await emit_for_materialization_result(materialization=materialization)
+
+
+# ---------------------------------------------------------------------------
+# Phase-1-email-pipeline M2 — EmailPromoted emit step (plan §5.4)
+# ---------------------------------------------------------------------------
+
+
+@DBOS.step(retries_allowed=True, max_attempts=5, interval_seconds=2.0, backoff_rate=2.0)
+async def emit_email_promoted_events(
+    *,
+    materialization: MaterializationResult,
+) -> list[EmissionRecord]:
+    """Emit one EmailPromoted EventBridge event per promoted interaction.
+
+    Plan §5.4 + §6. Notifies eq-email-pipeline that a cold-inbound email
+    was just promoted to ``emails`` and needs its local enrichment
+    pipeline run retroactively (Neo4j flesh + LLM extraction + Pinecone
+    embed + thread summary). The handler-side two-layer idempotency
+    guard (``local_enrichment_started_at`` 5-min soft TTL +
+    ``local_enrichment_completed_at`` hard marker) makes DBOS step
+    retries replay-safe at the consumer.
+
+    Empty list when ``promoted_interaction_ids`` is empty (legacy
+    meeting-only approval): the step is a cheap no-op for queues that
+    had no cold-inbound emails attached.
+
+    Appended at the END of the workflow per DBOS plan §6.8 (appending
+    steps at end is safe under deploy-while-in-flight; mid-workflow
+    insertions are not).
+    """
+    return await emit_email_promoted_for_materialization(materialization=materialization)

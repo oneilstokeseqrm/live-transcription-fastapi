@@ -328,8 +328,7 @@ SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
     JOIN interaction_summaries summ ON summ.summary_id = l.interaction_id
     JOIN contacts c ON c.id = l.contact_id
     LEFT JOIN pending_account_mapping_signals s
-           ON s.queue_id = CAST(:queue_id AS uuid)
-          AND s.interaction_id = CAST(:raw_interaction_id AS uuid)
+           ON s.interaction_id = CAST(:raw_interaction_id AS uuid)
           AND lower(s.contact_email) = lower(c.email)
           AND s.archived_at IS NULL
     WHERE summ.interaction_id = CAST(:raw_interaction_id AS uuid)
@@ -350,6 +349,16 @@ SELECT_CONTACTS_FOR_INTERACTION_SQL = text("""
 #    produce duplicate contact entries in extras.contacts with
 #    potentially conflicting roles. DISTINCT ON picks the most
 #    recent signal's role.
+#
+# Cross-queue roles (Codex M2 round-5 P2): the prior ``s.queue_id =
+# $queue_id`` constraint was REMOVED. After M2's Step 5 cross-queue link
+# batch, an interaction can have linked contacts from OTHER queues
+# (the §8.6 cross-queue cold-inbound case). With the queue_id constraint
+# the role for those cross-queue contacts came back NULL, even though
+# their signal exists in another queue. Scoping the role lookup by
+# interaction_id only (no queue_id) lets the JOIN find the cross-queue
+# signal's role. The interaction_id constraint still prevents Cartesian
+# fan-out across unrelated interactions (point 1 above).
 
 
 async def fetch_interactions_for_emit(
@@ -433,3 +442,112 @@ async def emit_for_materialization_result(
         interactions=interactions,
         boto3_factory=boto3_factory,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase-1-email-pipeline M2 — EmailPromoted EventBridge emission (plan §5.4)
+# ---------------------------------------------------------------------------
+
+
+_EMAIL_PROMOTED_DETAIL_TYPE = "EmailPromoted"
+
+
+async def emit_email_promoted_for_materialization(
+    *,
+    materialization: MaterializationResult,
+    boto3_factory: Any = _build_eventbridge_client,
+) -> list[EmissionRecord]:
+    """Emit one ``EmailPromoted`` EventBridge event per promoted interaction.
+
+    Plan §5.4 + §6: cold-inbound emails that were persisted to
+    ``pending_interactions`` and just got promoted to
+    ``raw_interactions`` + ``emails`` need eq-email-pipeline's full local
+    enrichment retroactively (Neo4j build_skeleton + write_flesh, LLM
+    extraction, Pinecone embed, headline / thread summary). The
+    EmailPromoted event is the notification that triggers it; the handler's
+    two-layer idempotency guard (started_at TTL + completed_at hard marker)
+    bounds retry-corruption on the non-idempotent Neo4j writes.
+
+    Empty list when ``promoted_interaction_ids`` is empty (legacy meeting-
+    only approval) — the step is a no-op for queues with no cold-inbound
+    emails attached.
+
+    Source = ``com.yourapp.transcription`` (same as the EnvelopeV1 path) so
+    EventBridge rule wiring stays uniform. DetailType = ``EmailPromoted``
+    is a NEW detail-type the operator must add to the eq-email-pipeline
+    subscription rule before M2 deploys to production.
+
+    Payload is intentionally lean — it carries IDs only, not the email
+    body. eq-email-pipeline reads the persisted ``emails`` + ``raw_interactions``
+    rows by interaction_id to get the full content. This keeps the
+    event under EventBridge's 256-KB limit and avoids serialising the
+    raw_text twice.
+    """
+    if not materialization.promoted_interaction_ids:
+        return []
+
+    bus_name = os.environ.get("EVENTBRIDGE_BUS_NAME", "default")
+    client = boto3_factory()
+    if client is None:
+        logger.info(
+            "EmailPromoted emission skipped (client unavailable): "
+            "promoted_count=%d. Expected in dev/CI without AWS credentials.",
+            len(materialization.promoted_interaction_ids),
+        )
+        return []
+
+    from datetime import datetime, timezone
+
+    promoted_at = datetime.now(timezone.utc).isoformat()
+    emissions: list[EmissionRecord] = []
+
+    for interaction_id in materialization.promoted_interaction_ids:
+        detail = {
+            "tenant_id": materialization.tenant_id,
+            "interaction_id": interaction_id,
+            "account_id": materialization.account_id,
+            "queue_id": materialization.queue_id,
+            "promoted_at": promoted_at,
+        }
+        entry = {
+            "Source": _EVENT_SOURCE,
+            "DetailType": _EMAIL_PROMOTED_DETAIL_TYPE,
+            "Detail": json.dumps(detail),
+            "EventBusName": bus_name,
+        }
+        try:
+            response = await asyncio.to_thread(client.put_events, Entries=[entry])
+        except NoCredentialsError:
+            logger.info(
+                "EmailPromoted put_events: AWS credentials missing at "
+                "call time. Skipping remaining emissions (%d so far).",
+                len(emissions),
+            )
+            return emissions
+
+        failed_count = response.get("FailedEntryCount", 0)
+        if failed_count:
+            raise EventBridgeEmissionError(
+                f"EventBridge put_events returned FailedEntryCount={failed_count} "
+                f"for EmailPromoted interaction_id={interaction_id}: "
+                f"{json.dumps(response.get('Entries', []), default=str)}"
+            )
+
+        event_id = None
+        entries_resp = response.get("Entries", [])
+        if entries_resp and isinstance(entries_resp[0], dict):
+            event_id = entries_resp[0].get("EventId")
+
+        emissions.append(
+            EmissionRecord(
+                interaction_id=interaction_id,
+                detail_type=_EMAIL_PROMOTED_DETAIL_TYPE,
+                event_id=event_id,
+            )
+        )
+        logger.info(
+            "Emitted EmailPromoted to EventBridge: interaction_id=%s event_id=%s",
+            interaction_id, event_id,
+        )
+
+    return emissions

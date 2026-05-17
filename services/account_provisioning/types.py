@@ -119,6 +119,15 @@ class MaterializationResult(BaseModel):
     interaction_id. If absent, ``materialize_account_approval`` raises
     rather than writing a placeholder. So ``interaction_ids`` is
     always emit-safe — no placeholder filtering needed downstream.
+
+    ``promoted_interaction_ids`` is the subset of ``interaction_ids``
+    that were promoted from ``pending_interactions`` during this
+    approval (cold-inbound emails awaiting an account anchor). The
+    M2 step ``emit_email_promoted_events`` fan-outs one EventBridge
+    ``EmailPromoted`` event per promoted interaction; eq-email-pipeline
+    subscribes and runs its full local enrichment (Neo4j flesh +
+    Pinecone embed + LLM summary) retroactively. Empty for queues
+    with no cold-inbound emails attached (legacy meeting-only case).
     """
 
     queue_id: str
@@ -126,6 +135,7 @@ class MaterializationResult(BaseModel):
     account_id: str
     contact_ids: list[str] = Field(default_factory=list)
     interaction_ids: list[str] = Field(default_factory=list)
+    promoted_interaction_ids: list[str] = Field(default_factory=list)
 
 
 class EmittedContact(BaseModel):
