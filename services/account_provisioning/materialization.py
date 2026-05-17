@@ -36,6 +36,22 @@ SELECT_SIGNALS_SQL = text("""
 """)
 
 
+CHECK_RAW_INTERACTION_EXISTS_SQL = text("""
+    SELECT 1 FROM raw_interactions
+    WHERE interaction_id = :interaction_id
+    LIMIT 1
+""")
+# Codex P2 2026-05-16: detect whether raw_interactions has a real
+# row before the materialization writes the placeholder. Placeholder
+# rows carry hard-coded interaction_type='meeting' + empty raw_text;
+# emitting them downstream would corrupt the EnvelopeV1 contract
+# (wrong DetailType, empty content). The MaterializationResult
+# tracks placeholder interaction_ids so the emit step can skip them.
+# The DB writes for placeholders still happen (interaction_contact_links
+# needs a parent summary which needs a parent raw_interactions row);
+# only the downstream emission is filtered.
+
+
 INSERT_CONTACT_SQL = text("""
     INSERT INTO contacts (id, tenant_id, email, first_name, last_name, account_id,
                           source, validation_status, created_at, updated_at)
@@ -167,6 +183,7 @@ async def materialize_account_approval(
 
     contact_ids: list[str] = []
     interaction_ids: list[str] = []
+    placeholder_interaction_ids: set[str] = set()
     # Lazy cache: at most one placeholder interaction_summaries row per
     # raw_interaction_id, created on first reference. All contacts for that
     # interaction link to the same summary_id; the link INSERT uses
@@ -204,6 +221,26 @@ async def materialize_account_approval(
             raw_id = str(s.interaction_id)
             summary_id = summary_id_by_raw_id.get(raw_id)
             if summary_id is None:
+                # Codex P2 2026-05-16: detect whether the upstream
+                # ingestion (Lane 2 / intelligence_service) has
+                # already written a real raw_interactions row. If
+                # NOT, we still need a placeholder for the
+                # interaction_summaries + interaction_contact_links
+                # FK chain — BUT the placeholder's content
+                # (interaction_type='meeting', empty raw_text) is
+                # WRONG for downstream emission. Track the
+                # interaction_id as a placeholder so Step 6's emit
+                # path skips it. Lane 2 will eventually write the
+                # real row; a future re-emission tool (M5) can
+                # backfill the downstream notification.
+                existing_check = (
+                    await session.execute(
+                        CHECK_RAW_INTERACTION_EXISTS_SQL,
+                        {"interaction_id": s.interaction_id},
+                    )
+                ).first()
+                if existing_check is None:
+                    placeholder_interaction_ids.add(raw_id)
                 # Ensure parent raw_interactions row exists (summaries-writer
                 # may have already created it; ON CONFLICT DO NOTHING is safe).
                 await session.execute(
@@ -251,4 +288,5 @@ async def materialize_account_approval(
         account_id=account_id,
         contact_ids=list(dict.fromkeys(contact_ids)),
         interaction_ids=list(dict.fromkeys(interaction_ids)),
+        placeholder_interaction_ids=sorted(placeholder_interaction_ids),
     )

@@ -289,7 +289,12 @@ async def call_agent_enrich(
     cached ``run_id``, the retry simply re-issues POST. Cost: 30-90s of
     redundant enrich on a crash window. Correctness: preserved.
     """
-    cached: Optional[dict] = await DBOS.get_event(  # type: ignore[func-returns-value]
+    # Codex P0 2026-05-16: DBOS 2.x has both sync (get_event/set_event)
+    # and async (get_event_async/set_event_async) variants. The sync
+    # methods raise RuntimeError when called from a running event loop —
+    # which is exactly the context an async @DBOS.step runs in. Use
+    # the _async variants.
+    cached: Optional[dict] = await DBOS.get_event_async(
         DBOS.workflow_id, _AGENT_RUN_EVENT_KEY, timeout_seconds=0
     )
     client = _build_agent_client()
@@ -321,7 +326,7 @@ async def call_agent_enrich(
         except Exception:  # noqa: BLE001
             run_id = None
         if run_id:
-            await DBOS.set_event(_AGENT_RUN_EVENT_KEY, {"run_id": run_id})
+            await DBOS.set_event_async(_AGENT_RUN_EVENT_KEY, {"run_id": run_id})
 
         return profile
     finally:

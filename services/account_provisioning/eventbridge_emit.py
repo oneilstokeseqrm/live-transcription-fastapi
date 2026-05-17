@@ -54,6 +54,15 @@ INTERACTION_TYPE_TO_DETAIL_TYPE: dict[str, str] = {
     "meeting": "EnvelopeV1.meeting",
     "note": "EnvelopeV1.note",
     "email": "EnvelopeV1.email",
+    # ``batch_upload`` is what routers/batch.py + routers/upload.py
+    # write to raw_interactions.interaction_type for transcript-content
+    # ingestion paths (file upload + batch processing). Downstream
+    # consumers should treat these as transcript interactions — the
+    # source is the same kind of content, just delivered async vs
+    # streamed live. Codex P1 2026-05-16: queue entries originating
+    # from these paths would have failed Step 6 with
+    # ``UnmappedInteractionTypeError`` before this mapping was added.
+    "batch_upload": "EnvelopeV1.transcript",
 }
 
 
@@ -296,8 +305,19 @@ async def fetch_interactions_for_emit(
     Plan §6.6 + Codex P2 (signal-role join scope): each interaction
     gets its OWN contacts list, filtered by signal.interaction_id so
     multi-touchpoint contacts don't bleed roles across interactions.
+
+    Codex P2 2026-05-16: placeholder interaction_ids (created by
+    materialization when Lane 2 hadn't yet written the real
+    raw_interactions row) are excluded. Emitting placeholders would
+    send empty downstream envelopes with the wrong
+    ``interaction_type``. Lane 2's real-row write will arrive later;
+    M5's verify_consumer_contracts tool replays missed emissions then.
     """
-    if not materialization.interaction_ids:
+    placeholder_set = set(materialization.placeholder_interaction_ids)
+    emit_interaction_ids = [
+        i for i in materialization.interaction_ids if i not in placeholder_set
+    ]
+    if not emit_interaction_ids:
         return []
 
     interactions: list[InteractionForEmit] = []
@@ -306,7 +326,7 @@ async def fetch_interactions_for_emit(
             await session.execute(
                 SELECT_INTERACTIONS_FOR_EMIT_SQL,
                 {
-                    "interaction_ids": materialization.interaction_ids,
+                    "interaction_ids": emit_interaction_ids,
                     "tenant_id": materialization.tenant_id,
                 },
             )

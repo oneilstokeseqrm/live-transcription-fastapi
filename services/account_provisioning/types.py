@@ -113,6 +113,16 @@ class MaterializationResult(BaseModel):
 
     Captures what Step 6 needs to fan out per-interaction EnvelopeV1
     emissions without re-reading from the database.
+
+    ``placeholder_interaction_ids`` is the subset of
+    ``interaction_ids`` where materialization created a placeholder
+    ``raw_interactions`` row (the upstream Lane 2 / intelligence
+    service hadn't yet written the real row at materialize time).
+    Step 6's emit MUST skip these — their stored content is a
+    placeholder (``interaction_type='meeting'``, empty ``raw_text``)
+    and would produce a corrupted EnvelopeV1 downstream. Lane 2 will
+    backfill the real row later; a future re-emission tool (M5) can
+    fire the downstream notification then. Codex P2 2026-05-16.
     """
 
     queue_id: str
@@ -120,6 +130,7 @@ class MaterializationResult(BaseModel):
     account_id: str
     contact_ids: list[str] = Field(default_factory=list)
     interaction_ids: list[str] = Field(default_factory=list)
+    placeholder_interaction_ids: list[str] = Field(default_factory=list)
 
 
 class EmittedContact(BaseModel):
