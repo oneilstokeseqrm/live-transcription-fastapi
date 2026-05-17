@@ -287,6 +287,19 @@ class TestValidation:
         assert not result.accepted
         assert any("content must be an object" in f for f in result.findings)
 
+    def test_null_required_content_field_rejected(self) -> None:
+        # Codex round-3 P2: ``content={"text": null}`` was accepted as
+        # "key is present" but Pydantic rejects None on `text: str`.
+        shape = ConsumerEnvelopeShape(
+            consumer="strict",
+            required_fields={"tenant_id", "content"},
+            required_content_fields={"text"},
+        )
+        envelope = {"tenant_id": "x", "content": {"text": None, "format": "plain"}}
+        result = validate_against_consumer(envelope, shape)
+        assert not result.accepted
+        assert any("null" in f and "text" in f for f in result.findings)
+
     def test_loose_consumer_skips_nested_check(self) -> None:
         # Loose consumer (no ContentPayload model declared) doesn't run
         # the nested validation. Producer can send any content shape.

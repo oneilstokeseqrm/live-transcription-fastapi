@@ -458,6 +458,19 @@ def validate_against_consumer(
                 result.findings.append(
                     f"missing required content fields: {sorted(missing_content)}"
                 )
+            # Round-3 P2: required content fields can't be None either —
+            # the consumer's Pydantic model declares them as `str`, not
+            # `Optional[str]`. Catches the false-green for
+            # ``content={"text": null, "format": "plain"}``.
+            null_content = {
+                k for k in shape.required_content_fields
+                if k in content and content[k] is None
+            }
+            if null_content:
+                result.accepted = False
+                result.findings.append(
+                    f"required content fields are null: {sorted(null_content)}"
+                )
             if shape.content_format_enum is not None and "format" in content:
                 fmt = content.get("format")
                 if fmt not in shape.content_format_enum:
@@ -638,17 +651,20 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"  - {w}", file=sys.stderr)
 
     print()
-    rejecters = [
-        r.consumer for r in results
-        if not r.accepted and (not r.skipped or args.strict)
-    ]
     skipped = [r.consumer for r in results if r.skipped]
-    if skipped and not args.strict:
-        print(
-            f"SKIPPED {len(skipped)} consumer(s) "
-            f"(repo not in checkout): {skipped}",
-            file=sys.stderr,
-        )
+    # Round-3 P2: in --strict, treat skipped consumers as rejections so the
+    # gate actually fires in single-repo CI. Skipped results are constructed
+    # with accepted=True for the default code path; --strict overrides that.
+    if args.strict:
+        rejecters = [r.consumer for r in results if not r.accepted or r.skipped]
+    else:
+        rejecters = [r.consumer for r in results if not r.accepted]
+        if skipped:
+            print(
+                f"SKIPPED {len(skipped)} consumer(s) "
+                f"(repo not in checkout): {skipped}",
+                file=sys.stderr,
+            )
 
     # Round-2 P1: if AWS surfaced rule-filter drops for the computed
     # DetailType, fail. Otherwise CI could green-light a PR that

@@ -72,6 +72,16 @@ def normalize_dsn_for_asyncpg(dsn: str) -> str:
 
 # Match :name placeholders, but NOT ::cast or := assignment.
 # Negative lookbehind for `:` prevents matching the second colon of ::cast.
+#
+# KNOWN LIMITATION (Codex round-3 P2, 2026-05-17): this regex rewrites
+# ANY ``:name`` sequence, including ones inside SQL string literals
+# (e.g. ``SELECT ':tenant' AS label``) and SQL comments
+# (``-- :tenant``, ``/* :tenant */``). Our actual SQL constants in
+# this repo don't currently embed ``:name``-shaped tokens in literals
+# or comments, so the impact is theoretical. A correct fix is a
+# state-machine tokenizer that respects ``'…'``, ``"…"``, ``--…\n``,
+# ``/*…*/``, and dollar-quoted bodies. Tracked for a future session;
+# if a real SQL constant trips this, switch to the state-machine form.
 _NAMED_PARAM_RE: Final = re.compile(r"(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)\b")
 
 
@@ -81,6 +91,11 @@ def translate_named_to_numbered(sql: str) -> tuple[str, list[str]]:
     The same `:name` always maps to the same `$N` (first-appearance order).
     Returns the rewritten SQL and the ordered list of param names found,
     so callers can report which params the script substituted.
+
+    See module-level comment on ``_NAMED_PARAM_RE`` for the known limitation:
+    this naive regex also rewrites ``:name`` inside SQL string literals
+    and comments. Acceptable for current SQL constants in this repo;
+    upgrade to a state-machine tokenizer when a real query trips it.
     """
     name_to_num: dict[str, int] = {}
     order: list[str] = []
