@@ -107,6 +107,35 @@ class TestParseConsumerEnvelope:
         assert shape.parse_errors == []
         assert shape.required_fields == set()
 
+    def test_extracts_nested_content_block_class_name(self, tmp_path: Path) -> None:
+        # Codex round-4 P1: consumers use different class names for the
+        # nested content model:
+        #   action-item-graph        → ContentPayload
+        #   eq-structured-graph-core → ContentBlock
+        #   eq-interaction-threads   → ContentModel
+        # Without recognizing all three, content validation silently runs
+        # on 1 of 3 consumers — defeating the gate. Pin all three.
+        for class_name in ("ContentPayload", "ContentBlock", "ContentModel"):
+            model = tmp_path / f"{class_name}.py"
+            model.write_text(
+                "from pydantic import BaseModel, Field\n"
+                f"class {class_name}(BaseModel):\n"
+                "    text: str = Field(..., description='REQUIRED')\n"
+                "class EnvelopeV1(BaseModel):\n"
+                "    tenant_id: str\n"
+                f"    content: {class_name} = Field(..., description='REQUIRED')\n"
+            )
+            reg = ConsumerRegistration(
+                name=class_name,
+                repo_path=tmp_path,
+                envelope_model_path=f"{class_name}.py",
+                rule_name="r",
+            )
+            shape = parse_consumer_envelope(reg)
+            assert shape.required_content_fields == {"text"}, (
+                f"content validation failed for class name {class_name!r}"
+            )
+
     def test_extracts_nested_content_payload_and_format(self, tmp_path: Path) -> None:
         # Codex round-2 P2: action-item-graph constrains content via a
         # nested ContentPayload model + ContentFormat enum. AST scan
@@ -286,6 +315,20 @@ class TestValidation:
         result = validate_against_consumer(envelope, shape)
         assert not result.accepted
         assert any("content must be an object" in f for f in result.findings)
+
+    def test_null_required_top_level_field_rejected(self) -> None:
+        # Codex round-4 P2: top-level required fields must also be
+        # non-null. Producer regression like envelope.tenant_id=None
+        # would pass the key-presence check but fail Pydantic.
+        shape = ConsumerEnvelopeShape(
+            consumer="strict",
+            required_fields={"tenant_id", "user_id"},
+        )
+        envelope = {"tenant_id": None, "user_id": "u"}
+        result = validate_against_consumer(envelope, shape)
+        assert not result.accepted
+        assert any("required fields are null" in f and "tenant_id" in f
+                   for f in result.findings)
 
     def test_null_required_content_field_rejected(self) -> None:
         # Codex round-3 P2: ``content={"text": null}`` was accepted as

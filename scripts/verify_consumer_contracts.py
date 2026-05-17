@@ -101,6 +101,16 @@ KNOWN_UNMAPPED_RULES: Final = frozenset({
 })
 
 
+# Class names consumers use for the nested ``EnvelopeV1.content`` model.
+# Round-4 P1 fix (2026-05-17): previously hardcoded to "ContentPayload",
+# which silently skipped content validation for 2 of 3 live consumers.
+_CONTENT_MODEL_CLASS_NAMES: Final = frozenset({
+    "ContentPayload",  # action-item-graph
+    "ContentBlock",    # eq-structured-graph-core
+    "ContentModel",    # eq-interaction-threads
+})
+
+
 # ---------------------------------------------------------------------------
 # Static analysis: parse consumer envelope.py via AST (no runtime import)
 # ---------------------------------------------------------------------------
@@ -222,11 +232,17 @@ def parse_consumer_envelope(consumer: ConsumerRegistration) -> ConsumerEnvelopeS
         elif node.name == "ContentFormat":
             # str-enum on action-item-graph: PLAIN/MARKDOWN/DIARIZED/EMAIL.
             shape.content_format_enum = _extract_str_enum_values(node)
-        elif node.name == "ContentPayload":
-            # Nested model on action-item-graph for the envelope's `content`
-            # field. Catches producer changes like content.text=None or a
-            # bogus content.format that would pass the top-level required-
-            # field check but fail Pydantic at parse time.
+        elif node.name in _CONTENT_MODEL_CLASS_NAMES:
+            # Nested model for the envelope's ``content`` field. Consumers
+            # name this differently:
+            #   action-item-graph        → ContentPayload
+            #   eq-structured-graph-core → ContentBlock
+            #   eq-interaction-threads   → ContentModel
+            # Round-4 P1 (2026-05-17): without this set, content validation
+            # silently ran on 1 of 3 consumers — defeating the gate.
+            # Catches producer changes like content.text=None or a bogus
+            # content.format that would pass the top-level required-field
+            # check but fail Pydantic at parse time.
             shape.required_content_fields = set()
             for item in node.body:
                 if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
@@ -436,6 +452,20 @@ def validate_against_consumer(
         result.findings.append(
             f"missing required fields: {sorted(missing_required)}"
         )
+    # Round-4 P2: required top-level fields must also be non-null.
+    # The Pydantic models declare these as non-Optional types (e.g.
+    # ``tenant_id: UUID = Field(...)``), so envelope[k] = None would
+    # be rejected at parse time. Same logic we already apply to the
+    # nested content fields.
+    null_required = {
+        k for k in shape.required_fields
+        if k in envelope and envelope[k] is None
+    }
+    if null_required:
+        result.accepted = False
+        result.findings.append(
+            f"required fields are null: {sorted(null_required)}"
+        )
 
     # Nested content validation: only when the consumer declares a
     # ContentPayload-style model (loose consumers skip this check).
@@ -500,7 +530,15 @@ def probe_eventbridge_rules() -> tuple[list[dict], str | None]:
             "events",
             region_name=os.getenv("AWS_REGION", "us-east-1"),
         )
-        all_rules = client.list_rules(EventBusName="default").get("Rules", [])
+        # Round-4 P3 fix: ListRules is paginated. We page through all
+        # results so a later rule (or detail-type filter) on page 2+ can't
+        # silently be missed. Our default bus today has ~12 rules, well
+        # within a single page, but pagination future-proofs the gate
+        # without meaningful cost.
+        all_rules: list[dict] = []
+        paginator = client.get_paginator("list_rules")
+        for page in paginator.paginate(EventBusName="default"):
+            all_rules.extend(page.get("Rules", []))
     except Exception as exc:  # noqa: BLE001 — surface any AWS error verbatim
         return [], f"AWS probe failed: {type(exc).__name__}: {exc}"
 
