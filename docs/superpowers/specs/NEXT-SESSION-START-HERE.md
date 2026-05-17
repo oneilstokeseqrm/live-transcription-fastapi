@@ -16,6 +16,31 @@ After Phase 1.5: explicit stopping point for comprehensive re-planning before Ph
 
 ---
 
+## Production credentials + IDs (load-bearing reference)
+
+Locked across the initiative. Re-stated here so the prompt is self-contained:
+
+- **Neon Postgres (eq-dev):** project `super-glitter-11265514`, branch `production`, database `neondb`. Direct connection (no `-pooler`) for `DBOS_SYSTEM_DATABASE_URL`.
+- **Test tenant:** `11111111-1111-4111-8111-111111111111` (column is `tenants.id`). All data under this tenant is test data.
+- **Test user (FK target for `pending_account_mappings.owner_user_id`):** `b0000000-0000-4000-8000-000000000002`.
+- **Railway FastAPI service:** project `inspiring-upliftment` (`847cfa5a-b77c-4fb0-95e4-b20e8773c23e`), service `59a69f3d-9a24-4041-942a-891c4a81c5fb`, env `e4c5ec15-1931-4632-9e58-92d9c6be4261`, URL `https://live-transcription-fastapi-production.up.railway.app`.
+- **Railway eq-agent-action-core:** URL `https://eq-agent-action-core-production.up.railway.app`, service `3036ea0f-afc9-4bc4-889d-c98617d81e96`.
+- **Internal JWT:** HS256, `INTERNAL_JWT_SECRET`, `iss=eq-frontend`, `aud=eq-backend`, claims: `tenant_id`, `user_id`, optional `pg_user_id`.
+- **AWS:** EventBridge bus `default` (configurable via `EVENTBRIDGE_BUS_NAME`); `AWS_REGION=us-east-1`; access keys in Railway env.
+- **Neo4j:** Aura instance `c6171c63`, URI `neo4j+s://c6171c63.databases.neo4j.io`. Shared across graph services.
+
+## ⚠️ Test tenant state at session end
+
+The shared test tenant `11111111-1111-4111-8111-111111111111` is **EMPTY** at the end of the PR #17 session. The session ran multiple destructive ops:
+- A one-shot 8-DELETE FK-chain cleanup (mid-session, after test data accumulated)
+- Multiple `RUN_DESTRUCTIVE_TESTS=1` pytest runs (each fires conftest teardown after every DB-touching test → deletes accounts → opportunities CASCADE-delete)
+
+User flagged this at session end as "cleaned my account and opportunities again." Acknowledged. The lesson: the `requires_db_write` marker prevents accidental writes by *other* agents but doesn't prevent *me* from wiping the user's own seed data when I knowingly opt in. **Going forward (LOCKED 2026-05-17):** ask the user PER ACTION before destructive ops on the shared test tenant, including before each batch of `RUN_DESTRUCTIVE_TESTS=1` runs. Env-var gating is necessary but not sufficient.
+
+If the user has re-seeded data between sessions, treat it as live — do not run destructive cleanup or DB-write tests without explicit confirmation.
+
+---
+
 ## Pre-flight (one-time, before any work)
 
 1. **`/context-restore`** — should load the checkpoint
@@ -134,14 +159,29 @@ Coordinated Prisma migration in eq-frontend. The outbox is dead code (no writers
 
 ## Decisions that are LOCKED — do NOT re-litigate
 
-16 locked decisions (grew from 14 in PR #17). New entries:
+17 locked decisions (grew from 14 in PR #17 + one more post-session).
 
-15. **SQLAlchemy 2.0.49 bindparam truncation**: `text("WHERE id = :name::uuid")` parses bindname as `name_minus_one_char`. Use `CAST(:name AS uuid)` form everywhere. Confirmed in PR #17.
-16. **Materialization REQUIRES Lane 2 to have written real raw_interactions** before materializing. Placeholder pattern REMOVED. If absent → raise → DBOS retry OR /map returns 503.
+Full list:
 
-Full list 1-14 unchanged from prior session (DBOS substrate, single replica, Path A EventBridge, workflow_id formula, /approve reserves synchronously, drop outbox post-M3, account_domains anchor, extras.contacts, closed interaction_type lookup, opt-in DB tests, DBOS v2.x sync launch/async events-in-steps, websockets 14.2 + compat shim, DBOS_SYSTEM_DATABASE_URL required, Codex review BEFORE merging is the gate).
+1. **Substrate is DBOS.** Locked at D7 of the 2026-05-15 rethink.
+2. **Single Railway replica V1 + `executor_id=RAILWAY_REPLICA_ID`.** Multi-replica-ready by config; orphan-detector deferred to Phase 2.
+3. **EventBridge Path A** (`EnvelopeV1.*` events with `Source=com.yourapp.transcription`).
+4. **Workflow ID** = `f"queue-{queue_id}:approval-{approval_attempt_id}"`.
+5. **`/approve` reserves the row synchronously then enqueues the workflow** via `SetWorkflowID + APPROVAL_QUEUE.enqueue_async`.
+6. **`account_provisioning_outbox` is dropped** post-M3 (M3.5).
+7. **Account creation idempotency anchor** is `account_domains.(tenant_id, domain)`. NOT `accounts.name` (no unique index there).
+8. **Emit `extras.contacts` metadata** per downstream change briefs.
+9. **Closed `INTERACTION_TYPE_TO_DETAIL_TYPE` lookup** (5 entries: transcript / meeting / note / email / batch_upload). Unknown types FAIL LOUD.
+10. **Test infrastructure:** Option B (test-tenant scoping in production Neon) + `@pytest.mark.requires_db_write` opt-in marker + mandatory teardown per test.
+11. **DBOS v2.x API:** sync `DBOS.launch()`/`DBOS.destroy()` at FastAPI lifespan; **async** `get_event_async`/`set_event_async` INSIDE `@DBOS.step` functions (Codex P0 round-4 fix).
+12. **websockets pin 14.2** + deepgram compat shim in `services/deepgram_websockets_compat.py`.
+13. **`DBOS_SYSTEM_DATABASE_URL` is REQUIRED.** `build_dbos_config()` raises if unset.
+14. **Codex review BEFORE merging** is the gate. Soft cap: **4 rounds** before surfacing diminishing-returns trade-off to user. PR #17 hit 6 (user explicitly stopped at 6).
+15. **SQLAlchemy 2.0.49 bindparam truncation** — `text("WHERE id = :name::uuid")` parses bindname as `name_minus_one_char`. Use `CAST(:name AS uuid)` everywhere. (NEW in PR #17.)
+16. **Materialization REQUIRES real `raw_interactions` row** before materializing. Placeholder pattern REMOVED. If absent → raise ValueError → DBOS retry OR `/map` 503. (NEW in PR #17.)
+17. **Per-action confirmation for destructive ops on shared test tenant.** Env-var gating (`RUN_DESTRUCTIVE_TESTS=1`) is necessary but not sufficient — the marker prevents accidental writes by other agents but does NOT prevent ME from wiping the user's own seed data. Ask the user PER BATCH of destructive runs. (NEW 2026-05-17 post-PR-#17.)
 
-**Soft cap on Codex rounds:** 4 rounds before surfacing to user. PR #17 hit 6 because we kept finding real bugs each round; the diminishing-returns inflection was around round 5 → user said "stop, ship." Mirror this judgment in M5.
+**Codex 4-round soft cap reasoning:** rounds 1-3 typically catch the real architectural P1s. Rounds 4+ find increasingly narrow edges (P2/P3). PR #17 took 6 rounds because we kept finding genuine bugs (placeholder pattern, batch_upload mapping, async event APIs) but the user surfaced "context is heavy" at round 6. Default to surfacing the trade-off after round 4 — let the user decide whether to keep iterating.
 
 ---
 
@@ -168,29 +208,56 @@ The user is a non-developer founder.
 
 ---
 
-## Verified-contracts discipline (re-probe before writing SQL)
+## Verified-contracts discipline (re-probe before writing SQL or ANY emission code)
 
-Plan §3 contracts were probed 2026-05-15 and re-probed 2026-05-15 PM. PR #17's changes didn't alter the schema; the M2 unique index + the unchanged outbox table are still the dominant state. Before writing M5 SQL: re-probe via `mcp__neon__run_sql` against project `super-glitter-11265514`.
+Plan §3 contracts were probed 2026-05-15 + re-probed 2026-05-15 PM + verified-unchanged 2026-05-17 (PR #17). For M5 you re-probe AGAIN before writing — discipline is non-substitutable per `tasks/lessons.md` "Cross-service contract verification at design time."
 
-For M5 specifically:
-- Re-fetch `https://eq-agent-action-core-production.up.railway.app/openapi.json` for verify_consumer_contracts.py's validation rules
-- Re-list EventBridge rules via `mcp__aws-api__call_aws` for the same purpose
-- Read the latest action-item-graph + eq-structured-graph-core Pydantic models for downstream validation
+**Tables to re-probe via `mcp__neon__run_sql` (project `super-glitter-11265514`, branch `production`, database `neondb`):**
+
+| Table | Why M5 cares |
+|---|---|
+| `pending_account_mappings` | verify_schema.py target; queue lifecycle columns |
+| `pending_account_mapping_signals` | M5 emit-fix may pull source_type for downstream type mapping |
+| `accounts` | verify_schema.py probes this; FK target for many things |
+| `account_domains` | UNIQUE INDEX `(tenant_id, domain)` is the canonical idempotency anchor (LOCKED decision 7) |
+| `contacts` | verify_schema.py target |
+| `raw_interactions` | M5 P1 fix candidate: confirm whether `raw_text` column exists and how it's populated (currently NULL per intelligence_service.py) |
+| `interaction_summaries` | UNIQUE INDEX `interaction_summaries_interaction_id_key`; potential source of `content.text` for M5 backfill fix |
+| `interaction_contact_links` | M2 UNIQUE INDEX `(interaction_id, contact_id)` MUST still be live |
+| `interaction_account_links` | tenant-less link table; teardown chain dependency |
+| `account_provisioning_outbox` | M3.5 drop target; confirm still present |
+
+**External contracts to re-probe:**
+
+- `https://eq-agent-action-core-production.up.railway.app/openapi.json` — for verify_consumer_contracts.py validation rules + `AccountProfile` schema (still missing per plan §10.1; coordinate or treat the M3 contract-pinning test as the load-bearing definition)
+- EventBridge rules via `mcp__aws-api__call_aws "aws events list-rules --event-bus-name default"`. The two live rules to verify unchanged are `action-item-graph-rule` and `eq-structured-graph-rule`. BOTH filter on `source: ["com.yourapp.transcription", "com.eq.email-pipeline"]` + `detail-type: ["EnvelopeV1.transcript", "EnvelopeV1.note", "EnvelopeV1.meeting", "EnvelopeV1.email"]`. Plan §3.3 documented; PR #17's INTERACTION_TYPE_TO_DETAIL_TYPE depends on this.
+- Consumer Pydantic models:
+  - `action-item-graph/src/action_item_graph/models/envelope.py:34-43` (SourceType enum — `zoom`+`generic` were missing 2026-05-15; in-flight fix by that repo's agent — independent of M5)
+  - `eq-structured-graph-core/app/models/envelope.py:23-42` (EnvelopeV1; loose `source: str`, no enum constraint)
+
+If ANY of these contracts has drifted from what PR #17's code assumes, that's a P0 finding for M5 — fix before merging.
 
 ---
 
-## Stop conditions
+## Stop conditions — STOP and surface to user if ANY fire
 
-Stop and surface to the user if:
+**Hard stops (do NOT proceed without user OK):**
 
-- `/context-restore` returns NO_CHECKPOINTS or the wrong checkpoint.
-- MEMORY.md status string isn't `PHASE_1.5_M3_M4_SHIPPED_M5_NEXT`.
-- PR #17 has unmerged conflicts or new Codex findings.
-- Production deploy from PR #17 merge FAILED or shows errors in logs.
-- Canary fails or shows unexpected behavior.
-- The empty-content.text fix decision needs your input on approach (a/b/c).
-- More than 4 Codex rounds during M5 without a clean pass.
-- You discover NEW evidence that any of the 16 LOCKED decisions needs reconsideration.
+- `/context-restore` returns NO_CHECKPOINTS or wrong checkpoint
+- MEMORY.md status string isn't `PHASE_1.5_M3_M4_SHIPPED_M5_NEXT`
+- **Codex review on the M5 PR substantively disagrees with the plan in a way the plan didn't anticipate.** This is how M1-hotfix's 2 P1s were caught + M3+M4's 6-round cycle surfaced real bugs. Treat new contract-drift findings as P0 even if Codex marks them lower.
+- Production deploy from PR #17 merge FAILED or DBOS launch banner missing from logs
+- Canary fails or shows unexpected behavior (likely indicates design gap, not bug — surface)
+- More than **4 Codex rounds** during M5 without P1-clean — surface the diminishing-returns trade-off
+- You discover NEW evidence that any of the **16 LOCKED decisions** needs reconsideration
+- **Empty-content.text fix decision** (the round-6 P1 deferred from PR #17): three approaches in scope (pull from interaction_summaries / add `is_backfill` flag + downstream coord / accept limitation). Surface options before picking — strategic decision.
+- **ANY destructive op on the shared test tenant.** Not just "check the ls"; surface to the user *per action* if you suspect the user has seed data in the tenant. The PR #17 session ran multiple destructive cleanups + tests that wiped test-tenant accounts/contacts/opportunities. User flagged this 2026-05-17. New rule: per-action confirmation, not just env-var gating.
+
+**Soft signals (consider surfacing):**
+
+- PR #17 has unmerged conflicts (likely benign — rebase + resolve)
+- Codex round 1-3 with progressive narrowing (normal; keep going)
+- Plan §3 contract probe shows minor drift (note in plan §20; continue)
 
 ---
 

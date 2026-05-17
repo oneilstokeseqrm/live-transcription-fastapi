@@ -176,15 +176,39 @@ Before doing anything else, follow these steps IN ORDER:
      about ship-vs-keep-iterating. The user explicitly stopped the
      prior session at round 6 because diminishing returns.
 
-9. SHARED-INFRASTRUCTURE-COLLISION PROTOCOL (LOCKED 2026-05-16)
+9. SHARED-INFRASTRUCTURE-COLLISION PROTOCOL (LOCKED 2026-05-16,
+   STRENGTHENED 2026-05-17)
+
+   Two layers of protection:
+
+   Layer 1 — Other agents:
    - Before ANY destructive SQL on production Neon test tenant:
      `ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl | head`
      Files modified in last hour = hazard. Pause + ask user.
-   - DB-touching tests are opt-in via RUN_DESTRUCTIVE_TESTS=1. Set
-     it only after the check. Default pytest run skips them.
    - The `eq-synthetic-date-generation` agent had an active inject
-     during the prior session that was wiped by the test teardown.
-     This rule prevents a recurrence.
+     during the 2026-05-16 session that was wiped by the test
+     teardown. This rule prevents a recurrence.
+
+   Layer 2 — The user's own seed data:
+   - The PR #17 session ran `RUN_DESTRUCTIVE_TESTS=1` pytest
+     multiple times AND a one-shot 8-DELETE cleanup. Each run
+     wiped accounts under the test tenant → opportunities + other
+     dependents CASCADE-deleted. User said 2026-05-17: "you
+     cleaned my account and opportunities again. You weren't
+     supposed to do that."
+   - LOCKED decision 17: **ask the user PER BATCH** of destructive
+     runs, not just per-session. The env-var gate is necessary
+     but not sufficient. Examples requiring confirmation:
+       - Running `RUN_DESTRUCTIVE_TESTS=1 pytest` (the teardown wipes data)
+       - Running an ad-hoc DELETE cleanup
+       - Running any tool that triggers `mcp__neon__run_sql` with
+         a DELETE/UPDATE/TRUNCATE statement
+       - The production canary (Step 2 of this session) — seed +
+         teardown both require confirmation
+
+   The TEST TENANT IS EMPTY AT START OF THIS SESSION (per the
+   PR #17 checkpoint). If the user re-seeded data between sessions,
+   treat as live data — do not touch without explicit confirmation.
 
 10. After M5 deploys, run /context-save and update
     `docs/superpowers/specs/NEXT-SESSION-START-HERE.md` +
@@ -193,9 +217,9 @@ Before doing anything else, follow these steps IN ORDER:
 
 ANTI-ANCHORING
 
-The plan has 16 LOCKED decisions (grew from 14 in PR #17). Do NOT
-re-litigate unless you find NEW evidence contradicting the prior
-rationale. Key items:
+The plan has 17 LOCKED decisions (grew from 14 in PR #17 + 1 added
+post-session 2026-05-17). Do NOT re-litigate unless you find NEW
+evidence contradicting the prior rationale. The 17 items:
 
 (1) Substrate is DBOS.
 (2) Single replica V1 + executor_id-from-RAILWAY_REPLICA_ID.
@@ -205,23 +229,105 @@ rationale. Key items:
 (6) Drop account_provisioning_outbox post-M3 (M3.5).
 (7) account_domains as idempotency anchor.
 (8) Emit extras.contacts metadata.
-(9) Closed INTERACTION_TYPE_TO_DETAIL_TYPE lookup (now 5 entries,
-    includes batch_upload).
-(10) Test infrastructure: RUN_DESTRUCTIVE_TESTS=1 opt-in + shared-
-     infrastructure collision protocol.
+(9) Closed INTERACTION_TYPE_TO_DETAIL_TYPE lookup (5 entries:
+    transcript / meeting / note / email / batch_upload).
+(10) Test infrastructure: Option B + @pytest.mark.requires_db_write
+     opt-in + mandatory teardown per test.
 (11) DBOS v2.x sync launch()/destroy() AT FastAPI lifespan;
-     get_event_async/set_event_async INSIDE async @DBOS.step
-     functions.
+     get_event_async/set_event_async INSIDE async @DBOS.step.
 (12) websockets pin 14.2 + deepgram compat shim.
 (13) DBOS_SYSTEM_DATABASE_URL is REQUIRED.
-(14) Codex review BEFORE merging is the gate. 4-round soft cap on
-     iterations before surfacing to user.
-(15) **NEW**: SQLAlchemy 2.0.49 truncates `:name::uuid` bindparam
-     to `:name_minus_last_char`. Use `CAST(:name AS uuid)` form.
-(16) **NEW**: Materialization REQUIRES Lane 2 to have written the
-     real raw_interactions row before materializing. Placeholder
-     pattern removed. If absent → raise ValueError → DBOS retry
-     OR 503 on /map.
+(14) Codex review BEFORE merging is the gate. **4-round soft cap**
+     on iterations before surfacing diminishing-returns to user.
+(15) SQLAlchemy 2.0.49 truncates `:name::uuid` bindparam to
+     `:name_minus_last_char`. Use `CAST(:name AS uuid)` form.
+(16) Materialization REQUIRES real raw_interactions row before
+     materializing. Placeholder pattern REMOVED. If absent → raise
+     ValueError → DBOS retry OR /map 503.
+(17) **PER-ACTION confirmation for destructive ops on shared test
+     tenant.** Env-var gating (RUN_DESTRUCTIVE_TESTS=1) is necessary
+     but NOT sufficient — the marker prevents accidental writes by
+     other agents but does NOT prevent ME from wiping the user's
+     own seed data. Ask the user PER BATCH of destructive runs.
+     (NEW 2026-05-17 post-PR-#17; user flagged test-tenant
+     accounts/opportunities were wiped during that session.)
+
+VERIFIED-CONTRACTS DISCIPLINE — RE-PROBE LIST
+
+Plan §3 contracts were probed 2026-05-15 + re-probed 2026-05-15 PM +
+verified-unchanged 2026-05-17 (PR #17). For M5 you re-probe AGAIN
+before writing code — discipline is non-substitutable per
+tasks/lessons.md "Cross-service contract verification at design
+time."
+
+Tables to re-probe via mcp__neon__run_sql (project
+super-glitter-11265514, branch production, database neondb):
+
+| Table | Why M5 cares |
+|---|---|
+| pending_account_mappings | verify_schema.py target |
+| pending_account_mapping_signals | M5 emit-fix may pull source_type |
+| accounts | verify_schema.py probes this |
+| account_domains | UNIQUE INDEX (tenant_id, domain) — LOCKED 7 |
+| contacts | verify_schema.py target |
+| raw_interactions | M5 P1 candidate: confirm raw_text column exists + how populated (currently NULL per intelligence_service.py) |
+| interaction_summaries | UNIQUE INDEX (interaction_id); potential source for M5 backfill content fix |
+| interaction_contact_links | M2 UNIQUE INDEX (interaction_id, contact_id) MUST still be live |
+| interaction_account_links | tenant-less link table; teardown chain dependency |
+| account_provisioning_outbox | M3.5 drop target; confirm still present |
+
+External contracts to re-probe:
+
+- https://eq-agent-action-core-production.up.railway.app/openapi.json
+  — for verify_consumer_contracts.py + AccountProfile schema
+  (still missing per plan §10.1)
+- EventBridge rules via mcp__aws-api__call_aws:
+  `aws events list-rules --event-bus-name default`
+  Two live rules: action-item-graph-rule + eq-structured-graph-rule.
+  Both filter on source ["com.yourapp.transcription",
+  "com.eq.email-pipeline"] + detail-type ["EnvelopeV1.transcript",
+  "EnvelopeV1.note", "EnvelopeV1.meeting", "EnvelopeV1.email"].
+- Consumer Pydantic models in sibling repos:
+  - action-item-graph/src/action_item_graph/models/envelope.py:34-43
+    (SourceType enum; missing zoom+generic 2026-05-15; that repo's
+    agent is fixing — independent of M5)
+  - eq-structured-graph-core/app/models/envelope.py:23-42
+    (loose source: str, no enum constraint)
+
+If ANY drift from PR #17's assumptions, that's a P0 finding for M5
+— fix BEFORE merging.
+
+PRODUCTION CREDENTIALS + IDS (load-bearing reference)
+
+Restated here so the prompt is self-contained:
+
+- Neon Postgres (eq-dev): project super-glitter-11265514, branch
+  production, database neondb. Direct connection (no -pooler) for
+  DBOS_SYSTEM_DATABASE_URL.
+- Test tenant: 11111111-1111-4111-8111-111111111111. ALL DATA
+  UNDER THIS TENANT IS TEST DATA. See LOCKED decision 17 before
+  any destructive op.
+- Test user (FK target for owner_user_id):
+  b0000000-0000-4000-8000-000000000002.
+- Railway FastAPI: project 847cfa5a-b77c-4fb0-95e4-b20e8773c23e,
+  service 59a69f3d-9a24-4041-942a-891c4a81c5fb,
+  env e4c5ec15-1931-4632-9e58-92d9c6be4261,
+  URL https://live-transcription-fastapi-production.up.railway.app.
+- Railway eq-agent-action-core:
+  URL https://eq-agent-action-core-production.up.railway.app,
+  service 3036ea0f-afc9-4bc4-889d-c98617d81e96.
+- Internal JWT: HS256, INTERNAL_JWT_SECRET, iss=eq-frontend,
+  aud=eq-backend, claims: tenant_id, user_id, optional pg_user_id.
+- AWS: EventBridge bus 'default' (EVENTBRIDGE_BUS_NAME);
+  AWS_REGION=us-east-1; keys in Railway env.
+- Neo4j: Aura instance c6171c63, neo4j+s://c6171c63.databases.neo4j.io.
+
+TEST TENANT STATE AT THIS SESSION START
+
+EMPTY as of PR #17 session end (per the checkpoint). The PR #17
+session ran multiple destructive ops. If the user has re-seeded
+data between sessions, treat as live — do NOT touch without
+explicit confirmation per LOCKED decision 17.
 
 USER POSTURE (load-bearing)
 
