@@ -225,3 +225,28 @@ async def test_account_profile_tolerates_extra_fields():
     # Extra fields preserved via model_dump (forward-compat).
     dumped = profile.model_dump()
     assert dumped.get("run_id") == "abc-123"
+
+
+def test_default_timeout_accommodates_observed_worst_case_agent_latency():
+    """Lock-in that the default HTTP timeout exceeds observed agent latency.
+
+    M5 E2E (2026-05-18) caught the workflow hanging at function 3
+    (`call_agent_enrich`) because the agent took ~145s on a sparse-web
+    synthetic domain (`cold-prospect-{uuid}.com`) while httpx defaulted to
+    120s. The agent completed and side-effected an `accounts` row, but
+    the workflow never received the response and retried in a loop.
+
+    The 240s floor here gives 95s of headroom over the observed 145s
+    worst case so future agent slowdowns surface as a test failure
+    instead of a silent retry-loop. If the agent's expected latency
+    budget changes, this floor should change with it — DO NOT lower this
+    floor without first widening it on the agent side.
+    """
+    from services.agent_action_core_client import _DEFAULT_TIMEOUT_SECONDS
+
+    assert _DEFAULT_TIMEOUT_SECONDS >= 240.0, (
+        f"_DEFAULT_TIMEOUT_SECONDS={_DEFAULT_TIMEOUT_SECONDS}s is below the "
+        "240s floor required to accommodate observed sparse-web enrichment "
+        "latency (~145s). See tasks/lessons.md 'Synthetic test domains "
+        "stress agent enrichment latency budgets' (2026-05-18)."
+    )

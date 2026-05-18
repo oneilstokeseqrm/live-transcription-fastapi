@@ -40,7 +40,16 @@ from services.account_provisioning.types import (
 )
 
 
-_DEFAULT_TIMEOUT_SECONDS = 120.0
+# Worst-case agent latency observed on sparse-web synthetic domains (M5 E2E,
+# 2026-05-18): 145s for `cold-prospect-{uuid}.com`. Real customer domains
+# with rich web presence enrich in 30-90s, but stealth-mode / new-company /
+# low-web-presence prospects can stretch toward the 120-150s range as the
+# agent retries Tavily searches with progressively broader queries. 300s
+# gives headroom for those cases without masking genuine hangs (DBOS retry
+# policy still bounds total time at max_attempts × interval × backoff).
+# See tasks/lessons.md "Synthetic test domains stress agent enrichment
+# latency budgets" for the full diagnosis.
+_DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
 class AgentActionCoreClient:
