@@ -1,295 +1,241 @@
 # Next Session — Start Here
 
 **Project:** Contact Quality and Account-Anchoring Initiative — multi-phase data-quality foundation for an AI-native customer intelligence platform.
-**Last session:** 2026-05-18 (M4 of the Phase-1-email-pipeline cold-inbound fix shipped, merged, AND deployed to production; orchestrator branches cold-inbound from unknown business → `pending_interactions`; atomic `upsert_thread` rewrite closes the SELECT-then-UPSERT race; 2 Codex review rounds with R2 CLEAN).
-**Status:** ✅ **PHASE_1_EMAIL_PIPELINE_M1_M2_M3_M4_DEPLOYED_M5_NEXT** — the end-to-end cold-inbound pipeline is **BUILT, DEPLOYED, AND LIVE.** The very next cold-inbound from an unknown business sender to a connected mailbox WILL trigger: `orchestrator §4.2 → pending_interactions row + queue entry + signals → admin /approve → workflow promotes → EmailPromoted fires → M3 subscriber runs Neo4j + Pinecone + summary enrichment.` M5 (production E2E + rollback drill) is the verification milestone that signs off the whole Phase-1-email-pipeline initiative.
+**Last session:** 2026-05-18 (M5 verification ran — empirically validated M4's deliverable (cold-inbound capture via orchestrator §4.2) through plan §10.3 Steps 1-4; shipped M5.1 ON-CONFLICT fix (PR #11, merged as `79862b6`); Steps 5-7 blocked by httpx-timeout bug discovered downstream of M4 — queued as M5.2).
+**Status:** ⚠️ **PHASE_1_EMAIL_PIPELINE_M4_VERIFIED_M5.1_SHIPPED_M5.2_NEXT** — M4's switch-flipped deliverable is empirically verified end-to-end on the orchestrator side. M5.1 hardened the signal-flush path (one-line `ON CONFLICT` SQL fix to resolve a latent Phase-1 bug exposed by M4's reachability change). Three downstream bugs (one defense-in-depth, two real production) queued as M5.2 — M5.2 gates Phase 2 planning per the user's "complete Phase 1 before next" rule.
 
 ---
 
 ## SESSION SCOPE FOR THE NEXT SESSION
 
-**This session is M5 — production E2E + rollback drill per plan §10.3 + §10.4 + §11 acceptance verification.** The work is verification + lock-in, not new code (unless an E2E reveals a bug, in which case scope expands to that fix).
+**This session is M5.2 — ship three bug fixes, then complete M5 verification (Steps 5-12 + §11 invariants).**
 
-Recommended scope: **M5 alone.** No new feature work beyond the verification milestone. If E2E surfaces a real bug, scope expands to fix + re-verify; if E2E surfaces a known limitation (5 acknowledged V1 limitations), document and accept.
-
----
-
-## CRITICAL — what already shipped + verified deployed
-
-| Milestone | Shipped | PR | Merge SHA | Deploy verification |
+| # | Bug | Severity | Where it lives | Fix shape |
 |---|---|---|---|---|
-| Phase 1 — account-anchor contract end-to-end | ✅ 2026-05-14 | PR #10/#11 | (legacy) | (legacy) |
-| M0-M2 (DBOS + Prisma) — Phase 1.5 | ✅ 2026-05-15 | PR #14/#15 + eq-frontend PR #373 | (legacy) | (legacy) |
-| M3 + M4 — workflow + /approve cutover (DBOS) | ✅ 2026-05-17 AM | PR #17 | `ae45737` | (legacy) |
-| M5 — verified-contract tooling | ✅ 2026-05-17 PM | PR #18 | `95f9084` | (legacy) |
-| Phase-1-email-pipeline M1 | ✅ 2026-05-17 evening | eq-frontend PR #392 | **`de586bbc`** | Vercel: Prisma migrate deploy applied; Neon schema verified |
-| Phase-1-email-pipeline M2 | ✅ 2026-05-17 evening | live-transcription-fastapi PR #19 | **`756575d7`** | Railway deployment `809679fc` SUCCESS; /health 200 |
-| Phase-1-email-pipeline M3 | ✅ 2026-05-18 morning | eq-email-pipeline PR #9 | **`85c0295`** | Railway deployment `5c013fd3` SUCCESS; /api/health 200; subscriber long-polling SQS |
-| **Phase-1-email-pipeline M4** | **✅ 2026-05-18 evening** | eq-email-pipeline PR #10 | **`6fa181a`** | **Railway deployment `756b96e4` SUCCESS; /api/health 200 with all 3 checks ok; switch FLIPPED on cold-inbound capture** |
-| **Phase-1-email-pipeline M5** | ⏳ **NEXT (this session)** | — | — | — |
+| 1 | `agent_action_core_client` httpx 120s timeout < agent's observed 145s on sparse-web domains | **Medium-High** (real prod impact: cold-outreach prospects from low-web-presence companies stick in `status='creating'`) | `live-transcription-fastapi/services/agent_action_core_client.py:43` | Bump `_DEFAULT_TIMEOUT_SECONDS` to 300.0; OR use stream/poll mode if agent supports it |
+| 2 | `pending_account_approval` missing from `_INGEST_SUCCESS_STATUSES` | Low (synthetic-injection HTTP wrapper only; production webhook paths unaffected) | `eq-email-pipeline/src/api/routes.py:540` | One-line: add `'pending_account_approval'` to the `frozenset` |
+| 3 | `pending_signal_dedup` NULL-DISTINCT semantics doesn't dedupe email signals | Low (defense-in-depth gap; orchestrator's `email_exists` is the actual sequential-dup guard) | eq-frontend Prisma `@@unique` on `PendingAccountMappingSignal` → add `nullsNotDistinct: true` (Prisma 5.7+, Postgres 15+) | Coordinated Prisma migration + Vercel deploy + verify Neon |
 
-### Production state verified end-of-prior-session (2026-05-18)
+Recommended sequencing: **bug #1 first** (highest impact, smallest blast radius — single file in live-transcription-fastapi); then **bug #2** (live-transcription-fastapi or eq-email-pipeline depending on actual layering — verify); then **bug #3** (cross-repo Prisma); then **resume M5 E2E** Steps 5-12.
 
-- **Neon Postgres (eq-dev, super-glitter-11265514)**: M1 schema applied. `pending_interactions` table exists. `emails` has `account_provisioning_queue_id`, `local_enrichment_started_at`, `local_enrichment_completed_at`. `interaction_summaries_tenant_id_interaction_id_summary_type_key` UNIQUE exists; old single-column index GONE. Composite FK `interaction_summaries_tenant_id_interaction_id_fkey` exists. `raw_interactions_tenant_id_interaction_id_key` UNIQUE exists. `email_threads_tenant_id_thread_key_key` UNIQUE exists (required for M4 atomic upsert_thread ON CONFLICT inference).
-- **Railway live-transcription-fastapi**: M2 code at `756575d7`; `/health` 200.
-- **Railway eq-email-pipeline**: M4 code at `6fa181a`; deployment `756b96e4` SUCCESS; `/api/ping` 200; `/api/health` 200 with postgres + neo4j + eventbridge all ok.
-- **EMAIL_PROMOTED_QUEUE_URL** set on Railway eq-email-pipeline production env → subscriber's `run_polling()` is active.
-- **AWS resources (account 211125681610, region us-east-1)**: SQS `eq-email-promoted-queue` (300s VT, 14d retention, redrive to DLQ after 5); SQS DLQ; queue policy allowing `events.amazonaws.com SendMessage` from rule; EventBridge rule `route-email-promoted-to-sqs` (Source `com.yourapp.transcription`, DetailType `EmailPromoted`) → SQS target; IAM inline policy `SQSEmailPromotedReader` on `eq-bff-kinesis-writer`.
-- **End-to-end wire test PASSED** during M3 setup; **end-to-end behavior** awaits the first real cold-inbound (which M5 synthesizes).
-
-### What M5 verifies
-
-M5 is the empirical verification that the whole Phase-1-email-pipeline initiative works end-to-end on real data. The 12-step E2E (plan §10.3) walks through:
-
-1. Synthesize cold-inbound email from `test-prospect-{uuid}@cold-prospect-{uuid}.com` to test user. Non-trivial body. processing_tier=full.
-2. POST to eq-email-pipeline synthetic-injection endpoint.
-3. Verify pending state (3a-3f):
-   - `pending_interactions` row exists for the from_email.
-   - `pending_account_mappings` row exists, status='pending'.
-   - `pending_account_mapping_signals` rows exist, interaction_id matches.
-   - NO `raw_interactions`, NO `emails`, NO `interaction_summaries` for the interaction_id.
-4. Test duplicate webhook before approval: re-POST. Verify 1 pending row.
-5. POST `/approve` with queue_id + approval_attempt_id.
-6. Poll `dbos.workflow_status` until status='success'.
-7. Verify promote (7a-7g):
-   - `accounts` row exists, AI-researched.
-   - `pending_interactions` archived with `archive_reason='promoted'`.
-   - `raw_interactions` row exists, account_id=resolved.
-   - `emails` row exists, account_id=resolved, account_provisioning_queue_id=queue_id, thread_id not null.
-   - `interaction_summaries` row exists.
-   - `interaction_contact_links` rows exist.
-   - `email_threads.message_count` = 1 (incremented exactly once).
-8. Wait for EmailPromoted handler to complete (poll on `emails.local_enrichment_completed_at IS NOT NULL`).
-9. Verify enrichment (9a-9d):
-   - Neo4j `Interaction-[:BELONGS_TO]->Account` edge exists.
-   - Neo4j `Interaction.headline` and `Interaction.summary` non-null.
-   - Pinecone fetch by id=preserved interaction_id returns a vector.
-   - `emails.local_enrichment_completed_at` NOT NULL.
-10. Test handler idempotency: re-emit EmailPromoted via boto3. Verify nothing changes.
-11. Verify downstream consumers (11a-11b):
-    - action-item-graph: `action_items WHERE source_interaction_id=preserved_id`.
-    - eq-structured-graph-core: Neo4j MERGE confirmed.
-12. Teardown per LOCKED-11.
-
-Plus plan §10.4 rollback drill (optional but recommended), and plan §11 acceptance invariants checklist (all 22 invariants must hold).
+If context budget is tight, **bug #1 + bug #2 + resume Steps 5-12** is the priority core; bug #3 (NULL semantics) is defensible to split into M5.3.
 
 ---
 
-## Mandatory read order for the next session (~20 min)
+## CRITICAL — what's verified end-to-end (production)
+
+| Plan §10.3 step | Behavior | Status | Evidence |
+|---|---|---|---|
+| Step 1 | Synthesize cold-inbound email | ✓ | `/api/emails/ingest` POST returns orchestrator status |
+| Step 2 | Orchestrator §4.2 BUSINESS path fires | ✓ | Returns `status='pending_account_approval'` (HTTP wrapper currently maps to 500; orchestrator behavior correct) |
+| Step 3a | `pending_interactions` row exists with correct fields | ✓ | Verified for `interaction_id=a8f21189-...` (since cleaned up) |
+| Step 3b | `pending_account_mappings` queue row, status='pending' | ✓ | Verified for `queue_id=3415f8ba-...` (since cleaned up) |
+| Step 3c | `pending_account_mapping_signals` row, interaction_id matches | ✓ | Verified (since cleaned up) |
+| Step 3d-f | NO raw_interactions, NO emails, NO interaction_summaries | ✓ | All 0 rows |
+| Step 4 | Duplicate webhook returns `skipped_duplicate`, only 1 pending row | ✓ | HTTP 200; pending_interactions count unchanged |
+| Step 5 | POST `/approve` returns HTTP 202 + correct workflow_id format | ✓ | `workflow_id = queue-{queue_id}:approval-{attempt_id}` matches LOCKED-4 |
+| Step 6 | DBOS workflow reaches `status='success'` | ❌ BLOCKED | Stuck at function 3 (`call_agent_enrich`) — httpx 120s timeout < agent 145s (M5.2 bug #1) |
+| Steps 7-12 | Promote → enrichment → idempotency → downstream | ⏳ NOT REACHED | Pending M5.2 fix |
+
+**M4's specific deliverable** — "cold-inbound from unknown business sender stores in pending_interactions + queue + signals, dedupes correctly on duplicate webhooks" — IS verified. The /approve → workflow → enrichment chain is downstream and has its own M2-era bugs.
+
+### Production state at end-of-prior-session
+
+- **eq-email-pipeline main HEAD**: `79862b6` (M5.1 merged; Railway deployment `7c15697e` SUCCESS; /api/health 200; all 3 checks ok).
+- **live-transcription-fastapi main HEAD**: `4979cdf` (M5 handoff docs only; M2 code unchanged).
+- **eq-frontend**: unchanged from M1 deploy `de586bbc`.
+- **Test tenant `11111111-...` cleaned**: 0 active pending_interactions, 0 active queue rows from M5 verification artifacts (post-session cleanup per LOCKED-11; CANCELLED workflow row remains in dbos.workflow_status).
+- **Neo4j, Pinecone, EventBridge, SQS**: untouched (Steps 8-12 not reached, so no enrichment writes happened).
+- **`Cold Prospect` account** (`a1f9e717-...` created by agent as side-effect of timed-out enrich): DELETED.
+
+### What M5.2 verifies after the 3 fixes
+
+After M5.2 ships, walk the FULL plan §10.3 (Steps 1-12) on a FRESH synthetic email, then §11 (22 invariants). Phase-1-email-pipeline initiative signs off when:
+- M5.2 fixes merged + deployed
+- Plan §10.3 Steps 1-12 all PASS on a fresh E2E
+- Plan §11 invariants all hold (Schema verified in pre-flight; Code via grep; Behavior via E2E)
+- No new V1 limitations beyond the 5 already documented
+
+---
+
+## Mandatory read order for the next session (~15 min)
 
 1. **This file.**
-2. **The checkpoint** loaded via `/context-restore` (the 2026-05-18 save titled `phase-1-email-pipeline-m4-shipped-m5-next`).
-3. **THE PLAN — §10 + §11**: `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md` (eq-email-pipeline:`033626a`). Focus on:
-   - §10.3 (production E2E — 12 numbered steps; PRIMARY M5 REFERENCE).
-   - §10.4 (rollback drill).
-   - §11 (acceptance invariants — the ship-when-true checklist).
-   - §8 (edge cases) — re-skim before E2E so you recognize variants if they show up.
-4. **The M4 PR** (https://github.com/oneilstokeseqrm/eq-email-pipeline/pull/10) — the comprehensive narrative for what M4 shipped, including the Codex R1 fixes (direction guard, NULL-participants COALESCE, anchor TZ comment).
-5. **M5's verified-contract scripts** at `/Users/peteroneil/EQ-CORE/live-transcription-fastapi/scripts/`:
-   - `verify_schema.py` — run against M4's new SQL constants if any new ones materialize during E2E.
-   - `verify_consumer_contracts.py` — sanity-check the EmailPromoted envelope shape against downstream consumers (action-item-graph + eq-structured-graph-core).
-6. **The full M4 source code** (don't re-read, just know where to look):
-   - `src/persistence/postgres.py:288-381` — atomic upsert_thread (verify it behaves correctly when participant_emails is NULL).
-   - `src/persistence/postgres.py:362-413` — extended email_exists.
-   - `src/persistence/postgres.py:1530+` — module-level persist_pending_interaction.
-   - `src/pipeline/orchestrator.py:200` — interaction_id pre-allocation.
-   - `src/pipeline/orchestrator.py:306-490` — §4.1 + §4.2 block.
+2. **The checkpoint** loaded via `/context-restore` (the 2026-05-18 save titled `phase-1-email-pipeline-m5-partial-m5.2-next`).
+3. **THE PLAN — §10 + §11**: `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md`. Same load-bearing artifact as M5; M5.2 just resumes from Step 5.
+4. **M5.1 merged PR** (https://github.com/oneilstokeseqrm/eq-email-pipeline/pull/11) — the SQL fix narrative, Codex R1+R2 trajectory, NULL-semantics deeper finding.
+5. **New lessons codified end-of-M5-session** (4 entries at the bottom of `tasks/lessons.md`):
+   - "Prisma @@unique materializes as INDEX, not CONSTRAINT — ON CONFLICT must use column-list inference"
+   - "Postgres unique indexes default to NULLS DISTINCT — dedup fails for partial-NULL tuples"
+   - "Synthetic test domains stress agent enrichment latency budgets"
+   - The pre-existing "Postgres array concatenation is NULL-poisoned" + "Scope to plan-explicit framing" (from M4)
 
 ---
 
-## Execution sequence — M5
+## Execution sequence — M5.2
 
-Per plan §10.3 + §10.4 + §11.
+### Pre-flight (run BEFORE any M5.2 work)
 
-### Pre-flight (run BEFORE any M5 work)
+Same 5 pre-flight checks as M5 plus one new check (M5.1 in production):
 
-1. **Production state stable**:
+1. **Production health (both services):**
    ```bash
-   curl -sS -o /dev/null -w "live-fastapi: %{http_code}\n" https://live-transcription-fastapi-production.up.railway.app/health
-   curl -sS -o /dev/null -w "eq-email-pipeline: %{http_code}\n" https://email-pipeline-production.up.railway.app/api/ping
+   curl -sS -o /dev/null -w "live-fastapi: %{http_code}\n" \
+     https://live-transcription-fastapi-production.up.railway.app/health
+   curl -sS -o /dev/null -w "eq-email-pipeline: %{http_code}\n" \
+     https://email-pipeline-production.up.railway.app/api/ping
    curl -sS https://email-pipeline-production.up.railway.app/api/health
-   # Expected all 200; eq-email-pipeline checks all "ok".
    ```
+   Expected: 200 / 200 / status=ok.
 
-2. **M4 code is live**:
+2. **M5.1 code is live on origin/main (NEW):**
    ```bash
    git -C /Users/peteroneil/eq-email-pipeline log --oneline -3
-   # Expected top: 6fa181a M4: orchestrator pending_interactions branch...
+   # Expected top: 79862b6 M5.1: fix ON CONFLICT target for pending_signal_dedup ...
    ```
 
-3. **LOCKED-17 SHARED-TENANT-COLLISION CHECK** (more important for M5 than M4 — M5's E2E writes destructive data):
-   ```bash
-   ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl | head -10
-   ```
-   Any file modified in the last hour = pause + confirm with user. M5 writes to the shared test tenant `11111111-1111-4111-8111-111111111111`; collision with another agent's seed/teardown could be destructive.
+3. **LOCKED-17 collision check.**
+4. **DBOS workflow drain check** (no PENDING/RUNNING).
+5. **Baseline pending_interactions count** (should be 0 active in test tenant after M5 cleanup).
 
-4. **DBOS workflow drain check** (per plan §9 deploy discipline):
-   ```sql
-   SELECT * FROM dbos.workflow_status
-   WHERE status IN ('pending', 'running')
-     AND created_at > NOW() - INTERVAL '1 hour';
-   ```
-   Expected: 0 rows. If non-zero, wait for drain or surface to user.
+### Fix #1 — agent_action_core_client httpx timeout (live-transcription-fastapi)
 
-5. **Pre-existing pending rows in test tenant** (so you know what the baseline is):
-   ```sql
-   SELECT COUNT(*) FROM pending_interactions
-   WHERE tenant_id = '11111111-1111-4111-8111-111111111111'
-     AND archived_at IS NULL;
-   ```
+Branch off main: `fix/m5-2-agent-client-timeout`.
 
-### Step 0 — Choose synthetic email parameters
-
-Generate a fresh UUID-based prospect identity to avoid clashes:
-
+Edit `services/agent_action_core_client.py:43`:
 ```python
-import uuid
-suffix = uuid.uuid4().hex[:12]
-from_email = f"test-prospect-{suffix}@cold-prospect-{suffix}.com"
-to_email = "stokeseqrm@gmail.com"  # or the test user's connected mailbox
-internet_message_id = f"<m5-e2e-{suffix}@cold-prospect-{suffix}.com>"
+# OLD
+_DEFAULT_TIMEOUT_SECONDS = 120.0
+# NEW
+_DEFAULT_TIMEOUT_SECONDS = 300.0  # M5.2: agent observed at 145s on sparse-web domains
 ```
 
-### Step 1-12 — Run plan §10.3 E2E
+Plus consider:
+- A test that asserts the timeout config matches a documented invariant (e.g., "must be ≥ 240s to accommodate observed worst-case agent latency").
+- Surface the configurable env var (`AGENT_HTTPX_TIMEOUT_SECONDS`) for ops tuning.
 
-Walk through the 12 steps in plan §10.3 in order. At each step, capture verification SQL/Neo4j/Pinecone results inline so you have an audit trail if anything breaks.
+Codex review BEFORE merge. Expected: 1 round, CLEAN (it's a one-line change).
 
-Use:
-- `mcp__neon__run_sql` for Postgres verification.
-- `mcp__neo4j_structured__read_neo4j_cypher` for Neo4j verification.
-- `mcp__pinecone-custom__describe-index-stats` + `search-records` for Pinecone verification.
-- `mcp__railway__deployment_logs` for live log streaming during the EmailPromoted handler step.
+Verify post-merge: Railway redeploy SUCCESS + /health 200.
+
+### Fix #2 — _INGEST_SUCCESS_STATUSES adds pending_account_approval (eq-email-pipeline)
+
+Branch off main: `fix/m5-2-ingest-success-pending-status`.
+
+Edit `eq-email-pipeline/src/api/routes.py:540`:
+```python
+# OLD
+_INGEST_SUCCESS_STATUSES = frozenset({
+    "processed",
+    "processed_light",
+    "skipped_duplicate",
+    "skipped_internal",
+    "skipped_internal_irrelevant",
+})
+# NEW (add one entry)
+_INGEST_SUCCESS_STATUSES = frozenset({
+    "processed",
+    "processed_light",
+    "skipped_duplicate",
+    "skipped_internal",
+    "skipped_internal_irrelevant",
+    "pending_account_approval",  # M5.2: orchestrator §4.2 path (M4)
+})
+```
+
+Test: update `tests/test_routes_ingest.py` to add a case where the orchestrator returns `pending_account_approval` → expect HTTP 200.
+
+Codex review BEFORE merge. Expected: 1 round, CLEAN.
+
+### Fix #3 — pending_signal_dedup NULLS NOT DISTINCT (eq-frontend Prisma)
+
+Branch off main in eq-frontend: `fix/m5-2-pending-signal-dedup-nulls-not-distinct`.
+
+Edit `eq-frontend/prisma/schema.prisma` — find `PendingAccountMappingSignal` model:
+```prisma
+// OLD
+@@unique([queueId, contactEmail, sourceType, interactionId, calendarEventId], map: "pending_signal_dedup")
+// NEW (verify Prisma version supports `nullsNotDistinct` — 5.7+)
+@@unique([queueId, contactEmail, sourceType, interactionId, calendarEventId], map: "pending_signal_dedup", nullsNotDistinct: true)
+```
+
+Generate migration: `cd eq-frontend && pnpm prisma migrate dev --name pending_signal_dedup_nulls_not_distinct --create-only`.
+
+Review the generated SQL (should be `DROP INDEX` + `CREATE UNIQUE INDEX ... NULLS NOT DISTINCT`).
+
+Update the M5.1 test in `eq-email-pipeline/tests/test_pending_account_mappings.py`:
+- `test_null_calendar_event_id_does_NOT_dedupe` becomes `test_null_calendar_event_id_DOES_dedupe_after_nulls_not_distinct_migration`.
+- Flip assertion from `n_rows == 2` to `n_rows == 1`.
+- This test will only pass after the eq-frontend migration deploys to production Neon.
+
+Codex review BEFORE merge on eq-frontend. Expected: 1-2 rounds.
+
+Coordinate deploy: eq-frontend merges → Vercel `prisma migrate deploy` → verify Neon schema (pg_indexes shows `NULLS NOT DISTINCT`) → then merge eq-email-pipeline test update.
+
+### Step 5-12 re-run after M5.2 fixes ship
+
+Use a FRESH synthetic UUID (don't reuse `f1c4290c2155`). Walk plan §10.3 Steps 1-12 sequentially. Step 6 should now complete (workflow reaches `status='SUCCESS'`). Steps 7-12 should all PASS.
 
 ### Step 13 — Plan §11 acceptance invariants checklist
 
-Walk every checkbox in plan §11 (the ship-when-true checklist). Pull live values for each `Schema` invariant via Neon MCP. Spot-check `Code` invariants via `grep` (they should all be true post-merge but verify). Walk through `Behavior (E2E)` invariants from the §10.3 results.
+Walk every checkbox. Use the same MCP tools (Neon, Neo4j, Pinecone, Railway).
 
-### Step 14 — (Optional) Plan §10.4 rollback drill
+### Step 14 (optional) — Plan §10.4 rollback drill
 
-Per plan §10.4. Synthetic cold-inbound → store in pending_interactions → revert M4 (`git revert 6fa181a` + push + Railway redeploys old code) → subsequent cold-inbounds drop silently → re-deploy M4 → confirm recovery.
+Same as M5 prompt. Gated on user approval per LOCKED-11.
 
-Recommended only if production has zero real-user traffic (currently true per LOCKED-11 + user's "no production users yet" framing). If user prefers to skip, document as "not exercised; recovery path documented in plan §10.4."
+### Step 15 — Document M5.2 results + new lessons
 
-### Step 15 — Document M5 results
+Update `tasks/lessons.md` if anything new surfaces. Update `MEMORY.md` to reflect M5.2 status.
 
-Update `tasks/lessons.md` with any new lessons surfaced by the E2E. Update `MEMORY.md` to reflect M5 status. Surface any V1 limitations that empirically manifested.
+### Step 16 — Phase-1-email-pipeline initiative SIGN-OFF
 
-### Step 16 — Initiative sign-off
-
-If all §11 invariants hold AND no new P0/P1 bugs, the Phase-1-email-pipeline initiative is COMPLETE. Surface to user with:
-
-- Phase-1-email-pipeline shipped end-to-end (M1 + M2 + M3 + M4 + M5).
-- 21+ LOCKED decisions list.
-- 5 acknowledged V1 limitations + their V2 roadmap items.
-- Phase 2 work as the natural next initiative.
+Same criteria as the M5 prompt. If §11 invariants all hold AND no new P0/P1 bugs, the initiative is COMPLETE. Surface to user. Phase 2 is the natural next initiative (with its own planning session).
 
 ---
 
 ## LOCKED decisions (21 total; do NOT re-litigate)
 
-1. DBOS substrate.
-2. Single Railway replica + `executor_id=RAILWAY_REPLICA_ID`.
-3. EventBridge Path A with `source="com.yourapp.transcription"` and closed `INTERACTION_TYPE_TO_DETAIL_TYPE` lookup.
-4. Workflow ID = `f"queue-{queue_id}:approval-{approval_attempt_id}"`.
-5. `/approve` reserves synchronously then enqueues.
-6. Option B test infrastructure (test-tenant scoping in prod Neon) + `@pytest.mark.requires_db_write` + `RUN_DESTRUCTIVE_TESTS=1`.
-7. **Two hard rules** — no contact / no interaction without account anchor.
-8. SQLAlchemy 2.0.49 `CAST(:name AS uuid)` form.
-9. Materialization REQUIRES Lane 2 raw_interactions before materializing.
-10. Codex review BEFORE merging (4-round soft cap; extendable when real P1s keep surfacing — M2 ran 7, M3 ran 6, **M4 ran 2 (R2 CLEAN)** demonstrating the round-N convergence heuristic).
-11. Per-batch user confirmation for destructive ops on shared test tenant.
-12. Transcripts: frontend forces anchor; emails: backend handles via pending state.
-13. Recipient-as-anchor REJECTED for emails.
-14. Pending-interactions pattern (Approach C).
-15. Lean payload + typed columns for pending_interactions schema.
-16. Path B full reprocess on promote via EventBridge `EmailPromoted` event.
-17. Shared-tenant collision protocol: pre-flight `ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl`.
-18. Codex multi-round: `--commit HEAD` past ~1500 lines; `model_reasoning_effort=medium` default.
-19. SQS-from-EventBridge for the consumer subscription pattern (M3).
-20. DB CAS TTL strictly > SQS VisibilityTimeout (10 min vs 5 min; M3).
-21. `HandlerOutcome` tri-state enum {COMPLETE, PERMANENT_SKIP, TRANSIENT_SKIP} (M3).
+[same 21 as M5 session — see prior NEXT-SESSION-START-HERE or M5 prompt file for full list]
 
-### M4-locked behaviors (descriptive, not new decisions)
-
-- **§4.1 cold-inbound branch scope:** `direction in ("inbound", "internal")` only. Outbound-to-unknown preserves pre-M4 silent-drop fallthrough; outbound capture is a Phase 2 enhancement.
-- **Atomic `upsert_thread`:** single `INSERT ... ON CONFLICT (tenant_id, thread_key) DO UPDATE` statement. Closes the SELECT-then-UPSERT race. Relies on the production UNIQUE index.
-- **`persist_pending_interaction`:** module-level free function taking an asyncpg connection (NOT pool), so it participates in the caller's transaction alongside queue + signal helpers.
-- **`email_exists` UNION:** emails OR active (`archived_at IS NULL`) pending_interactions. Archived (promoted/expired) pending rows do NOT block retries.
+M5.2 doesn't add any new LOCKED decisions; the 3 fixes are bug-corrections within the existing decision frame.
 
 ---
 
 ## Acknowledged V1 limitations (NOT regressions; documented + bounded)
 
-1. **Personal/internal anchor cold-inbound → log+drop.** V2 roadmap: audit log table.
-2. **Neo4j build_skeleton + write_flesh partial-retry corruption.** Bounded by M3 two-layer guard (atomic CAS + 10-min soft TTL > 5-min SQS VT). V2: MERGE patterns + edge-count thread counters.
-3. **`upsert_thread` race** — FIXED in M2 for workflow promote path AND in M4 for orchestrator known-account path via atomic INSERT...ON CONFLICT DO UPDATE.
-4. **Legacy per-signal loop hardcodes `summary_type='meeting'`** for re-pointed email signals (M2 4-pre-1). Cosmetic duplicate; downstream filters by summary_type='email' get the correct link via M2 Step 5 batch.
-5. **`build_skeleton` `CREATE` fallback for missing `internet_message_id`.** Extends V1 limitation #2; same 2-layer guard bound; same V2 roadmap.
+[same 5 as M5 session]
 
-### M4-introduced (none)
-
-M4 added zero new V1 limitations. The §4.1 outbound-not-covered scope is a deliberate Phase 2 boundary, NOT a regression — pre-M4 behavior preserved for outbound.
-
----
-
-## Production credentials + IDs (load-bearing reference)
-
-- **Neon Postgres (eq-dev):** project `super-glitter-11265514`, branch `production`, database `neondb`. Direct connection (no `-pooler`) for `DBOS_SYSTEM_DATABASE_URL`.
-- **Test tenant:** `11111111-1111-4111-8111-111111111111`. All test data. Per LOCKED-11.
-- **Test user (FK target):** `b0000000-0000-4000-8000-000000000002`.
-- **Real stokeseqrm user:** `061ae392-47d5-4f04-9ea8-afa241f23555`.
-- **Railway live-transcription-fastapi:** project `847cfa5a-b77c-4fb0-95e4-b20e8773c23e`, service `59a69f3d-9a24-4041-942a-891c4a81c5fb`, env `e4c5ec15-1931-4632-9e58-92d9c6be4261`. M2 SHA `756575d7` is deployment `809679fc` (SUCCESS).
-- **Railway eq-email-pipeline:** project `f7d26745-7722-4946-aa3f-9dfc3664426f`, service `92d55588-e548-4188-a179-1d3fa9ea38d2`, env `845e3772-e146-439f-b5f5-cbdfcab6087c`, URL `https://email-pipeline-production.up.railway.app`. **M4 SHA `6fa181a` is deployment `756b96e4` (SUCCESS).** EMAIL_PROMOTED_QUEUE_URL set on this service.
-- **Railway eq-agent-action-core:** URL `https://eq-agent-action-core-production.up.railway.app`, service `3036ea0f-afc9-4bc4-889d-c98617d81e96`.
-- **eq-email-pipeline:** `/Users/peteroneil/eq-email-pipeline`. Main HEAD `6fa181a` (post-M4 merge).
-- **eq-frontend:** `/Users/peteroneil/eq-frontend`. M1 merged at `de586bbc`.
-- **AWS** (account `211125681610`, region `us-east-1`): same inventory as M3/M4 sessions — SQS main + DLQ, queue policy, EventBridge rule, IAM principal `eq-bff-kinesis-writer` with `SQSEmailPromotedReader` inline policy.
-- **Neo4j:** Aura `c6171c63`, URI `neo4j+s://c6171c63.databases.neo4j.io`.
-- **Pinecone:** index per env var `PINECONE_INDEX_NAME` (check Railway service variables).
+M5.2 changes don't add new V1 limitations. Bug #3 (NULL-DISTINCT) is removed from the "acknowledged limitation" framing once the migration deploys — it becomes a fixed bug, not a limitation.
 
 ---
 
 ## Stop conditions (hard — surface to user)
 
 - `/context-restore` returns NO_CHECKPOINTS or the wrong checkpoint title.
-- MEMORY.md status isn't `PHASE_1_EMAIL_PIPELINE_M1_M2_M3_M4_DEPLOYED_M5_NEXT`.
+- MEMORY.md status isn't `PHASE_1_EMAIL_PIPELINE_M4_VERIFIED_M5.1_SHIPPED_M5.2_NEXT`.
 - Production /api/health returns non-200 OR any of postgres/neo4j/eventbridge is not "ok".
-- M4 code is not at `6fa181a` on origin/main (M4 may have been reverted).
-- LOCKED-17 collision check shows a concurrent agent in another repo within the last hour AND you're about to run destructive E2E SQL.
-- E2E step fails AT A STEP THAT WORKED IN M2/M3/M4 INTEGRATION TESTS — that's a regression, surface immediately.
-- E2E surfaces a new V1 limitation NOT in the documented list — surface to user before continuing.
-- You're tempted to "fix" a §4.1 outbound corner case during M5 — STOP, that's out of M5 scope (and out of M4 scope per the Phase 2 boundary). Document and continue.
+- M5.1 code is not at `79862b6` on eq-email-pipeline origin/main (someone reverted).
+- LOCKED-17 collision check shows concurrent agent in last hour AND M5.2 about to write destructive SQL.
+- ANY of the 3 fixes introduces test regressions beyond the M4 baseline (459 tests for eq-email-pipeline).
+- M5.2 Step 6 workflow STILL stalls after bug #1 fix deploys — that means there's a 4th bug; surface immediately.
+- A NEW V1 limitation surfaces during Steps 7-12 verification that isn't in the documented 5.
 
 ---
 
-## Open questions deferred to M5
+## Handoff artifacts from the prior session (2026-05-18 end-of-day)
 
-1. **Backfill of historical dropped emails** (plan §14 #6) — confirm during M5 that no backfill is needed (test data only; no real users yet per user posture).
-2. **EmailPromoted DLQ + observability** (plan §14 #5) — operations setup, separate from M5 code scope. M5 should verify the DLQ catches malformed messages but the alerting wiring is post-initiative work.
-3. **Queue UI integration** (plan §14 #7) — `app/(workspace)/agent-queue` may want to surface pending_interactions count. Defer to a separate eq-frontend session.
-
----
-
-## Handoff artifacts from the prior session (2026-05-18 evening)
-
-- **M4 merged**: https://github.com/oneilstokeseqrm/eq-email-pipeline/pull/10 → `6fa181a` (2 Codex rounds; R2 CLEAN; 1 commit of fixes for R1's 3 findings).
-- **M4 deployed**: Railway `756b96e4` SUCCESS; /api/health 200 with all 3 checks ok.
-- **Comprehensive checkpoint**: `~/.gstack/projects/oneilstokeseqrm-live-transcription-fastapi/checkpoints/<timestamp>-phase-1-email-pipeline-m4-shipped-m5-next.md`.
-- **The plan (unchanged)**: `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md` (eq-email-pipeline:`033626a`).
-- **Next-session prompt** (paste-ready): `docs/superpowers/specs/2026-05-19-m5-next-session-prompt.md`.
-- **New lessons codified** in `tasks/lessons.md`: "Postgres array concatenation is NULL-poisoned" + "Scope to plan-explicit framing when Codex flags scope expansion" (both 2026-05-18).
+- **M5.1 merged**: https://github.com/oneilstokeseqrm/eq-email-pipeline/pull/11 → `79862b6` (2 Codex rounds; R2 CLEAN; 1 commit of R1 fixes for NULL-semantics test restructure).
+- **Comprehensive checkpoint**: `~/.gstack/projects/oneilstokeseqrm-live-transcription-fastapi/checkpoints/<timestamp>-phase-1-email-pipeline-m5-partial-m5.2-next.md`.
+- **The plan (unchanged)**: `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md`.
+- **Next-session prompt** (paste-ready): `docs/superpowers/specs/2026-05-19-m52-next-session-prompt.md`.
+- **New lessons codified** in `tasks/lessons.md`: "Prisma @@unique materializes as INDEX", "Postgres NULLS DISTINCT", "Synthetic test domains stress agent latency".
+- **Feedback rule saved**: `memory/feedback_complete_phase_before_next.md` — "Discovered defects from verification get their own follow-up milestone (M5.1, M5.2) that gates the next phase; never 'defer to Phase 2' as a parking lot."
 
 ---
 
-## Phase 2 preview (what comes after the initiative ships)
+## Phase 2 preview (still not Phase 2 scope; gated on M5.2 completion)
 
-These are NOT M5 scope but are the natural follow-ons that the Phase 1 + Phase-1-email-pipeline foundation enables:
+[same as M5 prompt: Neo4j MERGE-everywhere, identity state machine, outbound capture, EmailPromoted DLQ, queue UI]
 
-1. **Neo4j MERGE-everywhere refactor** — replaces V1 limitations #2 + #5. `build_skeleton` becomes truly idempotent via MERGE on `(tenant_id, interaction_id)` fallback; `write_flesh` uses MERGE for Chunk nodes keyed on `(tenant_id, interaction_id, chunk_index)`.
-2. **Personal/internal anchor audit log table** — replaces V1 limitation #1.
-3. **Contacts identity state machine** — shell/emerging/partial/resolved/verified. Symmetric construct to pending_interactions for emails.
-4. **Outbound cold-outreach capture** — extend M4's §4.1 BUSINESS branch to direction=outbound. Tracks the customer's first emails to new prospects in the pending queue for retroactive linking.
-5. **eq-email-pipeline EmailPromoted DLQ wiring + observability** — alerting on stuck messages.
-6. **Queue UI integration** — surface pending_interactions count per queue entry in `app/(workspace)/agent-queue`.
-
-The Phase 2 design doc lives at `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md`; Phase 2 + Phase 3 sections describe the full roadmap.
+Phase 2 PLANNING does not start until M5.2 ships AND M5 §10.3 Steps 1-12 + §11 invariants all PASS.
