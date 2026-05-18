@@ -189,12 +189,44 @@ class AgentActionCoreClient:
             raise AgentEnrichTerminalError(
                 f"Agent response was not a JSON object: type={type(data).__name__}"
             )
+        # M5.3 (2026-05-19): the agent's v2 schema (in production since
+        # 2026-03-04) wraps the enrichment payload under a top-level
+        # `result` key alongside `run_id`, `status`, `metadata`, `account_id`.
+        # `_parse_profile` unwraps the envelope before validating
+        # AccountProfile. The GET /api/enrich/{run_id} endpoint returns the
+        # same envelope shape (eq-agent-action-core enrich_routes.py:160-164),
+        # so both endpoints reuse this parser. The agent's `account_id` is
+        # intentionally ignored — Step 4 `resolve_or_create_account` does
+        # its own idempotent lookup via the shared
+        # `account_domains.(tenant_id, domain)` UNIQUE constraint.
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise AgentEnrichTerminalError(
+                f"Agent response missing 'result' envelope: keys={sorted(data.keys())}"
+            )
+        # M5.3 R1 fold (Codex P2, 2026-05-19): preserve `run_id` across the
+        # envelope unwrap. `call_agent_enrich` (steps.py:298-330) reads
+        # `profile.model_dump().get("run_id")` to cache the enrichment id
+        # via `DBOS.set_event_async`. On a crash window between the agent's
+        # POST succeeding and DBOS checkpointing the step, the retry path
+        # short-circuits via `GET /api/enrich/{run_id}` instead of paying
+        # for a second 30-90s enrich. Pre-M5.3 the flat response carried
+        # `run_id` at top level and AccountProfile's `extra="allow"`
+        # captured it directly. After the unwrap, `run_id` lives one level
+        # up — inject it back into the result dict so the existing
+        # crash-recovery contract keeps working without changing the
+        # call_agent_enrich signature. Defensive: don't overwrite if
+        # `result` ever carries its own `run_id` (future agent change).
+        run_id = data.get("run_id")
+        if run_id is not None and "run_id" not in result:
+            result = {**result, "run_id": run_id}
         try:
-            return AccountProfile.model_validate(data)
+            return AccountProfile.model_validate(result)
         except ValueError as exc:
             # Pydantic raises ValidationError (a subclass of ValueError).
             # The contract-pinning test in tests/contract/ is the load-bearing
-            # guard; if this fires in production it's a real contract drift.
+            # live-drift guard; if this fires in production it's a real
+            # contract drift inside the result envelope.
             raise AgentEnrichTerminalError(
                 f"Agent response did not match AccountProfile contract: {exc}"
             ) from exc

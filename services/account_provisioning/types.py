@@ -69,29 +69,35 @@ class QueueState(BaseModel):
 
 
 class AccountProfile(BaseModel):
-    """Agent enrichment payload (local declaration of the contract).
+    """Agent enrichment payload — v2 schema (in production since 2026-03-04).
 
-    The agent's OpenAPI declares the ``/api/enrich`` response as bare
-    ``{}``; this model is what we EXPECT and assert against via the
-    contract-pinning test. If the agent's response drifts away from this
-    shape, the contract test surfaces it loudly.
+    The agent's ``/api/enrich`` response wraps the enrichment payload
+    under a top-level ``result`` envelope: ``{run_id, status, result: {
+    company_name, website_domain, ...}, metadata, account_id}``. The
+    client's ``_parse_profile`` extracts ``result`` before validating
+    against this model. Field aliases here map the agent's v2 field names
+    to our local semantics so the workflow keeps reading
+    ``profile.name``, ``profile.region``, etc.
 
-    Field set is conservative — the workflow only needs ``name`` and the
-    enrichment fields it stores on ``accounts``. Unknown extra fields are
-    ignored (forward-compat).
+    The contract-pinning test at ``tests/contract/test_agent_enrich_response_shape.py``
+    is the load-bearing live-drift guard (today @needs_internal_jwt-marked;
+    deferred Phase-2 follow-up to make it actually run in CI). Unit-test
+    regression coverage lives in
+    ``tests/unit/account_provisioning/test_agent_client.py``.
 
-    Plan §3.2.
+    Plan §3.2. M5.3 (2026-05-19): added aliases for v2 envelope.
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
-    name: str
-    domain: Optional[str] = None
+    name: str = Field(..., alias="company_name")
+    domain: Optional[str] = Field(default=None, alias="website_domain")
     industry: Optional[str] = None
-    company_size: Optional[str] = None
-    region: Optional[str] = None
-    website: Optional[str] = None
-    description: Optional[str] = None
+    company_size: Optional[str] = Field(default=None, alias="employee_count_range")
+    region: Optional[str] = Field(default=None, alias="headquarters")
+    website: Optional[str] = Field(default=None, alias="website_domain")
+    description: Optional[str] = Field(default=None, alias="one_line_description")
+    company_type: Optional[str] = None
 
 
 class AgentEnrichRun(BaseModel):
