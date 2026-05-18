@@ -315,6 +315,72 @@ async def test_enrich_handles_v2_envelope_shape():
 
 
 @pytest.mark.asyncio
+async def test_envelope_run_id_preserved_for_crash_recovery_replay():
+    """M5.3 R1 fold (Codex P2): ``run_id`` is injected from envelope into
+    the result before AccountProfile validation, so
+    ``call_agent_enrich`` keeps caching it via ``DBOS.set_event_async``
+    for the crash-recovery replay path (``GET /api/enrich/{run_id}``).
+    Without this, every retry would re-issue POST and pay 30-90s of
+    redundant enrich. Plan §6.4 + §15 item 3.
+    """
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "run_id": "abc-123",
+            "status": "completed",
+            "result": {"company_name": "Acme Inc"},
+            "metadata": {"duration_ms": 1000},
+            "account_id": "acc-xyz",
+        })
+
+    transport = httpx.MockTransport(handler)
+    client = AgentActionCoreClient(base_url="http://test.example.com")
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(30))
+
+    try:
+        profile = await client.enrich(url="acme.com", jwt="tok")
+    finally:
+        await client.aclose()
+
+    # The replay-cache contract: profile.model_dump() carries run_id.
+    dumped = profile.model_dump()
+    assert dumped.get("run_id") == "abc-123", (
+        "envelope run_id must be preserved into the profile so "
+        "call_agent_enrich → DBOS.set_event_async caches it for replay"
+    )
+
+
+@pytest.mark.asyncio
+async def test_envelope_run_id_not_overwritten_if_result_carries_one():
+    """Defensive: if the agent ever embeds a ``run_id`` inside ``result``
+    (future contract change), the parser must not overwrite it with the
+    envelope-level value. The ``result.run_id`` wins because it's more
+    specific to the payload.
+    """
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "run_id": "envelope-run",
+            "status": "completed",
+            "result": {
+                "company_name": "Acme Inc",
+                "run_id": "inner-run",
+            },
+        })
+
+    transport = httpx.MockTransport(handler)
+    client = AgentActionCoreClient(base_url="http://test.example.com")
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(30))
+
+    try:
+        profile = await client.enrich(url="acme.com", jwt="tok")
+    finally:
+        await client.aclose()
+
+    assert profile.model_dump().get("run_id") == "inner-run"
+
+
+@pytest.mark.asyncio
 async def test_enrich_rejects_v2_response_missing_result_envelope():
     """If the agent ever drops the ``result`` envelope (returns flat or
     a status-only response), the parser must fail loud rather than

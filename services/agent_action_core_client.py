@@ -204,6 +204,22 @@ class AgentActionCoreClient:
             raise AgentEnrichTerminalError(
                 f"Agent response missing 'result' envelope: keys={sorted(data.keys())}"
             )
+        # M5.3 R1 fold (Codex P2, 2026-05-19): preserve `run_id` across the
+        # envelope unwrap. `call_agent_enrich` (steps.py:298-330) reads
+        # `profile.model_dump().get("run_id")` to cache the enrichment id
+        # via `DBOS.set_event_async`. On a crash window between the agent's
+        # POST succeeding and DBOS checkpointing the step, the retry path
+        # short-circuits via `GET /api/enrich/{run_id}` instead of paying
+        # for a second 30-90s enrich. Pre-M5.3 the flat response carried
+        # `run_id` at top level and AccountProfile's `extra="allow"`
+        # captured it directly. After the unwrap, `run_id` lives one level
+        # up — inject it back into the result dict so the existing
+        # crash-recovery contract keeps working without changing the
+        # call_agent_enrich signature. Defensive: don't overwrite if
+        # `result` ever carries its own `run_id` (future agent change).
+        run_id = data.get("run_id")
+        if run_id is not None and "run_id" not in result:
+            result = {**result, "run_id": run_id}
         try:
             return AccountProfile.model_validate(result)
         except ValueError as exc:
