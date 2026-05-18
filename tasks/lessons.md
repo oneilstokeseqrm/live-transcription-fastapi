@@ -1535,3 +1535,169 @@ This lesson sits next to [[feedback_codex_pre_merge_gate]] and
 [[production-e2e-non-substitutable]]: production E2E surfaced this
 bug too. Mock-based unit tests can't simulate agent latency
 characteristics for synthetic test data.
+
+## Skip-marked contract tests silently lose contract enforcement (2026-05-18)
+
+A contract test that gates its execution on environment state (e.g.,
+`@pytest.mark.skipif(not os.environ.get("X"))`) silently passes when
+the environment isn't configured. In CI the marker fires, the test is
+skipped, CI reports green. Nobody sees the skip; nobody runs the test
+locally because the contract feels "already covered." Over months, the
+upstream service's contract can drift arbitrarily far from what the
+test asserts. When something finally runs the test against production
+(or, more likely, hits production directly and discovers the drift),
+the bug looks brand-new but has been latent the whole time.
+
+### Evidence
+
+Phase-1-email-pipeline M5.2 production E2E (2026-05-18) discovered
+that eq-agent-action-core's `/api/enrich` response shape had been a v2
+envelope (`{"run_id", "status", "result": {"company_name", ...}, "metadata", "account_id"}`)
+since 2026-03-04, while live-transcription-fastapi's `AccountProfile`
+Pydantic model still expected the v1 flat shape (`{"name", "domain", ...}`).
+The contract-pinning test at `tests/contract/test_agent_enrich_response_shape.py`
+was marked `@needs_internal_jwt` — it ran only when `INTERNAL_JWT_SECRET`
+was set. In CI that env var isn't injected; in local development nobody
+ran the marker manually. The drift went undetected for 2+ months. M5.2's
+timeout fix (Fix #1) was the first time a production workflow waited
+long enough to actually validate the response body, surfacing the bug.
+
+### How to apply
+
+1. **Skip-markers on contract tests are a contract anti-pattern.** A
+   skipped test is not a contract. Pick one of:
+   - **Run the test in CI** with a long-lived JWT injected via secrets,
+     or with the secret rotated per-run. Cost: secrets management.
+     Benefit: drift surfaces on every PR.
+   - **Replace with a Testcontainers-style synthetic** that stubs the
+     upstream service and asserts the parser handles the documented
+     shape. Cost: stub maintenance. Benefit: tests run unconditionally
+     but only verify "our parser matches the documented contract"
+     (doesn't catch upstream drift in real prod).
+   - **Both:** unit-test the parser against a recorded sample of the
+     documented shape (always runs); separately have a manual or
+     scheduled live contract test (catches real drift).
+2. **Inventory all `@needs_*` skip markers.** Anywhere a contract test
+   gates on auth/secrets/external-state, the contract enforcement is
+   load-bearing on whoever remembers to run it. Migrate to one of the
+   patterns above.
+3. **Whenever you write a skip marker for a contract test, also write
+   a `# WARNING: this test SKIPS in CI without X. Drift will go undetected
+   until something runs it manually.` comment** so the next reader knows
+   the test isn't actually defending the contract.
+
+### Related
+
+[[production-e2e-non-substitutable]] — the M5.2 E2E also surfaced this.
+Production end-to-end remains the only way to discover certain classes
+of bugs, but it's a slow signal; contract tests in CI catch drift fast
+IF they actually run.
+
+## Two-system idempotency via shared DB UNIQUE constraint coordinates dual creators (2026-05-18)
+
+When two independent systems both create rows in the same table for
+the same logical entity, the safe design is a **single shared
+idempotency key enforced by a Postgres UNIQUE constraint** — not code
+coordination, not message-passing, not feature flags. The database
+becomes the source of truth for "who got there first," and both
+systems can be written as if they were the only creator. Whichever
+runs first inserts; whichever runs second sees a conflict and either
+updates or no-ops.
+
+### Evidence
+
+Phase-1-email-pipeline M5.2 (2026-05-18) discovered that
+eq-agent-action-core's `/api/enrich` creates `accounts` + `account_domains`
+rows as a side-effect (since 2026-03-04). The live-transcription-fastapi
+workflow's Step 4 `resolve_or_create_account` ALSO creates accounts.
+Initial reaction: "this is a duplicate-creator bug, we need to centralize
+ownership." Investigation: both systems gate on the same key —
+`account_domains.(tenant_id, domain)` UNIQUE INDEX. The agent's create
+path uses `SELECT account_id FROM account_domains WHERE tenant_id=$1 AND domain=$2`
+before INSERT; the workflow does the same. Whichever runs first creates;
+the other sees the existing row and reuses the account_id. **No
+duplicates, no race, no coordination needed.**
+
+### How to apply
+
+1. **Before "centralizing" duplicate writers, check for a shared UNIQUE
+   constraint.** If both systems gate on the same DB-enforced key, the
+   "duplicate" architecture is actually two independently-correct
+   readers/writers of a single source of truth. Centralization would
+   add code without adding correctness.
+2. **The UNIQUE constraint must be on the LOGICAL identity, not the
+   surrogate key.** A UUID PK doesn't coordinate two creators because
+   each creator generates its own UUID. The right key is the
+   business-domain tuple — `(tenant_id, domain)` here. Postgres
+   UNIQUE on (tenant_id, domain) makes "one account per business
+   domain per tenant" an invariant, regardless of who creates it.
+3. **Both creators must be designed as upsert-readers**, not pure
+   inserts. The pattern is: `SELECT by-business-key → if exists,
+   UPDATE that row → if not, INSERT new row + new business-key row`.
+   Single-INSERT writers would crash on conflict; upsert-readers
+   handle both first-write and second-write cleanly.
+4. **Don't paper over this pattern with code centralization.** A
+   review reflex "two writers = bad, centralize" can lead you to
+   introduce a service or queue that adds latency, code, and failure
+   modes — for a correctness problem that didn't exist.
+
+### Related
+
+[[cross_repo_deploy_coordination_for_constraint_relaxation]] — the
+M1+M2 session's lesson is the inverse of this: when relaxing a UNIQUE,
+audit every code path that depended on it. Here, ADDING a second writer
+on top of an existing UNIQUE is safe because the constraint absorbs
+the new writer's race.
+
+## Timeout fixes can expose latent shape bugs in downstream APIs (2026-05-18)
+
+A timeout fix that lets a slow downstream service finish responding
+can expose latent bugs in the downstream's response shape — bugs that
+were hidden because earlier timeouts cut the connection before the
+response body was read or validated. The timeout fix doesn't CAUSE
+the shape bug; it makes the bug REACHABLE. Diagnosing the post-fix
+behavior as "a new bug introduced by the timeout fix" wastes time;
+the bug is older than the fix.
+
+### Evidence
+
+Phase-1-email-pipeline M5.2 Fix #1 (2026-05-18) bumped the agent
+client's read timeout from 120s to 300s. The next production E2E
+errored at the agent-validation step with "name field required" —
+which looked like the fix had broken something. Investigation: the
+agent had returned a v2 envelope shape (no top-level `name`) since
+2026-03-04 — over 2 months earlier. Every prior workflow call timed
+out at 120s before reading the response body, so the workflow's
+Pydantic validator never saw the response. The 300s timeout was the
+first time the validator could fire end-to-end; the latent shape
+mismatch surfaced immediately.
+
+### How to apply
+
+1. **When a timeout fix exposes a new failure mode at a downstream
+   service, the first hypothesis should be "latent bug newly reachable,"
+   NOT "the timeout fix broke something."** Check the downstream's
+   git log for the response-handling code path; if it hasn't changed
+   recently, the shape was always wrong, just unreachable.
+2. **Run the downstream's contract test (if any) against production
+   manually.** A skipped contract test (see "Skip-marked contract
+   tests silently lose contract enforcement") might be the bug class
+   responsible for the latent drift.
+3. **Test directly with curl before assuming the bug is in your code.**
+   For HTTP integrations, a `curl + auth + same payload` smoke test
+   answers the question "is the downstream returning what I think?"
+   in 30 seconds. Much faster than re-reading your own client code.
+4. **Document the latency vs shape failure-mode distinction in the
+   fix's PR.** The timeout fix's PR should call out "this fix exposes
+   the system to seeing responses it couldn't see before; downstream
+   bugs may surface as a result." Future incident responders see this
+   and don't waste time blaming the timeout fix.
+
+### Related
+
+[[postgres-unique-indexes-default-nulls-distinct]] — same family: M4's
+reachability change exposed M5.1's latent ON CONFLICT bug, just as
+M5.2's timeout fix exposed Bug #4's latent shape drift. Any
+"reachability-increasing" change creates a wave of newly-visible
+latent bugs downstream of where it lands.
+
