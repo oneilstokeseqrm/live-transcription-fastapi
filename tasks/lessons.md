@@ -1158,6 +1158,149 @@ Initial M3 design had DB-TTL = SQS VT = 5 min (matched intentionally for
 constant + the handler docstring. Race is now bounded by 10 min instead
 of 5 min — same V1 limitation magnitude, requires deeper hang to trigger.
 
+## Postgres array concatenation is NULL-poisoned — COALESCE each side BEFORE the `||` operator (2026-05-18)
+
+PG's array `||` operator returns NULL if EITHER operand is NULL, not the
+non-null side. Any `INSERT ... ON CONFLICT DO UPDATE` that unions two
+arrays must COALESCE each side INSIDE the unnest, not just the outer
+aggregate, or legacy rows with a NULL array will silently lose the
+newly-supplied values.
+
+### Evidence: Phase-1-email-pipeline M4 Codex round-1 P2 (2026-05-18)
+
+First M4 cut of the atomic `upsert_thread` rewrite:
+
+```sql
+participant_emails = COALESCE(
+    (
+        SELECT array_agg(DISTINCT e ORDER BY e)
+        FROM unnest(
+            email_threads.participant_emails || EXCLUDED.participant_emails
+        ) AS t(e)
+    ),
+    ARRAY[]::text[]
+)
+```
+
+The OUTER COALESCE looks defensive but the failure path is:
+
+1. Legacy row has `participant_emails IS NULL`.
+2. `NULL || ARRAY[new...]` evaluates to NULL.
+3. `unnest(NULL)` yields zero rows.
+4. `array_agg(DISTINCT ...)` over zero rows returns NULL.
+5. Outer COALESCE rewrites the column to `[]` — newly-supplied emails
+   are also dropped.
+
+Fix: COALESCE BEFORE the concatenation:
+
+```sql
+participant_emails = COALESCE(
+    (
+        SELECT array_agg(DISTINCT e ORDER BY e)
+        FROM unnest(
+            COALESCE(email_threads.participant_emails, ARRAY[]::text[])
+            || COALESCE(EXCLUDED.participant_emails, ARRAY[]::text[])
+        ) AS t(e)
+    ),
+    ARRAY[]::text[]
+)
+```
+
+### How to apply
+
+1. **Any time you write `array_a || array_b` in PG**, ask "could either
+   side be NULL?" Even when the column has a DEFAULT of `'{}'::text[]`,
+   legacy rows pre-dating that default can hold NULL — the default only
+   applies to inserts.
+
+2. **The pattern generalizes:** PG's `||` for jsonb, hstore, and tsvector
+   has similar NULL-propagating semantics. `to_tsvector(NULL)` =
+   NULL → `tsvector || NULL` = NULL → losing the index entry.
+
+3. **Test with a NULL-column fixture** when adding `||` to a write path.
+   The bug doesn't fire if your test DB always has non-NULL arrays.
+
+4. **In-tree precedent:** the PRE-rewrite SELECT-then-UPDATE pattern at
+   `src/persistence/postgres.py:288-356` (M4 pre-rewrite) DID handle
+   this correctly via Python's `row["participant_emails"] or []`. The
+   bug was introduced by the SQL rewrite. SQL semantics ≠ Python
+   semantics — port the defensive defaulting too.
+
+### Generalizes to other DB operations
+
+The same class of bug applies anywhere a NULLable value participates in
+an operator that returns NULL on NULL: numeric `+`/`-` (`NULL + 1 =
+NULL`), string `||`, boolean `AND`/`OR` (3-valued logic), `LIKE` against
+NULL pattern. ANSI-SQL's NULL semantics are uniform. The general rule:
+when writing UPDATE expressions over potentially-NULL columns, audit
+every operator for NULL propagation.
+
+## Scope to plan-explicit framing when Codex flags scope expansion (2026-05-18)
+
+Plan says "cold-inbound." Code implementation accidentally also handles
+outbound. Codex flags as P1. The right move is to ADD an explicit
+direction guard matching plan scope, NOT to argue Codex out of the
+finding by claiming the plan is implicitly direction-agnostic.
+
+### Why
+
+Implementation can drift from plan in two directions: (a) UNDER-fulfilling
+the plan (missing a documented case), (b) OVER-fulfilling the plan
+(handling cases the plan didn't enumerate). The second mode is
+SEDUCTIVE: "the code handles more cases, what's the harm?"
+
+The harm: every additional case is a behavior the user hasn't reviewed,
+hasn't seen a test for, and might not want. For Phase-1-email-pipeline
+M4, the plan's framing was "cold-inbound from unknown business." When
+the §4.1 branch fired for outbound too, the user might have seen sent
+emails (their own outgoing!) sitting in the admin queue waiting for
+approval — surprising at best, broken-feeling at worst.
+
+The right scope-down move:
+
+```python
+# Before (Codex R1 P1):
+if account_id is None:
+    target_domain_class = classify_domain(...)
+    ...
+
+# After:
+if account_id is None and direction in ("inbound", "internal"):
+    target_domain_class = classify_domain(...)
+    ...
+```
+
+Adds one condition. Locks behavior to plan scope. Future expansion
+(Phase 2: outbound capture for cold-outreach intelligence) is opt-in
+via an explicit user decision, not a side effect of M4 shipping.
+
+### How to apply
+
+1. **When Codex P1 raises a scope question, scope-DOWN first.** The
+   guard usually costs one line; the behavior unlocks a future
+   conversation about whether to expand.
+
+2. **Pair the scope-down with a comment + test.** The comment cites
+   the plan section. The test (here:
+   `test_outbound_to_unknown_business_does_not_enter_pending_path`)
+   locks the boundary so a future "let me handle outbound too"
+   refactor surfaces immediately.
+
+3. **Add the "Phase 2 enhancement" mention in the comment.** Signals
+   to future readers that the gap is INTENTIONAL, not an oversight.
+
+4. **Don't argue the plan is "implicitly broader" without explicit
+   user confirmation.** Plans are written quickly; if a case wasn't
+   enumerated, treat that as intentional unless the user says otherwise.
+
+### Counter-example (when expanding scope IS right)
+
+If the plan-narrow scope produces a clearly broken behavior (e.g.,
+"handle inbound only" but inbound + outbound share a critical data
+invariant that both must satisfy), then scope expansion is justified —
+BUT surface to the user before shipping. The default is scope-down
++ document; expansion requires explicit approval.
+
 ## SQS consumer receipt-deletion is a tri-state decision, not binary (2026-05-18)
 
 Naive SQS consumer pattern: `handle(msg); delete_message(msg)`. The

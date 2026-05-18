@@ -1,16 +1,16 @@
 # Next Session — Start Here
 
 **Project:** Contact Quality and Account-Anchoring Initiative — multi-phase data-quality foundation for an AI-native customer intelligence platform.
-**Last session:** 2026-05-18 (M3 of the Phase-1-email-pipeline cold-inbound fix shipped, merged, AND deployed to production; AWS infrastructure provisioned + IAM verified end-to-end; 6 Codex review rounds with all P0/P1 folded into PR #9).
-**Status:** ✅ **PHASE_1_EMAIL_PIPELINE_M1_M2_M3_DEPLOYED_M4_NEXT** — M3 is live in production. Subscriber is actively long-polling SQS but will receive ZERO events until M4 ships (M4 writes to `pending_interactions`, which is what makes M2's workflow emit `EmailPromoted` events). M4 (orchestrator branch + atomic `upsert_thread` rewrite) is the next milestone — **FLIPS THE SWITCH on cold-inbound capture**. Same repo as M3 (`/Users/peteroneil/eq-email-pipeline`).
+**Last session:** 2026-05-18 (M4 of the Phase-1-email-pipeline cold-inbound fix shipped, merged, AND deployed to production; orchestrator branches cold-inbound from unknown business → `pending_interactions`; atomic `upsert_thread` rewrite closes the SELECT-then-UPSERT race; 2 Codex review rounds with R2 CLEAN).
+**Status:** ✅ **PHASE_1_EMAIL_PIPELINE_M1_M2_M3_M4_DEPLOYED_M5_NEXT** — the end-to-end cold-inbound pipeline is **BUILT, DEPLOYED, AND LIVE.** The very next cold-inbound from an unknown business sender to a connected mailbox WILL trigger: `orchestrator §4.2 → pending_interactions row + queue entry + signals → admin /approve → workflow promotes → EmailPromoted fires → M3 subscriber runs Neo4j + Pinecone + summary enrichment.` M5 (production E2E + rollback drill) is the verification milestone that signs off the whole Phase-1-email-pipeline initiative.
 
 ---
 
 ## SESSION SCOPE FOR THE NEXT SESSION
 
-**This session is EXECUTION of M4.** Implementation only, NOT plan revision. The plan at `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md` (v4, committed as eq-email-pipeline:`033626a`) is the load-bearing artifact. Read §4 (orchestrator changes) + §5 (workflow promote step) + §6 (handler — already shipped by M3, read for context) before any code.
+**This session is M5 — production E2E + rollback drill per plan §10.3 + §10.4 + §11 acceptance verification.** The work is verification + lock-in, not new code (unless an E2E reveals a bug, in which case scope expands to that fix).
 
-Recommended scope: **M4 alone**. M5 (production E2E + rollback drill per plan §10.3 + §10.4) warrants its own session — it's the first time real `EmailPromoted` events flow end-to-end through the pipeline + verifies the §11 acceptance invariants, and is high-leverage signal-gathering work that benefits from undivided attention.
+Recommended scope: **M5 alone.** No new feature work beyond the verification milestone. If E2E surfaces a real bug, scope expands to fix + re-verify; if E2E surfaces a known limitation (5 acknowledged V1 limitations), document and accept.
 
 ---
 
@@ -24,373 +24,164 @@ Recommended scope: **M4 alone**. M5 (production E2E + rollback drill per plan §
 | M5 — verified-contract tooling | ✅ 2026-05-17 PM | PR #18 | `95f9084` | (legacy) |
 | Phase-1-email-pipeline M1 | ✅ 2026-05-17 evening | eq-frontend PR #392 | **`de586bbc`** | Vercel: Prisma migrate deploy applied; Neon schema verified |
 | Phase-1-email-pipeline M2 | ✅ 2026-05-17 evening | live-transcription-fastapi PR #19 | **`756575d7`** | Railway deployment `809679fc` SUCCESS; /health 200 |
-| **Phase-1-email-pipeline M3** | **✅ 2026-05-18** | eq-email-pipeline PR #9 | **`85c0295`** | **Railway deployment `5c013fd3` SUCCESS; /api/health 200; subscriber long-polling SQS** |
-| **Phase-1-email-pipeline M4** | ⏳ **NEXT (this session)** | TBD | TBD | TBD |
-| Phase-1-email-pipeline M5 | ⏸ Future session: production E2E + rollback drill | TBD | TBD | TBD |
+| Phase-1-email-pipeline M3 | ✅ 2026-05-18 morning | eq-email-pipeline PR #9 | **`85c0295`** | Railway deployment `5c013fd3` SUCCESS; /api/health 200; subscriber long-polling SQS |
+| **Phase-1-email-pipeline M4** | **✅ 2026-05-18 evening** | eq-email-pipeline PR #10 | **`6fa181a`** | **Railway deployment `756b96e4` SUCCESS; /api/health 200 with all 3 checks ok; switch FLIPPED on cold-inbound capture** |
+| **Phase-1-email-pipeline M5** | ⏳ **NEXT (this session)** | — | — | — |
 
 ### Production state verified end-of-prior-session (2026-05-18)
 
-- **Neon Postgres (eq-dev, super-glitter-11265514)**: M1 schema applied. `pending_interactions` table exists. `emails` has 3 new columns (`account_provisioning_queue_id` uuid, `local_enrichment_started_at` timestamp without time zone, `local_enrichment_completed_at` timestamp without time zone). `interaction_summaries_tenant_id_interaction_id_summary_type_key` UNIQUE exists; old single-column `interaction_summaries_interaction_id_key` is GONE. Composite FK `interaction_summaries_tenant_id_interaction_id_fkey` exists; old single-column FK is GONE. `raw_interactions_tenant_id_interaction_id_key` UNIQUE exists.
-- **Railway live-transcription-fastapi**: M2 code at `756575d7`; deployment `809679fc` SUCCESS; `/health` 200.
-- **Railway eq-email-pipeline**: M3 code at `85c0295`; deployment `5c013fd3` SUCCESS; `/api/ping` 200; `/api/health` 200 (postgres + neo4j + eventbridge all OK).
+- **Neon Postgres (eq-dev, super-glitter-11265514)**: M1 schema applied. `pending_interactions` table exists. `emails` has `account_provisioning_queue_id`, `local_enrichment_started_at`, `local_enrichment_completed_at`. `interaction_summaries_tenant_id_interaction_id_summary_type_key` UNIQUE exists; old single-column index GONE. Composite FK `interaction_summaries_tenant_id_interaction_id_fkey` exists. `raw_interactions_tenant_id_interaction_id_key` UNIQUE exists. `email_threads_tenant_id_thread_key_key` UNIQUE exists (required for M4 atomic upsert_thread ON CONFLICT inference).
+- **Railway live-transcription-fastapi**: M2 code at `756575d7`; `/health` 200.
+- **Railway eq-email-pipeline**: M4 code at `6fa181a`; deployment `756b96e4` SUCCESS; `/api/ping` 200; `/api/health` 200 with postgres + neo4j + eventbridge all ok.
 - **EMAIL_PROMOTED_QUEUE_URL** set on Railway eq-email-pipeline production env → subscriber's `run_polling()` is active.
-- **AWS resources (account 211125681610, region us-east-1)**:
-  - SQS `eq-email-promoted-queue` (300s VT, 14d retention, redrive to DLQ after 5 attempts)
-  - SQS `eq-email-promoted-dlq`
-  - Queue policy: `events.amazonaws.com` `SendMessage` from rule
-  - EventBridge rule `route-email-promoted-to-sqs` (Source `com.yourapp.transcription`, DetailType `EmailPromoted`) → SQS target
-  - IAM inline policy `SQSEmailPromotedReader` on `eq-bff-kinesis-writer` (Railway IAM principal; verified end-to-end)
-- **End-to-end wire test PASSED** during M3 setup — synthetic `put-events` → SQS routed with correct envelope shape; Railway IAM creds successfully `ReceiveMessage`.
+- **AWS resources (account 211125681610, region us-east-1)**: SQS `eq-email-promoted-queue` (300s VT, 14d retention, redrive to DLQ after 5); SQS DLQ; queue policy allowing `events.amazonaws.com SendMessage` from rule; EventBridge rule `route-email-promoted-to-sqs` (Source `com.yourapp.transcription`, DetailType `EmailPromoted`) → SQS target; IAM inline policy `SQSEmailPromotedReader` on `eq-bff-kinesis-writer`.
+- **End-to-end wire test PASSED** during M3 setup; **end-to-end behavior** awaits the first real cold-inbound (which M5 synthesizes).
 
-### What this means for M4
+### What M5 verifies
 
-M4 can now safely:
-- Branch the orchestrator's `process_email` to write to `pending_interactions` for unknown-business cold-inbound emails (instead of silently dropping them).
-- Trust that `emails.account_provisioning_queue_id`, `emails.local_enrichment_started_at`, `emails.local_enrichment_completed_at` all exist in production schema.
-- Trust that the M3 EmailPromoted subscriber is ready to receive events — the moment M4 writes to `pending_interactions` and M2's workflow promotes one, an `EmailPromoted` event will flow through EventBridge → SQS → M3 handler → full local enrichment.
+M5 is the empirical verification that the whole Phase-1-email-pipeline initiative works end-to-end on real data. The 12-step E2E (plan §10.3) walks through:
 
-M4 deploys safely the moment it's merged. **But this is the milestone that FLIPS THE SWITCH on real cold-inbound capture** — first time the end-to-end pipeline produces non-zero events. Treat the deploy as the moment-of-truth for the entire initiative.
+1. Synthesize cold-inbound email from `test-prospect-{uuid}@cold-prospect-{uuid}.com` to test user. Non-trivial body. processing_tier=full.
+2. POST to eq-email-pipeline synthetic-injection endpoint.
+3. Verify pending state (3a-3f):
+   - `pending_interactions` row exists for the from_email.
+   - `pending_account_mappings` row exists, status='pending'.
+   - `pending_account_mapping_signals` rows exist, interaction_id matches.
+   - NO `raw_interactions`, NO `emails`, NO `interaction_summaries` for the interaction_id.
+4. Test duplicate webhook before approval: re-POST. Verify 1 pending row.
+5. POST `/approve` with queue_id + approval_attempt_id.
+6. Poll `dbos.workflow_status` until status='success'.
+7. Verify promote (7a-7g):
+   - `accounts` row exists, AI-researched.
+   - `pending_interactions` archived with `archive_reason='promoted'`.
+   - `raw_interactions` row exists, account_id=resolved.
+   - `emails` row exists, account_id=resolved, account_provisioning_queue_id=queue_id, thread_id not null.
+   - `interaction_summaries` row exists.
+   - `interaction_contact_links` rows exist.
+   - `email_threads.message_count` = 1 (incremented exactly once).
+8. Wait for EmailPromoted handler to complete (poll on `emails.local_enrichment_completed_at IS NOT NULL`).
+9. Verify enrichment (9a-9d):
+   - Neo4j `Interaction-[:BELONGS_TO]->Account` edge exists.
+   - Neo4j `Interaction.headline` and `Interaction.summary` non-null.
+   - Pinecone fetch by id=preserved interaction_id returns a vector.
+   - `emails.local_enrichment_completed_at` NOT NULL.
+10. Test handler idempotency: re-emit EmailPromoted via boto3. Verify nothing changes.
+11. Verify downstream consumers (11a-11b):
+    - action-item-graph: `action_items WHERE source_interaction_id=preserved_id`.
+    - eq-structured-graph-core: Neo4j MERGE confirmed.
+12. Teardown per LOCKED-11.
 
----
-
-## ⚠️ CRITICAL — M3 already shipped 4 of the 5 persistence helpers M4 was originally planned to add
-
-The original M4 plan (§12 M4 bullet 3) lists these helpers to add to `src/persistence/postgres.py`:
-- `mark_local_enrichment_started`
-- `mark_local_enrichment_completed`
-- `fetch_email_by_interaction_id`
-- `fetch_raw_interaction`
-- `fetch_contacts_for_interaction`
-
-**M3 already shipped all 5 of these** (with `try_claim_local_enrichment` instead of the bare `mark_local_enrichment_started` — atomic CAS via `UPDATE...WHERE...RETURNING` is the race-safe form, per plan §6.2 Codex round-3 P1). They live in `src/persistence/postgres.py` lines ~488-628 (after `update_thread_summary`, before the "Provider connection helpers" section).
-
-**M4 must NOT re-add these.** Verify in pre-flight via `grep -n "async def try_claim_local_enrichment\|async def mark_local_enrichment_completed\|async def fetch_email_by_interaction_id\|async def fetch_raw_interaction\|async def fetch_contacts_for_interaction" src/persistence/postgres.py` — expect 5 matches. If any are missing, STOP and surface (production code may have rolled back).
-
-### What M4 actually adds to `src/persistence/postgres.py`
-
-1. **`persist_pending_interaction(pgconn, *, interaction_id, tenant_id, queue_id, connected_user_id, content_text, email, direction, thread_key, processing_tier, filter_reason, response_time_seconds, expires_at) -> None`** — INSERT into `pending_interactions`. Plan §4.2 step 2. Takes a connection (not pool) so it can participate in the orchestrator's transaction.
-
-2. **Rewrite `upsert_thread`** to atomic `INSERT ... ON CONFLICT (tenant_id, thread_key) DO UPDATE`. Closes the pre-existing SELECT-then-UPSERT race documented in plan §6.3 + acknowledged V1 limitation #3 (FIXED in M2 for the workflow promote path; M4 closes it for the orchestrator known-account path too). Requires the existing UNIQUE index on `email_threads.(tenant_id, thread_key)` (per `eq-email-pipeline/docs/architecture.md:854` — confirmed already in production per plan §11 acceptance invariants).
-
-3. **Extend `email_exists`** to UNION emails + pending_interactions (plan §4.2 step 0 / §14 #1). One-liner SQL change; M4 implementation detail. Verify column type + collation match across the two tables.
-
-### What M4 adds to `src/pipeline/orchestrator.py`
-
-1. **Pre-allocate `interaction_id`** at the top of `process_email` (after `direction` resolution, before the `--- DEDUP ---` block at line ~112). Plan §4.3.
-
-2. **§4.1 decision branch** after `--- ACCOUNT RESOLUTION ---` (currently at `src/pipeline/orchestrator.py:174-196`) — when `account_id is None`:
-   - `target_domain_class == PERSONAL` → log + return `{"status": "dropped_personal_anchor"}` (acknowledged V1 limitation #1).
-   - `target_domain_class == INTERNAL` → log warning + return `{"status": "dropped_internal_misconfigured"}` (tenant config error).
-   - `target_domain_class == BUSINESS` → branch to §4.2 pending path.
-
-3. **§4.2 pending path** — inside `process_email()`, after the §4.1 BUSINESS branch:
-   - Open a single transaction on the existing `pg._pool`.
-   - Call `reopen_archived_entry` / `upsert_queue_entry` to ensure queue entry exists.
-   - Call `persist_pending_interaction` with the pre-allocated `interaction_id`.
-   - Flush ALL `pending_signal_proposals` (sender's own signal + any other unknown-business participants).
-   - Return `{"status": "pending_account_approval", "interaction_id", "queue_id", ...}`.
-   - **Do NOT call** `upsert_thread`, `insert_email`, `build_skeleton`, `extract`, `write_flesh`, `embed_and_upsert`, or `update_thread_summary` — these all happen retroactively via the M3 EmailPromoted handler on promotion (§4.4 + §6.2).
-
-4. **`insert_email` signature change** — accept caller-provided `interaction_id` instead of allocating internally. Backward-compat default: generate one if caller doesn't pass it. Plan §4.3.
-
-### What M4 adds to tests
-
-- Extend `tests/test_orchestrator_three_state.py` with the §10.2 cases:
-  - `test_cold_inbound_unknown_sender_pending`
-  - `test_cold_inbound_with_multiple_unknown_participants`
-  - `test_cold_inbound_personal_anchor_dropped`
-  - `test_cold_inbound_internal_anchor_misconfigured`
-  - `test_duplicate_webhook_before_approval`
-  - `test_cross_queue_cold_inbound_link_fill`
-- Unit tests for `persist_pending_interaction`, extended `email_exists`, rewritten `upsert_thread` (atomic semantics, concurrent-call test).
-- **Do NOT re-add** unit tests for `try_claim_local_enrichment` / `mark_local_enrichment_completed` / `fetch_email_by_interaction_id` / `fetch_raw_interaction` / `fetch_contacts_for_interaction` — M3 already shipped 33 tests in `tests/test_email_promoted_subscriber_unit.py` covering these.
+Plus plan §10.4 rollback drill (optional but recommended), and plan §11 acceptance invariants checklist (all 22 invariants must hold).
 
 ---
 
-## Mandatory read order for the next session (~25 min)
+## Mandatory read order for the next session (~20 min)
 
 1. **This file.**
-2. **The checkpoint** loaded via `/context-restore` (the 2026-05-18 save titled `phase-1-email-pipeline-m3-deployed-m4-next`).
-3. **THE PLAN**: `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md` (1207 lines). Especially:
-   - §4 (orchestrator changes) — primary M4 reference.
-   - §5 (workflow promote step — already shipped by M2, read for context on Step 4c thread upsert + Step 5 cross-queue link fill).
-   - §6 (handler — already shipped by M3, read for context on what consumes M4's pending_interactions writes).
-   - §7 (cross-repo migration ordering) — M4 is "Phase 4 — FLIPS THE SWITCH".
-   - §8 (edge cases) — especially §8.1 reopen-after-ignore, §8.2 mid-promotion crash, §8.6 cross-queue cold-inbound.
-   - §10.2 (integration tests) — required test additions.
-   - §11 (acceptance invariants) — the ship-when-true checklist. M4 is the milestone that lets all of §11 pass.
-4. **M3 PR description** (https://github.com/oneilstokeseqrm/eq-email-pipeline/pull/9) — the comprehensive narrative for what M3 shipped + the 6-round Codex trajectory + AWS infra + the 21 LOCKED decisions.
-5. **M3 code** to understand what M4 inherits:
-   - `src/persistence/postgres.py` lines 488-628 — the 5 helpers M3 added.
-   - `src/pipeline/email_promoted_subscriber.py` — the full M3 handler. Read `HandlerOutcome` enum docstring for the SQS receipt-deletion contract M4's pending-write must work with.
-   - `src/main.py` lifespan additions — confirm M4 doesn't need to touch this.
-6. **Existing code M4 modifies**:
-   - `src/pipeline/orchestrator.py:1-200` — current `process_email` head + §4.1 decision point.
-   - `src/persistence/postgres.py:288-356` — current `upsert_thread` (the SELECT-then-UPSERT race).
-   - `src/persistence/postgres.py:362-375` — current `email_exists` (the UNION extension).
-   - `src/persistence/postgres.py:189-282` — current `insert_email` (signature change).
+2. **The checkpoint** loaded via `/context-restore` (the 2026-05-18 save titled `phase-1-email-pipeline-m4-shipped-m5-next`).
+3. **THE PLAN — §10 + §11**: `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md` (eq-email-pipeline:`033626a`). Focus on:
+   - §10.3 (production E2E — 12 numbered steps; PRIMARY M5 REFERENCE).
+   - §10.4 (rollback drill).
+   - §11 (acceptance invariants — the ship-when-true checklist).
+   - §8 (edge cases) — re-skim before E2E so you recognize variants if they show up.
+4. **The M4 PR** (https://github.com/oneilstokeseqrm/eq-email-pipeline/pull/10) — the comprehensive narrative for what M4 shipped, including the Codex R1 fixes (direction guard, NULL-participants COALESCE, anchor TZ comment).
+5. **M5's verified-contract scripts** at `/Users/peteroneil/EQ-CORE/live-transcription-fastapi/scripts/`:
+   - `verify_schema.py` — run against M4's new SQL constants if any new ones materialize during E2E.
+   - `verify_consumer_contracts.py` — sanity-check the EmailPromoted envelope shape against downstream consumers (action-item-graph + eq-structured-graph-core).
+6. **The full M4 source code** (don't re-read, just know where to look):
+   - `src/persistence/postgres.py:288-381` — atomic upsert_thread (verify it behaves correctly when participant_emails is NULL).
+   - `src/persistence/postgres.py:362-413` — extended email_exists.
+   - `src/persistence/postgres.py:1530+` — module-level persist_pending_interaction.
+   - `src/pipeline/orchestrator.py:200` — interaction_id pre-allocation.
+   - `src/pipeline/orchestrator.py:306-490` — §4.1 + §4.2 block.
 
 ---
 
-## Execution sequence — M4
+## Execution sequence — M5
 
-Per plan §4 + §12.
+Per plan §10.3 + §10.4 + §11.
 
-### Pre-flight (run BEFORE any M4 code)
+### Pre-flight (run BEFORE any M5 work)
 
-1. **Confirm production state stable**:
+1. **Production state stable**:
    ```bash
-   curl -sS -o /dev/null -w "live-transcription-fastapi: %{http_code}\n" https://live-transcription-fastapi-production.up.railway.app/health
+   curl -sS -o /dev/null -w "live-fastapi: %{http_code}\n" https://live-transcription-fastapi-production.up.railway.app/health
    curl -sS -o /dev/null -w "eq-email-pipeline: %{http_code}\n" https://email-pipeline-production.up.railway.app/api/ping
    curl -sS https://email-pipeline-production.up.railway.app/api/health
-   # Expected all 200; eq-email-pipeline checks all "ok"
+   # Expected all 200; eq-email-pipeline checks all "ok".
    ```
 
-2. **Verify M3 helpers + EMAIL_PROMOTED_QUEUE_URL are live**:
+2. **M4 code is live**:
    ```bash
-   grep -nE "async def try_claim_local_enrichment|async def mark_local_enrichment_completed|async def fetch_email_by_interaction_id|async def fetch_raw_interaction|async def fetch_contacts_for_interaction" /Users/peteroneil/eq-email-pipeline/src/persistence/postgres.py
-   # Expect 5 matches.
+   git -C /Users/peteroneil/eq-email-pipeline log --oneline -3
+   # Expected top: 6fa181a M4: orchestrator pending_interactions branch...
    ```
-   Verify EMAIL_PROMOTED_QUEUE_URL on Railway via mcp__railway__list_service_variables (project `f7d26745-7722-4946-aa3f-9dfc3664426f`, service `92d55588-e548-4188-a179-1d3fa9ea38d2`, env `845e3772-e146-439f-b5f5-cbdfcab6087c`) — expect `https://sqs.us-east-1.amazonaws.com/211125681610/eq-email-promoted-queue`.
 
-3. **Verify M1/M2 schema didn't roll back** via Neon MCP `run_sql` against project `super-glitter-11265514`:
-   ```sql
-   SELECT (SELECT COUNT(*) FROM information_schema.tables WHERE table_name='pending_interactions') AS pending_interactions_table,
-          (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='emails' AND column_name LIKE 'local_enrichment%') AS local_enrichment_cols,
-          (SELECT COUNT(*) FROM pg_indexes WHERE indexname='interaction_summaries_tenant_id_interaction_id_summary_type_key') AS composite_unique_index,
-          (SELECT COUNT(*) FROM pg_indexes WHERE indexname='interaction_summaries_interaction_id_key') AS old_single_unique_should_be_zero,
-          (SELECT COUNT(*) FROM pg_indexes WHERE indexname='raw_interactions_tenant_id_interaction_id_key') AS raw_composite_unique;
-   ```
-   Expected: `{pending_interactions_table: 1, local_enrichment_cols: 2, composite_unique_index: 1, old_single_unique_should_be_zero: 0, raw_composite_unique: 1}`.
-
-4. **Verify `email_threads.(tenant_id, thread_key)` UNIQUE index exists** (required for M4's atomic upsert_thread rewrite):
-   ```sql
-   SELECT indexname FROM pg_indexes WHERE tablename='email_threads' AND (indexdef LIKE '%(tenant_id, thread_key)%' OR indexdef LIKE '%(tenant_id,thread_key)%');
-   ```
-   Expected: at least one matching index. If missing, M4 needs a coordinated eq-frontend Prisma migration FIRST — surface to user before proceeding. Per plan §12 M1 bullet "(REMOVED v4: email_threads.(tenant_id, thread_key) UNIQUE — confirmed already exists at eq-email-pipeline/docs/architecture.md:854)" this should be present already, but verify.
-
-5. **SHARED-TENANT-COLLISION CHECK (LOCKED-17)**:
+3. **LOCKED-17 SHARED-TENANT-COLLISION CHECK** (more important for M5 than M4 — M5's E2E writes destructive data):
    ```bash
    ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl | head -10
    ```
-   Any file modified in last hour = concurrent agent hazard. M4 itself is non-destructive (writes to test tenant via tests), but the upsert_thread rewrite touches a shared-code-path table; informational caution only unless tests are running.
+   Any file modified in the last hour = pause + confirm with user. M5 writes to the shared test tenant `11111111-1111-4111-8111-111111111111`; collision with another agent's seed/teardown could be destructive.
 
-6. **eq-email-pipeline state check**:
-   ```bash
-   git -C /Users/peteroneil/eq-email-pipeline status      # should be clean on main
-   git -C /Users/peteroneil/eq-email-pipeline log --oneline -3
-   # Expected top: 85c0295 M3: EmailPromoted SQS subscriber...
+4. **DBOS workflow drain check** (per plan §9 deploy discipline):
+   ```sql
+   SELECT * FROM dbos.workflow_status
+   WHERE status IN ('pending', 'running')
+     AND created_at > NOW() - INTERVAL '1 hour';
+   ```
+   Expected: 0 rows. If non-zero, wait for drain or surface to user.
+
+5. **Pre-existing pending rows in test tenant** (so you know what the baseline is):
+   ```sql
+   SELECT COUNT(*) FROM pending_interactions
+   WHERE tenant_id = '11111111-1111-4111-8111-111111111111'
+     AND archived_at IS NULL;
    ```
 
-### M4 — eq-email-pipeline orchestrator branch + atomic upsert_thread (4-5 days, medium-high risk)
+### Step 0 — Choose synthetic email parameters
 
-**Step 0 — Open feature branch**:
-```bash
-cd /Users/peteroneil/eq-email-pipeline
-git checkout -b phase-1-email-pipeline/m4-orchestrator-flip-switch
-```
-
-**Step 1 — Atomic `upsert_thread` rewrite** (plan §6.3 acknowledged V1 limitation #3; the "FIXED in M2 for workflow / M4 for orchestrator" half):
-
-Current code at `src/persistence/postgres.py:288-356` is SELECT-then-UPDATE-or-INSERT — has a race window where two concurrent calls for the same `thread_key` can either (a) both hit the SELECT-miss path and both INSERT (UNIQUE constraint violation on one), or (b) one INSERTs and the other UPDATEs but reads stale `participant_emails`.
-
-Rewrite as a single atomic statement:
-```python
-async def upsert_thread(
-    self, *, tenant_id: str, thread_key: str, subject: str,
-    participant_emails: list[str], sent_at: datetime, account_id: str | None,
-) -> str:
-    """Atomic INSERT ... ON CONFLICT DO UPDATE for email_threads.
-
-    Closes the pre-existing SELECT-then-UPSERT race documented in plan
-    §6.3 limitation #3. Single Postgres statement = no race window.
-    Relies on UNIQUE constraint on (tenant_id, thread_key).
-    """
-    tid = uuid.UUID(tenant_id)
-    aid = uuid.UUID(account_id) if account_id else None
-    new_id = uuid.uuid4()
-
-    row = await self._pool.fetchrow(
-        """
-        INSERT INTO email_threads (
-            id, tenant_id, thread_key, account_id, subject,
-            participant_emails, first_message_at, last_message_at,
-            message_count, created_at, updated_at
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6::text[], $7, $7, 1, NOW(), NOW()
-        )
-        ON CONFLICT (tenant_id, thread_key) DO UPDATE SET
-            message_count = email_threads.message_count + 1,
-            last_message_at = GREATEST(email_threads.last_message_at, EXCLUDED.last_message_at),
-            participant_emails = ARRAY(
-                SELECT DISTINCT unnest(email_threads.participant_emails || EXCLUDED.participant_emails)
-            ),
-            account_id = COALESCE(email_threads.account_id, EXCLUDED.account_id),
-            updated_at = NOW()
-        RETURNING id
-        """,
-        new_id, tid, thread_key, aid, subject,
-        sorted(set(participant_emails)), _naive_utc(sent_at),
-    )
-    return str(row["id"])
-```
-
-**Behavioral invariants preserved**:
-- First call for a (tenant_id, thread_key): inserts new row with `message_count=1`.
-- Second+ call: increments `message_count` by exactly 1, takes max of `last_message_at`, unions participant emails, preserves first non-NULL `account_id`.
-- Returns the thread UUID (either new or existing).
-- No race window — single statement.
-
-**Verify all callers behave identically** after the rewrite:
-- `src/pipeline/orchestrator.py:283` (known-account path) — semantics unchanged.
-- M2 workflow Step 4c at `live-transcription-fastapi/services/account_provisioning/materialization.py` — calls this helper indirectly via the shared schema; verify M2's expectations on `message_count` increment match.
-
-**Step 2 — Extend `email_exists`** to UNION emails + pending_interactions:
-```python
-async def email_exists(self, tenant_id: str, internet_message_id: str) -> bool:
-    """Check if an email with this internet_message_id already exists in
-    emails OR pending_interactions. Phase-1-email-pipeline M4: prevents
-    duplicate cold-inbound retries from creating duplicate pending rows.
-    """
-    if not internet_message_id:
-        return False
-    row = await self._pool.fetchrow(
-        """
-        SELECT 1
-        FROM (
-            SELECT 1 FROM emails
-            WHERE tenant_id = $1 AND internet_message_id = $2
-            UNION ALL
-            SELECT 1 FROM pending_interactions
-            WHERE tenant_id = $1 AND internet_message_id = $2 AND archived_at IS NULL
-        ) hits
-        LIMIT 1
-        """,
-        uuid.UUID(tenant_id), internet_message_id,
-    )
-    return row is not None
-```
-
-Note `archived_at IS NULL` on pending_interactions — promoted/expired rows should NOT block retries.
-
-**Step 3 — `persist_pending_interaction`** (plan §4.2 step 2):
-
-New helper in `src/persistence/postgres.py`. Takes a connection (not pool) so it can participate in the orchestrator's transaction. Pseudo:
-```python
-async def persist_pending_interaction(
-    conn, *, interaction_id, tenant_id, queue_id, connected_user_id,
-    content_text, email, direction, thread_key, processing_tier,
-    filter_reason, response_time_seconds, expires_at,
-) -> None:
-    """INSERT into pending_interactions. Plan §4.2 step 2."""
-    await conn.execute(
-        """
-        INSERT INTO pending_interactions (
-            interaction_id, tenant_id, queue_id, connected_user_id,
-            internet_message_id, provider_message_id, provider, subject,
-            from_email, from_name, to_emails, cc_emails, direction,
-            has_attachments, sent_at, thread_key, content_text,
-            processing_tier, filter_reason, response_time_seconds,
-            expires_at, created_at, updated_at
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-            $13, $14, $15, $16, $17, $18, $19, $20, $21,
-            NOW(), NOW()
-        )
-        """,
-        uuid.UUID(interaction_id), uuid.UUID(tenant_id), uuid.UUID(queue_id),
-        uuid.UUID(connected_user_id), email.internet_message_id,
-        email.provider_message_id, email.provider, email.subject,
-        email.from_address.email, email.from_address.display_name or None,
-        [a.email for a in email.to], [a.email for a in email.cc],
-        direction, email.has_attachments, _naive_utc(email.sent_at),
-        thread_key, content_text, processing_tier, filter_reason,
-        response_time_seconds, _naive_utc(expires_at),
-    )
-```
-
-Verify the exact column list against the M1 Prisma schema before writing — these column names must match. Grep eq-frontend `prisma/schema.prisma` for `model PendingInteraction` to confirm.
-
-**Step 4 — Pre-allocate `interaction_id`** at the top of `process_email` (after `direction` resolution, before the `--- DEDUP ---` block). Plan §4.3. Pass it as an argument to both the existing `insert_email` (known path) and the new `persist_pending_interaction` (pending path).
-
-`insert_email` signature change:
-- From: `insert_email(*, tenant_id, email, content_text, ...) -> (interaction_id, email_id, summary_id)`
-- To: `insert_email(*, interaction_id, tenant_id, email, content_text, ...) -> (email_id, summary_id)`
-- Backward compat default: if caller passes `interaction_id=None`, generate internally (legacy callers don't break).
-
-**Step 5 — §4.1 decision branch** in `process_email`. After the existing `--- ACCOUNT RESOLUTION ---` block at `src/pipeline/orchestrator.py:174-196`:
+Generate a fresh UUID-based prospect identity to avoid clashes:
 
 ```python
-# --- §4.1 decision branch (Phase-1-email-pipeline M4) ---
-if account_id is None:
-    target_domain_class = classify_domain(
-        target_domain, internal_domains=internal_domains
-    )
-    if target_domain_class == DomainClass.PERSONAL:
-        logger.info(
-            "Dropping cold-inbound from personal domain — acknowledged V1 limitation",
-            target_domain=target_domain, from_email=email.from_address.email,
-            subject=(email.subject or "")[:80],
-        )
-        result.update({
-            "status": "dropped_personal_anchor",
-            "reason": "cold inbound from personal domain",
-        })
-        return result
-    if target_domain_class == DomainClass.INTERNAL:
-        logger.warning(
-            "Dropping cold-inbound from internal-classified domain without anchor account "
-            "— check tenant provider_connections + account_domains",
-            target_domain=target_domain, tenant_id=tenant_id,
-        )
-        result.update({
-            "status": "dropped_internal_misconfigured",
-            "reason": "internal domain without anchor account",
-        })
-        return result
-    # ELSE BUSINESS — fall through to §4.2 pending path (Step 6 below).
+import uuid
+suffix = uuid.uuid4().hex[:12]
+from_email = f"test-prospect-{suffix}@cold-prospect-{suffix}.com"
+to_email = "stokeseqrm@gmail.com"  # or the test user's connected mailbox
+internet_message_id = f"<m5-e2e-{suffix}@cold-prospect-{suffix}.com>"
 ```
 
-**Step 6 — §4.2 pending path** (when `account_id is None AND target_domain_class == BUSINESS`):
+### Step 1-12 — Run plan §10.3 E2E
 
-Wrap in a single transaction. Mirror the plan §4.2 pseudo-code. The transaction:
-1. Calls `reopen_archived_entry` / `upsert_queue_entry` to get `queue_id`.
-2. Calls `persist_pending_interaction(interaction_id=pre_allocated_id, ...)`.
-3. Flushes ALL pending_signal_proposals (sender + other unknown participants).
-4. Returns `{"status": "pending_account_approval", "interaction_id": ..., "queue_id": ..., ...}` — **DOES NOT** call `upsert_thread`, `insert_email`, `build_skeleton`, `extract`, `write_flesh`, `embed`, or `update_thread_summary`.
+Walk through the 12 steps in plan §10.3 in order. At each step, capture verification SQL/Neo4j/Pinecone results inline so you have an audit trail if anything breaks.
 
-**Step 7 — Tests** per plan §10.2. Required cases:
-- `test_cold_inbound_unknown_sender_pending`
-- `test_cold_inbound_with_multiple_unknown_participants` (one pending row, two queue entries, signals for both)
-- `test_cold_inbound_personal_anchor_dropped`
-- `test_cold_inbound_internal_anchor_misconfigured`
-- `test_duplicate_webhook_before_approval` (second delivery short-circuits at email_exists)
-- `test_cross_queue_cold_inbound_link_fill` (Alice in cold-1.com email; Bob in cold-2.com email; approve cold-2 first → Bob's contact exists, NO link yet; approve cold-1 → interaction promoted, both Alice + Bob's links created via M2's Step 5 cross-queue OR clause)
+Use:
+- `mcp__neon__run_sql` for Postgres verification.
+- `mcp__neo4j_structured__read_neo4j_cypher` for Neo4j verification.
+- `mcp__pinecone-custom__describe-index-stats` + `search-records` for Pinecone verification.
+- `mcp__railway__deployment_logs` for live log streaming during the EmailPromoted handler step.
 
-Plus unit tests for `persist_pending_interaction`, extended `email_exists`, rewritten `upsert_thread` (especially concurrent-call atomic test).
+### Step 13 — Plan §11 acceptance invariants checklist
 
-**Step 8 — Codex review BEFORE merge** per LOCKED-10:
-```bash
-codex review --base main -c 'model_reasoning_effort="medium"' --enable web_search_cached
-```
-4-round soft cap. Extend per round-N convergence pattern (severity decreasing + non-redundant findings = real). M3 ran 6 rounds; M4 may run similar given the upsert_thread rewrite is subtle Postgres work. Past ~1500 cumulative lines, switch to `--commit HEAD` per LOCKED-18.
+Walk every checkbox in plan §11 (the ship-when-true checklist). Pull live values for each `Schema` invariant via Neon MCP. Spot-check `Code` invariants via `grep` (they should all be true post-merge but verify). Walk through `Behavior (E2E)` invariants from the §10.3 results.
 
-**Step 9 — Open M4 PR**; surface to user for merge approval. PR description should call out:
-- The pending-path branching at §4.1 + §4.2.
-- The atomic upsert_thread rewrite (this is the highest-risk change — Codex will scrutinize it).
-- All callers verified post-rewrite.
-- `email_exists` UNION extension.
-- The `insert_email` signature change + backward-compat default.
-- That M4 FLIPS THE SWITCH — first time real cold-inbound emails will create pending rows in production.
+### Step 14 — (Optional) Plan §10.4 rollback drill
 
-**Step 10 — POST-MERGE: confirm deploy succeeds + verify subscriber sees real events.** After Railway redeploy with M4 code:
-- `/api/health` 200.
-- Inspect SQS queue depth via `aws sqs get-queue-attributes` — expect 0 initially (no cold-inbounds yet).
-- The next real cold-inbound from an unknown business sender to a connected mailbox WILL create a pending row + queue entry + signals. When that queue is `/approve`d (manually or via existing UI), the workflow promotes → EmailPromoted fires → M3 subscriber processes → Neo4j + Pinecone writes.
+Per plan §10.4. Synthetic cold-inbound → store in pending_interactions → revert M4 (`git revert 6fa181a` + push + Railway redeploys old code) → subsequent cold-inbounds drop silently → re-deploy M4 → confirm recovery.
 
-### M5 — DEFERRED to separate session
+Recommended only if production has zero real-user traffic (currently true per LOCKED-11 + user's "no production users yet" framing). If user prefers to skip, document as "not exercised; recovery path documented in plan §10.4."
 
-Per plan §12. M5 = full production E2E per §10.3 (12 numbered steps) + rollback drill per §10.4. Treat M5 as its own session — it's the verification milestone that signs off the whole Phase-1-email-pipeline initiative. LOCKED-17 Layer-1 check before running.
+### Step 15 — Document M5 results
+
+Update `tasks/lessons.md` with any new lessons surfaced by the E2E. Update `MEMORY.md` to reflect M5 status. Surface any V1 limitations that empirically manifested.
+
+### Step 16 — Initiative sign-off
+
+If all §11 invariants hold AND no new P0/P1 bugs, the Phase-1-email-pipeline initiative is COMPLETE. Surface to user with:
+
+- Phase-1-email-pipeline shipped end-to-end (M1 + M2 + M3 + M4 + M5).
+- 21+ LOCKED decisions list.
+- 5 acknowledged V1 limitations + their V2 roadmap items.
+- Phase 2 work as the natural next initiative.
 
 ---
 
@@ -405,7 +196,7 @@ Per plan §12. M5 = full production E2E per §10.3 (12 numbered steps) + rollbac
 7. **Two hard rules** — no contact / no interaction without account anchor.
 8. SQLAlchemy 2.0.49 `CAST(:name AS uuid)` form.
 9. Materialization REQUIRES Lane 2 raw_interactions before materializing.
-10. Codex review BEFORE merging (4-round soft cap; extendable when real P1s keep surfacing — M2 ran 7, M3 ran 6, both with real findings).
+10. Codex review BEFORE merging (4-round soft cap; extendable when real P1s keep surfacing — M2 ran 7, M3 ran 6, **M4 ran 2 (R2 CLEAN)** demonstrating the round-N convergence heuristic).
 11. Per-batch user confirmation for destructive ops on shared test tenant.
 12. Transcripts: frontend forces anchor; emails: backend handles via pending state.
 13. Recipient-as-anchor REJECTED for emails.
@@ -414,19 +205,30 @@ Per plan §12. M5 = full production E2E per §10.3 (12 numbered steps) + rollbac
 16. Path B full reprocess on promote via EventBridge `EmailPromoted` event.
 17. Shared-tenant collision protocol: pre-flight `ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl`.
 18. Codex multi-round: `--commit HEAD` past ~1500 lines; `model_reasoning_effort=medium` default.
-19. **(NEW M3) SQS-from-EventBridge** for the consumer subscription pattern. Resolved plan §14 #2 in M3 (PR #9). Chosen over direct EventBridge for at-least-once + DLQ + matching the existing Gmail/Outlook polling shape.
-20. **(NEW M3) DB CAS TTL strictly > SQS VisibilityTimeout.** 10-min DB TTL vs 5-min SQS VT. Codex round-5 P1 fix; race at the boundary if equal. See `tasks/lessons.md` "DB CAS TTL must be strictly longer than SQS VisibilityTimeout".
-21. **(NEW M3) `HandlerOutcome` tri-state enum** {COMPLETE, PERMANENT_SKIP, TRANSIENT_SKIP} for SQS consumer receipt-deletion decisions. Naive "no exception = delete" semantics lose messages in transient-skip paths. Codex round-2 P1 fix. See `tasks/lessons.md` "SQS consumer receipt-deletion is a tri-state decision".
+19. SQS-from-EventBridge for the consumer subscription pattern (M3).
+20. DB CAS TTL strictly > SQS VisibilityTimeout (10 min vs 5 min; M3).
+21. `HandlerOutcome` tri-state enum {COMPLETE, PERMANENT_SKIP, TRANSIENT_SKIP} (M3).
+
+### M4-locked behaviors (descriptive, not new decisions)
+
+- **§4.1 cold-inbound branch scope:** `direction in ("inbound", "internal")` only. Outbound-to-unknown preserves pre-M4 silent-drop fallthrough; outbound capture is a Phase 2 enhancement.
+- **Atomic `upsert_thread`:** single `INSERT ... ON CONFLICT (tenant_id, thread_key) DO UPDATE` statement. Closes the SELECT-then-UPSERT race. Relies on the production UNIQUE index.
+- **`persist_pending_interaction`:** module-level free function taking an asyncpg connection (NOT pool), so it participates in the caller's transaction alongside queue + signal helpers.
+- **`email_exists` UNION:** emails OR active (`archived_at IS NULL`) pending_interactions. Archived (promoted/expired) pending rows do NOT block retries.
 
 ---
 
 ## Acknowledged V1 limitations (NOT regressions; documented + bounded)
 
 1. **Personal/internal anchor cold-inbound → log+drop.** V2 roadmap: audit log table.
-2. **Neo4j build_skeleton + write_flesh partial-retry corruption.** Mitigation: M3 implements the 2-layer guard (atomic CAS + 10-min soft TTL > 5-min SQS VT). V2 roadmap: MERGE patterns + edge-count thread counters. M4 inherits this; not introduced by M4.
-3. **`upsert_thread` race** — FIXED in M2 for the workflow promote path. **M4 closes it for the orchestrator known-account path** via the atomic INSERT...ON CONFLICT DO UPDATE rewrite (Step 1 above).
-4. **Legacy per-signal loop hardcodes `summary_type='meeting'`** — for re-pointed email signals (M2 4-pre-1) it creates a duplicate 'meeting' summary alongside the existing 'email' summary. Cosmetic data inconsistency, NOT functionally broken. Future cleanup: type-aware legacy loop.
-5. **(NEW M3) `build_skeleton` `CREATE` fallback for missing `internet_message_id`** — extends V1 limitation #2 to the case where MERGE-on-`internet_message_id` falls back to CREATE on missing header. Same bound (2-layer guard), same V2 roadmap (MERGE on `(tenant_id, interaction_id)` as fallback). NOT introduced by M3 — orchestrator hot path has the same property; only the workflow's promote step exposes it to cold-inbound retries.
+2. **Neo4j build_skeleton + write_flesh partial-retry corruption.** Bounded by M3 two-layer guard (atomic CAS + 10-min soft TTL > 5-min SQS VT). V2: MERGE patterns + edge-count thread counters.
+3. **`upsert_thread` race** — FIXED in M2 for workflow promote path AND in M4 for orchestrator known-account path via atomic INSERT...ON CONFLICT DO UPDATE.
+4. **Legacy per-signal loop hardcodes `summary_type='meeting'`** for re-pointed email signals (M2 4-pre-1). Cosmetic duplicate; downstream filters by summary_type='email' get the correct link via M2 Step 5 batch.
+5. **`build_skeleton` `CREATE` fallback for missing `internet_message_id`.** Extends V1 limitation #2; same 2-layer guard bound; same V2 roadmap.
+
+### M4-introduced (none)
+
+M4 added zero new V1 limitations. The §4.1 outbound-not-covered scope is a deliberate Phase 2 boundary, NOT a regression — pre-M4 behavior preserved for outbound.
 
 ---
 
@@ -435,63 +237,59 @@ Per plan §12. M5 = full production E2E per §10.3 (12 numbered steps) + rollbac
 - **Neon Postgres (eq-dev):** project `super-glitter-11265514`, branch `production`, database `neondb`. Direct connection (no `-pooler`) for `DBOS_SYSTEM_DATABASE_URL`.
 - **Test tenant:** `11111111-1111-4111-8111-111111111111`. All test data. Per LOCKED-11.
 - **Test user (FK target):** `b0000000-0000-4000-8000-000000000002`.
-- **Real stokeseqrm user** (for production cold-inbound flow when real emails come through): `061ae392-47d5-4f04-9ea8-afa241f23555`.
+- **Real stokeseqrm user:** `061ae392-47d5-4f04-9ea8-afa241f23555`.
 - **Railway live-transcription-fastapi:** project `847cfa5a-b77c-4fb0-95e4-b20e8773c23e`, service `59a69f3d-9a24-4041-942a-891c4a81c5fb`, env `e4c5ec15-1931-4632-9e58-92d9c6be4261`. M2 SHA `756575d7` is deployment `809679fc` (SUCCESS).
-- **Railway eq-email-pipeline:** project `f7d26745-7722-4946-aa3f-9dfc3664426f`, service `92d55588-e548-4188-a179-1d3fa9ea38d2`, env `845e3772-e146-439f-b5f5-cbdfcab6087c`, URL `https://email-pipeline-production.up.railway.app`. M3 SHA `85c0295` is deployment `5c013fd3` (SUCCESS). EMAIL_PROMOTED_QUEUE_URL set on this service.
+- **Railway eq-email-pipeline:** project `f7d26745-7722-4946-aa3f-9dfc3664426f`, service `92d55588-e548-4188-a179-1d3fa9ea38d2`, env `845e3772-e146-439f-b5f5-cbdfcab6087c`, URL `https://email-pipeline-production.up.railway.app`. **M4 SHA `6fa181a` is deployment `756b96e4` (SUCCESS).** EMAIL_PROMOTED_QUEUE_URL set on this service.
 - **Railway eq-agent-action-core:** URL `https://eq-agent-action-core-production.up.railway.app`, service `3036ea0f-afc9-4bc4-889d-c98617d81e96`.
-- **eq-email-pipeline:** `/Users/peteroneil/eq-email-pipeline` (NOT under EQ-CORE/). Main HEAD `85c0295` (post-M3 merge).
-- **eq-frontend:** `/Users/peteroneil/eq-frontend`. M1 merged at `de586bbc` on origin/main.
-- **Internal JWT:** HS256, `INTERNAL_JWT_SECRET`, `iss=eq-frontend`, `aud=eq-backend`.
-- **AWS** (account `211125681610`, region `us-east-1`):
-  - EventBridge bus `default`; rule `route-email-promoted-to-sqs` (Source `com.yourapp.transcription`, DetailType `EmailPromoted`).
-  - SQS `eq-email-promoted-queue` (URL `https://sqs.us-east-1.amazonaws.com/211125681610/eq-email-promoted-queue`), `eq-email-promoted-dlq`.
-  - IAM principal: `eq-bff-kinesis-writer` (access key `AKIATCKASHXFGKNQ476O`, same key Railway uses for eq-email-pipeline). Inline policies include `EventBridgePutEvents`, `S3UploadBucketAccess`, `SQSBriefingEventsAccess`, **`SQSEmailPromotedReader`** (new from M3).
+- **eq-email-pipeline:** `/Users/peteroneil/eq-email-pipeline`. Main HEAD `6fa181a` (post-M4 merge).
+- **eq-frontend:** `/Users/peteroneil/eq-frontend`. M1 merged at `de586bbc`.
+- **AWS** (account `211125681610`, region `us-east-1`): same inventory as M3/M4 sessions — SQS main + DLQ, queue policy, EventBridge rule, IAM principal `eq-bff-kinesis-writer` with `SQSEmailPromotedReader` inline policy.
 - **Neo4j:** Aura `c6171c63`, URI `neo4j+s://c6171c63.databases.neo4j.io`.
-
----
-
-## Open questions deferred to execution
-
-1. **`email_exists` UNION ALL exact SQL** (plan §14 #1) — resolve during M4 implementation. Verify column type + collation match across `emails.internet_message_id` and `pending_interactions.internet_message_id`. Pre-flight: `SELECT column_name, data_type, collation_name FROM information_schema.columns WHERE table_name IN ('emails','pending_interactions') AND column_name='internet_message_id';`
-2. **EmailPromoted DLQ + observability** (plan §14 #5) — operations setup, separate from M4 code scope.
-3. **Backfill of historical dropped emails** (plan §14 #6) — confirm in M5 that no backfill needed (test data only).
-4. **Queue UI integration** (plan §14 #7) — `app/(workspace)/agent-queue` may want to surface a count of pending_interactions per queue entry. Defer to separate eq-frontend session.
+- **Pinecone:** index per env var `PINECONE_INDEX_NAME` (check Railway service variables).
 
 ---
 
 ## Stop conditions (hard — surface to user)
 
 - `/context-restore` returns NO_CHECKPOINTS or the wrong checkpoint title.
-- MEMORY.md status isn't `PHASE_1_EMAIL_PIPELINE_M1_M2_M3_DEPLOYED_M4_NEXT`.
-- Pre-flight `/api/health` for eq-email-pipeline returns non-200 OR any of postgres/neo4j/eventbridge is not "ok". (M3 may have been hot-fixed or reverted.)
-- The 5 M3 persistence helpers are missing from `src/persistence/postgres.py`. (M3 may have been reverted.)
-- `EMAIL_PROMOTED_QUEUE_URL` is unset on Railway eq-email-pipeline production env. (M3 deploy state may have rolled back.)
-- The Neon schema verification queries return unexpected values (M1/M2 may have rolled back).
-- `email_threads.(tenant_id, thread_key)` UNIQUE index is missing in production. (Requires upstream eq-frontend Prisma migration FIRST; do not proceed with M4 upsert_thread rewrite until in place.)
-- LOCKED-17 collision check shows a concurrent agent in another repo within the last hour AND M4 work involves running integration tests on the shared test tenant.
-- You're tempted to revise the plan doc instead of surfacing a plan issue — STOP, surface the issue.
-- M4's Codex pre-merge review surfaces a P1 you can't resolve in one revision round AND it's not in the known-FP family (upstream schema, hypothetical TZ flip).
+- MEMORY.md status isn't `PHASE_1_EMAIL_PIPELINE_M1_M2_M3_M4_DEPLOYED_M5_NEXT`.
+- Production /api/health returns non-200 OR any of postgres/neo4j/eventbridge is not "ok".
+- M4 code is not at `6fa181a` on origin/main (M4 may have been reverted).
+- LOCKED-17 collision check shows a concurrent agent in another repo within the last hour AND you're about to run destructive E2E SQL.
+- E2E step fails AT A STEP THAT WORKED IN M2/M3/M4 INTEGRATION TESTS — that's a regression, surface immediately.
+- E2E surfaces a new V1 limitation NOT in the documented list — surface to user before continuing.
+- You're tempted to "fix" a §4.1 outbound corner case during M5 — STOP, that's out of M5 scope (and out of M4 scope per the Phase 2 boundary). Document and continue.
 
 ---
 
-## Handoff artifacts from the prior session (2026-05-18)
+## Open questions deferred to M5
 
-- **M3 merged**: https://github.com/oneilstokeseqrm/eq-email-pipeline/pull/9 → `85c0295` (6 Codex rounds; R4 and R6 CLEAN; 4 commits of fixes).
-- **AWS infrastructure provisioned end-to-end** (account `211125681610`):
-  - `eq-email-promoted-queue` SQS, `eq-email-promoted-dlq` SQS, queue policy, `route-email-promoted-to-sqs` rule, target, `SQSEmailPromotedReader` IAM inline policy.
-  - End-to-end synthetic `put-events` → SQS routing test PASSED.
-  - Railway IAM creds end-to-end `ReceiveMessage` test PASSED.
-- **Railway env var set**: `EMAIL_PROMOTED_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/211125681610/eq-email-promoted-queue` on eq-email-pipeline production.
-- **Comprehensive checkpoint**: `~/.gstack/projects/oneilstokeseqrm-eq-email-pipeline/checkpoints/<timestamp>-phase-1-email-pipeline-m3-deployed-m4-next.md` (saved end-of-session).
+1. **Backfill of historical dropped emails** (plan §14 #6) — confirm during M5 that no backfill is needed (test data only; no real users yet per user posture).
+2. **EmailPromoted DLQ + observability** (plan §14 #5) — operations setup, separate from M5 code scope. M5 should verify the DLQ catches malformed messages but the alerting wiring is post-initiative work.
+3. **Queue UI integration** (plan §14 #7) — `app/(workspace)/agent-queue` may want to surface pending_interactions count. Defer to a separate eq-frontend session.
+
+---
+
+## Handoff artifacts from the prior session (2026-05-18 evening)
+
+- **M4 merged**: https://github.com/oneilstokeseqrm/eq-email-pipeline/pull/10 → `6fa181a` (2 Codex rounds; R2 CLEAN; 1 commit of fixes for R1's 3 findings).
+- **M4 deployed**: Railway `756b96e4` SUCCESS; /api/health 200 with all 3 checks ok.
+- **Comprehensive checkpoint**: `~/.gstack/projects/oneilstokeseqrm-live-transcription-fastapi/checkpoints/<timestamp>-phase-1-email-pipeline-m4-shipped-m5-next.md`.
 - **The plan (unchanged)**: `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md` (eq-email-pipeline:`033626a`).
-- **Next-session prompt** (paste-ready): `docs/superpowers/specs/2026-05-18-m4-next-session-prompt.md` (this directory).
+- **Next-session prompt** (paste-ready): `docs/superpowers/specs/2026-05-19-m5-next-session-prompt.md`.
+- **New lessons codified** in `tasks/lessons.md`: "Postgres array concatenation is NULL-poisoned" + "Scope to plan-explicit framing when Codex flags scope expansion" (both 2026-05-18).
 
 ---
 
-## Session lessons codified (in `tasks/lessons.md`)
+## Phase 2 preview (what comes after the initiative ships)
 
-1. **Anchor Codex with on-the-ground comments when schema lives upstream** — inline docstring near SQL referencing upstream PR + Neon-verified live state stops Codex from re-flagging the same upstream-Prisma "missing migration" FP across rounds. M3 R2 → R5: comment in R2's fix appears to have informed R5's analysis (which did NOT re-flag it). Apply to any cross-repo schema reference.
+These are NOT M5 scope but are the natural follow-ons that the Phase 1 + Phase-1-email-pipeline foundation enables:
 
-2. **DB CAS TTL must be strictly longer than SQS VisibilityTimeout** — equal values fire the race at the exact boundary. M3 R5: DB-TTL 5 min == SQS VT 5 min was a real race. Bumped DB-TTL to 10 min. Document the asymmetry in BOTH the SQL and the Python constant; add a test asserting they match.
+1. **Neo4j MERGE-everywhere refactor** — replaces V1 limitations #2 + #5. `build_skeleton` becomes truly idempotent via MERGE on `(tenant_id, interaction_id)` fallback; `write_flesh` uses MERGE for Chunk nodes keyed on `(tenant_id, interaction_id, chunk_index)`.
+2. **Personal/internal anchor audit log table** — replaces V1 limitation #1.
+3. **Contacts identity state machine** — shell/emerging/partial/resolved/verified. Symmetric construct to pending_interactions for emails.
+4. **Outbound cold-outreach capture** — extend M4's §4.1 BUSINESS branch to direction=outbound. Tracks the customer's first emails to new prospects in the pending queue for retroactive linking.
+5. **eq-email-pipeline EmailPromoted DLQ wiring + observability** — alerting on stuck messages.
+6. **Queue UI integration** — surface pending_interactions count per queue entry in `app/(workspace)/agent-queue`.
 
-3. **SQS consumer receipt-deletion is a tri-state decision** — `HandlerOutcome` enum {COMPLETE, PERMANENT_SKIP, TRANSIENT_SKIP} makes the receipt-delete decision explicit + reviewable. M3 R2: naive "no exception = delete" lost messages when a transient-skip handler returned after another worker won the claim. Generalizes to RabbitMQ, Kafka, NATS, Pub/Sub.
+The Phase 2 design doc lives at `docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md`; Phase 2 + Phase 3 sections describe the full roadmap.
