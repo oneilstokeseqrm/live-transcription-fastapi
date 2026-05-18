@@ -40,7 +40,36 @@ from services.account_provisioning.types import (
 )
 
 
-_DEFAULT_TIMEOUT_SECONDS = 120.0
+# Worst-case agent latency observed on sparse-web synthetic domains (M5 E2E,
+# 2026-05-18): 145s for `cold-prospect-{uuid}.com`. Real customer domains
+# with rich web presence enrich in 30-90s, but stealth-mode / new-company /
+# low-web-presence prospects can stretch toward the 120-150s range as the
+# agent retries Tavily searches with progressively broader queries. 300s
+# gives the READ phase ~107% headroom over the observed worst case.
+#
+# Trade-off (Codex M5.2 fix #1 R2 P2): a hung-but-connected upstream
+# (agent accepts connection but never returns body) now sits in the
+# `read` phase for up to 300s per DBOS attempt. With max_attempts=5
+# (interval=2s, backoff=2.0), the retry-interval overhead is 30s total
+# (2+4+8+16) but the cumulative HTTP-read time is 300 × 5 = 1500s.
+# Worst-case time to surface a hang: ~25min, up from ~10min at the old
+# 120s budget. Phase-1 acceptance: the trade-off favors sparse-web
+# happy-path correctness over hung-upstream surfacing speed; a Phase-2
+# workflow-level timeout could re-bound this without sacrificing
+# per-attempt headroom.
+#
+# See tasks/lessons.md "Synthetic test domains stress agent enrichment
+# latency budgets" for the full diagnosis.
+_DEFAULT_TIMEOUT_SECONDS = 300.0
+
+# Connection establishment (DNS + TCP handshake + TLS) should fail fast.
+# Real connectivity issues (bad AGENT_ACTION_CORE_BASE_URL, DNS failure,
+# Railway unreachable) need to surface quickly so DBOS can retry the step;
+# without this cap, a connectivity outage would tie up each retry for the
+# full 300s read budget. 10s is generous for connect on a healthy network
+# but short enough that 5 DBOS retries × 10s = 50s, not 25 minutes.
+# Codex M5.2 fix #1 R1 P2 finding (2026-05-18).
+_DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 
 
 class AgentActionCoreClient:
@@ -56,9 +85,16 @@ class AgentActionCoreClient:
         self,
         base_url: str,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        connect_timeout_seconds: float = _DEFAULT_CONNECT_TIMEOUT_SECONDS,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+        # Per-phase timeouts: short connect (fail fast on outages) + long
+        # read (accommodate slow agent enrichment). Pool + write inherit the
+        # read budget which is fine — they fire on the same long-lived
+        # response stream as read.
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds)
+        )
 
     async def enrich(
         self,

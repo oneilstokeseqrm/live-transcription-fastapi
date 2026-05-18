@@ -1357,3 +1357,181 @@ consumer can explicitly ack/leave. RabbitMQ, Kafka, NATS JetStream,
 Google Pub/Sub — all have ack/nack semantics where naive "no exception
 = ack" loses transient-skip messages. The HandlerOutcome enum is the
 right contract.
+
+## Prisma @@unique materializes as INDEX, not CONSTRAINT — ON CONFLICT must use column-list inference (2026-05-18)
+
+Prisma's `@@unique([col1, col2, ...])` directive generates Postgres
+`CREATE UNIQUE INDEX`, NOT `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`.
+Unique indexes live in `pg_indexes`; unique constraints live in both
+`pg_constraint` AND `pg_indexes`. SQL `ON CONFLICT ON CONSTRAINT <name>`
+ONLY resolves against `pg_constraint`. Application code using the
+`ON CONSTRAINT` form against a Prisma-managed unique will fail with
+`asyncpg.exceptions.UndefinedObjectError: constraint "..." does not exist`.
+
+### Evidence
+
+Phase-1-email-pipeline M5 E2E (2026-05-18). `pending_account_mapping_signals.pending_signal_dedup`
+was declared via Prisma `@@unique` → materialized as a unique INDEX
+only. The Phase-1 SQL at `eq-email-pipeline/src/persistence/pending_account_mappings.py:77`
+used `ON CONFLICT ON CONSTRAINT pending_signal_dedup` — which crashed
+in production on the very first cold-inbound signal flush. The codepath
+had been latent for the entire Phase 1 era because the only callers
+also wrote known-account signals via paths that didn't reach
+insert_signal. M4 made the §4.2 cold-inbound branch reachable; the
+bug surfaced immediately.
+
+### How to apply
+
+1. **For Prisma-managed schemas, always use column-list inference:**
+   `ON CONFLICT (col1, col2, ...) DO NOTHING/UPDATE`. The column list
+   matches against the unique INDEX directly. Same semantics as named
+   constraint, no schema dependency.
+
+2. **If you need a NAMED constraint:** explicitly write
+   `ALTER TABLE ... ADD CONSTRAINT name UNIQUE USING INDEX name;`
+   after Prisma's CREATE INDEX, to promote the index to a constraint.
+   But this is fragile — every Prisma reset/migrate cycle requires
+   re-applying it. Prefer column-list inference.
+
+3. **Test schema MUST match production schema generation pattern.**
+   `tests/schema.sql` declaring `pending_signal_dedup` as a CONSTRAINT
+   masked the production INDEX form in CI. Restate it as
+   `CREATE UNIQUE INDEX` so future ON-CONSTRAINT mistakes fail in
+   tests, not in production.
+
+4. **AsyncMock-based unit tests asserting "ON CONFLICT ON CONSTRAINT X"
+   via string-match lock the wrong shape silently.** Pair every mock
+   test with an integration test against the actual schema. The unit
+   test catches a developer changing the string accidentally; the
+   integration test catches the string being wrong from day one.
+
+### Related
+
+[[feedback_codex_pre_merge_gate]] — Codex review caught the related
+NULL-DISTINCT semantics issue in the integration test (Codex R1 P1).
+The verified-contract scripts shipped in Phase-1.5 M5 don't catch
+this class of bug because they verify SCHEMA presence, not
+ON-CONFLICT-target alignment. Phase-2 candidate: extend
+`scripts/verify_consumer_contracts.py` to grep for `ON CONFLICT ON
+CONSTRAINT <name>` patterns and assert the named constraint exists
+in `pg_constraint` (not just `pg_indexes`).
+
+## Postgres unique indexes default to NULLS DISTINCT — dedup fails for partial-NULL tuples (2026-05-18)
+
+A Postgres unique index on `(a, b, c)` does NOT dedupe two rows where
+some indexed column is NULL. Default NULLS DISTINCT semantics mean
+`NULL ≠ NULL` even when the rest of the tuple matches. So
+`INSERT ... ON CONFLICT (a, b, c) DO NOTHING` will INSERT both rows
+even if `a, b` match and `c` is NULL on both.
+
+### Evidence
+
+`pending_signal_dedup` is on `(queue_id, contact_email, source_type,
+interaction_id, calendar_event_id)`. Email signals always have
+`calendar_event_id=NULL`. Two duplicate webhook deliveries of the
+same email signal → both rows insert (n_rows=2, not 1). Surfaced by
+Codex R1 P1 in M5.1 review (2026-05-18) and confirmed empirically.
+
+Bounded blast radius: the orchestrator's email-level dedup (via
+`email_exists` UNION at `eq-email-pipeline/src/pipeline/orchestrator.py:~113`)
+catches sequential duplicate webhooks BEFORE reaching `insert_signal`.
+The signal-level unique index is genuinely defense-in-depth — its
+NULL hole only matters for truly concurrent webhook races OR manual
+workflow replays. The cosmetic-only failure mode (duplicate signal
+rows for the same observation) doesn't corrupt downstream materialization
+because contacts dedupe by email at the join layer.
+
+### How to apply
+
+1. **Audit every Prisma `@@unique([...])` on tables with nullable
+   indexed columns.** If the table participates in INSERT...ON
+   CONFLICT dedup, the gap is real. Document it OR fix it.
+
+2. **Fix options:**
+   - **`nullsNotDistinct: true` on the `@@unique` directive** (Prisma
+     5.7+, Postgres 15+). Generates `CREATE UNIQUE INDEX ...
+     NULLS NOT DISTINCT`. Clean fix; no application-side change.
+   - **COALESCE NULL columns to a sentinel UUID in the dedup tuple.**
+     E.g., `ON CONFLICT (queue_id, contact_email, source_type,
+     COALESCE(interaction_id, '00000000-...'), COALESCE(calendar_event_id, '00000000-...'))`.
+     Cosmetic; pollutes the dedup key.
+   - **Refactor to source-type-keyed partial indexes:** separate unique
+     constraint per source_type, with NULL columns excluded. Cleaner
+     but requires schema change.
+   - **Document as a known limitation** if defense-in-depth gap is
+     acceptable (because primary dedup happens elsewhere).
+
+3. **Always write a test that asserts the EXPECTED behavior under
+   NULL columns.** If you expect dedup → `assert n_rows == 1`. If you
+   expect NULLS DISTINCT pass-through → `assert n_rows == 2` (with a
+   docstring explaining why this is current Postgres reality). When
+   semantics change (NULLS NOT DISTINCT migration), the test fails
+   loudly.
+
+### Related
+
+[[postgres-array-concat-null-poisoning]] — Same family of NULL-semantics
+landmines. ANSI-SQL's NULL semantics propagate through operators and
+comparisons in ways that are non-obvious; always audit explicitly.
+
+## Synthetic test domains stress agent enrichment latency budgets (2026-05-18)
+
+Real customer domains usually have rich web presence (homepages,
+LinkedIn pages, news articles) that AI account-enrichment agents can
+research in 15-90 seconds. Synthetic test domains with UUID suffixes
+(e.g., `cold-prospect-{uuid12}.com`) have ZERO web presence — Tavily
+returns "no results" for every query, and the agent retries with
+increasingly broad queries until it has SOME synthesis material.
+Observed: 145s for `cold-prospect-f1c4290c2155.com` vs the agent's
+nominal 30-90s budget.
+
+### Evidence
+
+Phase-1-email-pipeline M5 E2E (2026-05-18). HTTP client at
+`live-transcription-fastapi/services/agent_action_core_client.py:43`
+had `_DEFAULT_TIMEOUT_SECONDS=120.0`. Agent took 145s; workflow's
+`client.enrich()` raised `httpx.ReadTimeout`; DBOS step retried;
+each retry hit the same timeout; queue stuck in `status='creating'`;
+account created as side-effect of the timed-out HTTP call (agent
+completed but workflow couldn't receive response).
+
+### How to apply
+
+1. **Production E2E with synthetic domains validates the FAILURE
+   case, not the happy path.** Synthetic test domains are great for
+   "no web presence" edge case verification but cause artificially
+   long agent runs. Either:
+   - Use a known-real domain for happy-path E2E (e.g., a public
+     company's domain that the agent can enrich quickly), OR
+   - Pre-seed the synthetic domain in `accounts` + `account_domains`
+     before the test runs so the orchestrator's `lookup_account_by_domain`
+     short-circuits before reaching the agent path.
+
+2. **HTTP client timeout must accommodate worst-case agent latency,
+   not nominal.** 120s default was set for the 30-90s nominal range.
+   Real customer scenarios that stress this: stealth-mode startups,
+   new companies, internationalized domains, sites blocked from
+   crawlers. Bump to 300s (5 min) at minimum; consider stream-mode
+   or async run_id polling for genuine long-running enrichment.
+
+3. **Workflow step retries don't help if every attempt hits the
+   same timeout.** DBOS `max_attempts=5` with exponential backoff
+   sounds robust but is useless when every retry calls the same slow
+   endpoint with the same insufficient timeout. The retry budget
+   exists for transient errors, not for "we always need 145s and
+   you give us 120s."
+
+4. **Side-effecting calls that "time out" but actually complete are
+   silent data-quality risks.** The agent created an `accounts` row,
+   but the workflow never recorded function 3 success. The row is
+   orphaned (no link from any workflow state). A future workflow
+   retry could create a SECOND account for the same domain (depending
+   on agent dedup). Always check side-effects when a long-running
+   downstream call appears to fail.
+
+### Related
+
+This lesson sits next to [[feedback_codex_pre_merge_gate]] and
+[[production-e2e-non-substitutable]]: production E2E surfaced this
+bug too. Mock-based unit tests can't simulate agent latency
+characteristics for synthetic test data.
