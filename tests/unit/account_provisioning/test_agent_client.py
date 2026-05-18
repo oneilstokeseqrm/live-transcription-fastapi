@@ -40,7 +40,15 @@ async def test_enrich_posts_url_and_effort_to_api_enrich():
         captured["body"] = request.content.decode()
         return httpx.Response(
             200,
-            json={"name": "Acme Inc", "domain": "acme.com"},
+            json={
+                "run_id": "abc-123",
+                "status": "completed",
+                "result": {
+                    "company_name": "Acme Inc",
+                    "website_domain": "acme.com",
+                },
+                "metadata": {"duration_ms": 1000},
+            },
         )
 
     transport = httpx.MockTransport(handler)
@@ -78,7 +86,15 @@ async def test_get_run_returns_account_profile():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
         assert "/api/enrich/run-xyz" in str(request.url)
-        return httpx.Response(200, json={"name": "Acme Inc"})
+        return httpx.Response(
+            200,
+            json={
+                "run_id": "run-xyz",
+                "status": "completed",
+                "result": {"company_name": "Acme Inc"},
+                "metadata": {"duration_ms": 1000},
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     client = AgentActionCoreClient(base_url="http://test.example.com")
@@ -182,10 +198,20 @@ async def test_non_object_body_raises_terminal():
 
 @pytest.mark.asyncio
 async def test_missing_required_field_raises_terminal():
-    """Pydantic validation fail → terminal. AccountProfile.name is required."""
+    """Pydantic validation fail → terminal. AccountProfile.name (aliased
+    from ``company_name``) is required inside the v2 envelope.
+    """
     def handler(_request: httpx.Request) -> httpx.Response:
-        # Missing 'name'
-        return httpx.Response(200, json={"domain": "acme.com"})
+        # `result` envelope present but missing company_name (the v2 name
+        # for our required `name` field).
+        return httpx.Response(
+            200,
+            json={
+                "run_id": "abc-123",
+                "status": "completed",
+                "result": {"website_domain": "acme.com"},
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     client = AgentActionCoreClient(base_url="http://test.example.com")
@@ -201,13 +227,23 @@ async def test_missing_required_field_raises_terminal():
 
 @pytest.mark.asyncio
 async def test_account_profile_tolerates_extra_fields():
-    """``extra='allow'`` on AccountProfile keeps us forward-compat with agent additions."""
+    """``extra='allow'`` on AccountProfile keeps us forward-compat with agent additions.
+
+    The v2 envelope's top-level keys (``run_id``, ``status``, ``metadata``,
+    ``account_id``) live OUTSIDE the AccountProfile (the parser strips
+    the envelope before validation). Unknown fields INSIDE the result
+    envelope are tolerated via ``extra='allow'``.
+    """
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
-            "name": "Acme Inc",
-            "industry": "Manufacturing",
-            "unknown_future_field": {"some": "stuff"},
             "run_id": "abc-123",
+            "status": "completed",
+            "result": {
+                "company_name": "Acme Inc",
+                "industry": "Manufacturing",
+                "unknown_future_field": {"some": "stuff"},
+                "founded_year": 1999,
+            },
         })
 
     transport = httpx.MockTransport(handler)
@@ -222,9 +258,114 @@ async def test_account_profile_tolerates_extra_fields():
 
     assert profile.name == "Acme Inc"
     assert profile.industry == "Manufacturing"
-    # Extra fields preserved via model_dump (forward-compat).
+    # Extra fields INSIDE the envelope are preserved via model_dump (forward-compat).
     dumped = profile.model_dump()
-    assert dumped.get("run_id") == "abc-123"
+    assert dumped.get("unknown_future_field") == {"some": "stuff"}
+    assert dumped.get("founded_year") == 1999
+
+
+@pytest.mark.asyncio
+async def test_enrich_handles_v2_envelope_shape():
+    """M5.3 (2026-05-19): the agent's v2 schema (in production since
+    2026-03-04) wraps the enrichment payload under ``.result``. Parser
+    must unwrap the envelope and apply field aliases (``company_name``
+    → ``name``, ``website_domain`` → ``domain``/``website``, etc.).
+    Regression guard for Bug #4 surfaced at M5.2 production E2E.
+    """
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "run_id": "abc-123",
+            "status": "completed",
+            "result": {
+                "tenant_id": "11111111-1111-4111-8111-111111111111",
+                "input_url": "https://acme.com",
+                "company_name": "Acme Inc",
+                "website_domain": "acme.com",
+                "industry": "Software",
+                "headquarters": "San Francisco",
+                "employee_count_range": "50-200",
+                "company_type": "Private",
+                "one_line_description": "Industrial automation, reimagined.",
+                "schema_version": "2.0.0",
+            },
+            "metadata": {"duration_ms": 5000, "sources_count": 8},
+            "account_id": "00000000-0000-0000-0000-000000000acc",
+        })
+
+    transport = httpx.MockTransport(handler)
+    client = AgentActionCoreClient(base_url="http://test.example.com")
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(30))
+
+    try:
+        profile = await client.enrich(url="acme.com", jwt="tok")
+    finally:
+        await client.aclose()
+
+    # Required field — aliased from company_name.
+    assert profile.name == "Acme Inc"
+    # Aliased fields all populated.
+    assert profile.domain == "acme.com"
+    assert profile.website == "acme.com"
+    assert profile.industry == "Software"
+    assert profile.region == "San Francisco"
+    assert profile.company_size == "50-200"
+    assert profile.company_type == "Private"
+    assert profile.description == "Industrial automation, reimagined."
+
+
+@pytest.mark.asyncio
+async def test_enrich_rejects_v2_response_missing_result_envelope():
+    """If the agent ever drops the ``result`` envelope (returns flat or
+    a status-only response), the parser must fail loud rather than
+    silently accept a response that can't be validated.
+    """
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "run_id": "abc-123",
+            "status": "completed",
+            "metadata": {"duration_ms": 1000},
+        })
+
+    transport = httpx.MockTransport(handler)
+    client = AgentActionCoreClient(base_url="http://test.example.com")
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(30))
+
+    try:
+        with pytest.raises(AgentEnrichTerminalError, match="missing 'result' envelope"):
+            await client.enrich(url="acme.com", jwt="tok")
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_enrich_rejects_v2_response_missing_company_name():
+    """Bug #4 (M5.2): agent's ``result`` envelope present but missing
+    ``company_name`` (the v2 source for our required ``name`` field).
+    Parser must fail loud with the AccountProfile-contract message.
+    """
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "run_id": "abc-123",
+            "status": "completed",
+            "result": {
+                "website_domain": "acme.com",
+                "industry": "Software",
+            },
+            "metadata": {"duration_ms": 1000},
+        })
+
+    transport = httpx.MockTransport(handler)
+    client = AgentActionCoreClient(base_url="http://test.example.com")
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(30))
+
+    try:
+        with pytest.raises(AgentEnrichTerminalError, match="did not match AccountProfile"):
+            await client.enrich(url="acme.com", jwt="tok")
+    finally:
+        await client.aclose()
 
 
 def test_default_timeout_accommodates_observed_worst_case_agent_latency():

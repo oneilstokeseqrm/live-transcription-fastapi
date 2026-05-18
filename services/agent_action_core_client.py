@@ -189,12 +189,28 @@ class AgentActionCoreClient:
             raise AgentEnrichTerminalError(
                 f"Agent response was not a JSON object: type={type(data).__name__}"
             )
+        # M5.3 (2026-05-19): the agent's v2 schema (in production since
+        # 2026-03-04) wraps the enrichment payload under a top-level
+        # `result` key alongside `run_id`, `status`, `metadata`, `account_id`.
+        # `_parse_profile` unwraps the envelope before validating
+        # AccountProfile. The GET /api/enrich/{run_id} endpoint returns the
+        # same envelope shape (eq-agent-action-core enrich_routes.py:160-164),
+        # so both endpoints reuse this parser. The agent's `account_id` is
+        # intentionally ignored — Step 4 `resolve_or_create_account` does
+        # its own idempotent lookup via the shared
+        # `account_domains.(tenant_id, domain)` UNIQUE constraint.
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise AgentEnrichTerminalError(
+                f"Agent response missing 'result' envelope: keys={sorted(data.keys())}"
+            )
         try:
-            return AccountProfile.model_validate(data)
+            return AccountProfile.model_validate(result)
         except ValueError as exc:
             # Pydantic raises ValidationError (a subclass of ValueError).
             # The contract-pinning test in tests/contract/ is the load-bearing
-            # guard; if this fires in production it's a real contract drift.
+            # live-drift guard; if this fires in production it's a real
+            # contract drift inside the result envelope.
             raise AgentEnrichTerminalError(
                 f"Agent response did not match AccountProfile contract: {exc}"
             ) from exc
