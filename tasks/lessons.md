@@ -1059,3 +1059,158 @@ from the same GitHub secret that supplies it to Vercel. Otherwise every
 future Prisma migration PR will trip this check. Small fix; the workflow
 yaml lives in `.github/workflows/` in eq-frontend.
 
+## Anchor Codex with on-the-ground comments when schema lives upstream (2026-05-18)
+
+For PRs in repo A that reference tables/columns whose schema is owned by
+upstream Prisma in repo B, Codex's static analysis CANNOT see the upstream
+schema and will repeatedly flag "missing migration in this repo" as a P1
+finding across multiple review rounds. This is the same family as
+"Codex's static analysis can't see live schema state" (2026-05-14) but on
+a slightly different surface — cross-repo schema ownership instead of
+live-vs-static.
+
+### Evidence: Phase-1-email-pipeline M3 review (2026-05-18)
+
+Codex round-1 P1 flagged "Add the schema migration for local enrichment
+columns" against eq-email-pipeline. The columns live in eq-frontend's
+Prisma schema (added by M1, PR #392, merge `de586bbc`, deployed
+2026-05-17). Pre-flight Neon MCP query confirmed they're live. Round-2
+re-flagged the SAME finding (FP repeat). After adding an inline docstring
+in `handle_email_promoted` citing the upstream PR + schema-ownership
+reference (`reference_prisma_schema_ownership.md`) + verified-deployed
+state, round-5 did NOT re-flag it.
+
+### How to apply
+
+When writing SQL in repo A that references upstream-Prisma schema:
+
+1. **First Codex round catches the FP.** Don't fix by adding a migration
+   to repo A — that would duplicate / conflict with the canonical schema.
+
+2. **Anchor with an inline comment.** Add a docstring or `# NOTE:` block
+   near the SQL citing:
+   - The upstream PR + merge SHA + deploy date
+   - The Neon MCP query that verified the columns are live
+   - The auto-memory reference (`reference_prisma_schema_ownership.md`)
+   - The lesson reference ("see tasks/lessons.md 'Codex's static
+     analysis can't see live schema state'")
+
+3. **The comment helps both Codex AND humans.** Codex's next pass on the
+   diff appears to incorporate inline comments into its analysis — it
+   stopped re-flagging the M3 finding after the anchor comment landed.
+   And future reviewers reading the SQL won't have to re-discover the
+   cross-repo ownership.
+
+4. **PR description still documents the FP explicitly.** Even after
+   anchoring, list the carry FP in the PR description so the reviewer
+   knows what Codex previously flagged and why it's a non-issue.
+
+## DB CAS TTL must be strictly longer than SQS VisibilityTimeout (2026-05-18)
+
+When a Postgres CAS guard (`UPDATE ... SET claimed_at = NOW() WHERE ... AND
+(claimed_at IS NULL OR claimed_at < NOW() - INTERVAL 'N minutes') RETURNING id`)
+and an SQS VisibilityTimeout both bound the same race, the TWO TTLs MUST
+differ — equal values fire the race at the exact boundary.
+
+### Why it matters
+
+At the boundary:
+- T0:     Worker-A receives msg (SQS VT starts), wins CAS (DB TTL starts).
+- T+5min: BOTH timers expire simultaneously.
+- T+5min: SQS makes msg visible → Worker-B receives.
+- T+5min: Worker-B reads row: `started_at` exactly 5 min ago. Comparison
+          on the second boundary is non-deterministic with clock skew.
+- T+5min+ε: Worker-B's CAS wins (started_at < NOW() - 5min by clock skew),
+          starts CONCURRENT non-idempotent writes with Worker-A who is
+          still running.
+
+### How to apply
+
+For any SQS consumer with a DB-side claim guard:
+
+1. **Make DB-TTL strictly larger than VT.** E.g., DB-TTL = 2×VT or
+   VT + safety margin. Phase-1-email-pipeline M3 uses DB-TTL = 10 min,
+   VT = 5 min.
+
+2. **The redelivered worker at T+VT then sees the claim within DB-TTL.**
+   It returns TRANSIENT_SKIP (leaves message in queue). The concurrent-
+   claim window opens only at T+DB-TTL, by which point a non-
+   pathologically-hung worker has either completed or genuinely crashed.
+
+3. **Document the relationship in both the SQL and the Python constant.**
+   The Python-side TTL (used for early-return guard) and the SQL CAS
+   interval (used for atomic claim) MUST stay in lockstep. Add a
+   cross-reference comment in both places. Use a test to assert the
+   Python constant matches the documented value.
+
+4. **The race is bounded, not eliminated.** A worker that takes longer
+   than DB-TTL still triggers the concurrent-claim window. For truly
+   safe re-entry, either (a) make the downstream writes idempotent
+   (MERGE patterns + edge-count counters), or (b) use SQS
+   ChangeMessageVisibility heartbeat to extend VT while work is in
+   progress. Plan §6.3 documents the V1 acceptance + V2 roadmap.
+
+### Codex round-5 P1 (2026-05-18)
+
+Initial M3 design had DB-TTL = SQS VT = 5 min (matched intentionally for
+"alignment"). Codex flagged the boundary race. Fix: bumped DB-TTL to
+10 min; documented the asymmetry in both the SQL comment + the `_CLAIM_TTL`
+constant + the handler docstring. Race is now bounded by 10 min instead
+of 5 min — same V1 limitation magnitude, requires deeper hang to trigger.
+
+## SQS consumer receipt-deletion is a tri-state decision, not binary (2026-05-18)
+
+Naive SQS consumer pattern: `handle(msg); delete_message(msg)`. The
+implicit assumption is "no exception = success = delete." This loses
+messages when the handler returns successfully but has not actually
+completed the work — specifically when it "skipped" because another
+worker is in flight.
+
+### Evidence: Phase-1-email-pipeline M3 Codex round-2 P1 (2026-05-18)
+
+Handler had a Layer-2 in-flight guard:
+```python
+if started_at is not None and started_at > now - 5min:
+    return  # another handler holds the claim
+```
+
+The `_process_message()` wrapper then deleted the receipt because no
+exception was raised. The race:
+
+- T0:     Worker-A receives msg, wins CAS (started_at = T0).
+- T0+ε:   Worker-B receives same msg (duplicate / VT expiry).
+- T0+ε:   Worker-B sees started_at within TTL → returns "skip" →
+          `_process_message` deletes the receipt.
+- T+X:    Worker-A crashes before completing enrichment.
+- Result: started_at is set, completed_at NULL, NO SQS message to retry.
+          Email is stuck "started but never completed" forever.
+
+### How to apply
+
+1. **Return an outcome enum from the handler, not None.** Three states:
+   - `COMPLETE` — work done (or already done) — delete the receipt.
+   - `PERMANENT_SKIP` — cannot succeed on retry (unknown id, perma-bad
+     state) — delete the receipt to prevent DLQ loop.
+   - `TRANSIENT_SKIP` — lost the race against a concurrent worker —
+     DO NOT delete; let SQS redeliver after VisibilityTimeout.
+
+2. **`_process_message` switches on the outcome.** Delete on COMPLETE
+   or PERMANENT_SKIP. Leave receipt for TRANSIENT_SKIP. Handler
+   exceptions also leave the receipt (SQS handles retry via maxReceiveCount).
+
+3. **Write a regression test for each branch.** Mock the SQS client,
+   call `_process_message` with a handler that returns each outcome,
+   assert `delete_message` was/wasn't called.
+
+4. **Document the failure mode in the enum's docstring.** The race
+   scenario is non-obvious; the enum + its docstring is the most
+   readable place to capture WHY the tri-state exists. Future
+   contributors looking at the SQS code will see it immediately.
+
+### Generalizes beyond SQS
+
+The same pattern applies to any at-least-once message queue where the
+consumer can explicitly ack/leave. RabbitMQ, Kafka, NATS JetStream,
+Google Pub/Sub — all have ack/nack semantics where naive "no exception
+= ack" loses transient-skip messages. The HandlerOutcome enum is the
+right contract.
