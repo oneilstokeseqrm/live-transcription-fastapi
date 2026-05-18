@@ -1701,3 +1701,119 @@ M5.2's timeout fix exposed Bug #4's latent shape drift. Any
 "reachability-increasing" change creates a wave of newly-visible
 latent bugs downstream of where it lands.
 
+## Multi-writer Neo4j MERGE-key coordination is its own bug class (2026-05-18)
+
+When two services both write to the same logical Neo4j node but use
+different MERGE keys, the system is structurally broken: the second
+writer can neither find nor create the node, and idempotency guards
+designed for single-writer partial retries don't help because the
+problem is upstream of "retry" semantics. This is a DIFFERENT bug
+class from single-writer partial-retry corruption (which a 2-layer
+guard correctly bounds). Multi-writer collision can stay invisible
+for months if the second writer's path was previously unreachable
+(e.g., gated by an earlier failure that's now been fixed).
+
+### Evidence
+
+Phase-1-email-pipeline M5.3 production E2E (2026-05-18) discovered
+that eq-email-pipeline's `EmailPromoted` handler can never complete
+local enrichment because eq-structured-graph-core's earlier
+`EnvelopeV1.email` consumer ALREADY created the Neo4j Interaction
+node — by `(tenant_id, interaction_id)`, WITHOUT setting
+`internet_message_id`. eq-email-pipeline's `build_skeleton` then
+`MERGE (i:Interaction {tenant_id, internet_message_id})` can't find
+the existing node (no internet_message_id property), falls through
+to its CREATE fallback, and trips the `(tenant_id, interaction_id)`
+UNIQUE constraint. Every retry hits the same wall → DLQ. Latent
+since M3 deployed 2026-05-17; surfaced only when M5.3 made the
+workflow finally reach SUCCESS (the first production run that
+exercised both Step 5 emit → eq-structured-graph-core AND Step 6
+emit → eq-email-pipeline). The 2-layer guard (Layer 1: completed_at
+hard guard, Layer 2: started_at TTL) prevents data corruption but
+not completion.
+
+### How to apply
+
+1. **When two services write to the same Neo4j node type, document
+   the MERGE-key contract explicitly.** A single source of truth
+   for "how do we identify this node uniquely" — both writers must
+   share it. RFC 5322 internet_message_id is fine for emails, but
+   if the producer doesn't set it, MERGE-by-it can't reconcile.
+2. **The fix can be at consumer (Option A: change MERGE key), producer
+   (Option B: set the missing field), or shared (Option C: define a
+   contract document). Choose by blast radius.** Cross-service code
+   change to a producer that has multiple consumers (transcripts +
+   emails + future signals) has higher blast radius than a
+   single-consumer change.
+3. **Before coding, use /codex consult + /plan-eng-review.** Cross-
+   service architectural changes warrant adversarial review. /codex
+   challenge mode is especially valuable: explicitly ask Codex to
+   find ways the fix could break OTHER consumers of the shared graph.
+4. **Don't conflate this with documented V1 limitations on
+   single-writer partial retry.** Those limitations cover within-a-
+   single-handler retry corruption (bounded by 2-layer guard).
+   Multi-writer collision is upstream of retry; the 2-layer guard
+   doesn't help.
+5. **When a "newly-reachable" bug surfaces in production after an
+   upstream fix, check whether the downstream path has changed in
+   the same window OR whether something new is now arriving at it
+   that never arrived before.** Both can produce the same symptom.
+
+### Related
+
+[[timeout-fixes-expose-latent-shape-bugs]] — same general pattern:
+M5.3's workflow-SUCCESS landing is what made the eq-email-pipeline
+handler's Step 5+6 emit path reachable for the first time, exposing
+the multi-writer collision that had been latent since M3 deployed.
+Reachability-increasing changes (timeout fixes, parser fixes,
+workflow-completion fixes) create waves of newly-visible bugs.
+
+## Railway MCP `deployment_logs` returns runtime logs despite description (2026-05-18)
+
+The `mcp__railway__deployment_logs` tool's description says it's for
+"build output" and "Not for: Service runtime logs" — but it ACTUALLY
+returns runtime logs from the running container. This discovery
+unblocked M5.4's investigation; without it, runtime-log access would
+have required `railway login` (interactive auth not available to AI
+agents) or GCP Application Default Credentials (also interactive).
+
+### Evidence
+
+Phase-1-email-pipeline M5.3 session (2026-05-18) couldn't get
+runtime logs for eq-email-pipeline via:
+- `railway logs` CLI → "Unauthorized. Please login with `railway login`."
+- `mcp__observability__list_log_entries` → "Could not load the
+  default credentials" (needs `gcloud auth application-default
+  login`).
+
+Trying `mcp__railway__deployment_logs` on the latest SUCCESS
+deployment (despite the tool description) returned full runtime
+stack traces including the `neo4j.exceptions.ConstraintError` that
+proved M5.4's hypothesis. The tool's actual behavior: it returns
+ALL logs from the deployment (build + runtime), not just build.
+
+### How to apply
+
+1. **For any Railway service diagnostics, try
+   `mcp__railway__deployment_logs` FIRST** — bypass the interactive
+   auth flows the CLI and GCP MCP require.
+2. **Use the latest SUCCESS deployment ID** from
+   `mcp__railway__deployment_list`. Older "REMOVED" deployments
+   may have less detailed runtime data.
+3. **Increase the `limit` parameter** (default 50 is too few for
+   serious diagnostics). 200-500 is reasonable for an investigation;
+   1000+ for a deep dive.
+4. **Tool descriptions can lie.** Always try the tool before
+   concluding it can't do what you need.
+5. **Save the Railway project + service + environment IDs once**
+   to a reference memory entry. Searching the project list every
+   session wastes context.
+
+### Related
+
+Saved a [[reference-railway-project-ids]] memory entry with all
+relevant project + service + environment IDs for the Contact
+Quality initiative's 5 services (live-transcription-fastapi,
+eq-email-pipeline, eq-agent-action-core, action-item-graph,
+eq-structured-graph-core).
+
