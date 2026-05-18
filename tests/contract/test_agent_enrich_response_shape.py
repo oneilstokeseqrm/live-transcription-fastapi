@@ -82,7 +82,12 @@ async def test_live_agent_returns_account_profile_compatible_shape():
     base_url = os.environ.get("AGENT_ACTION_CORE_BASE_URL", _AGENT_PROD_URL)
     jwt_token = _mint_test_jwt()
 
-    client = AgentActionCoreClient(base_url=base_url, timeout_seconds=180.0)
+    # Inherit the production default (currently 300s read + 10s connect).
+    # M5.2 Codex R2 P3: pinning a separate value here lets the contract
+    # test silently diverge from production behavior as the default
+    # evolves. anthropic.com enriches in 30-90s with effort=low so the
+    # default budget is more than sufficient.
+    client = AgentActionCoreClient(base_url=base_url)
     try:
         # Use a benign, well-known domain that produces a valid
         # AccountProfile but doesn't pollute production state. The

@@ -45,9 +45,19 @@ from services.account_provisioning.types import (
 # with rich web presence enrich in 30-90s, but stealth-mode / new-company /
 # low-web-presence prospects can stretch toward the 120-150s range as the
 # agent retries Tavily searches with progressively broader queries. 300s
-# gives the READ phase headroom for those cases without masking genuine
-# hangs (DBOS retry policy still bounds total time at
-# max_attempts × interval × backoff).
+# gives the READ phase ~107% headroom over the observed worst case.
+#
+# Trade-off (Codex M5.2 fix #1 R2 P2): a hung-but-connected upstream
+# (agent accepts connection but never returns body) now sits in the
+# `read` phase for up to 300s per DBOS attempt. With max_attempts=5
+# (interval=2s, backoff=2.0), the retry-interval overhead is 30s total
+# (2+4+8+16) but the cumulative HTTP-read time is 300 × 5 = 1500s.
+# Worst-case time to surface a hang: ~25min, up from ~10min at the old
+# 120s budget. Phase-1 acceptance: the trade-off favors sparse-web
+# happy-path correctness over hung-upstream surfacing speed; a Phase-2
+# workflow-level timeout could re-bound this without sacrificing
+# per-attempt headroom.
+#
 # See tasks/lessons.md "Synthetic test domains stress agent enrichment
 # latency budgets" for the full diagnosis.
 _DEFAULT_TIMEOUT_SECONDS = 300.0
