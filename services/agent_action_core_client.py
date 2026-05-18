@@ -45,11 +45,21 @@ from services.account_provisioning.types import (
 # with rich web presence enrich in 30-90s, but stealth-mode / new-company /
 # low-web-presence prospects can stretch toward the 120-150s range as the
 # agent retries Tavily searches with progressively broader queries. 300s
-# gives headroom for those cases without masking genuine hangs (DBOS retry
-# policy still bounds total time at max_attempts × interval × backoff).
+# gives the READ phase headroom for those cases without masking genuine
+# hangs (DBOS retry policy still bounds total time at
+# max_attempts × interval × backoff).
 # See tasks/lessons.md "Synthetic test domains stress agent enrichment
 # latency budgets" for the full diagnosis.
 _DEFAULT_TIMEOUT_SECONDS = 300.0
+
+# Connection establishment (DNS + TCP handshake + TLS) should fail fast.
+# Real connectivity issues (bad AGENT_ACTION_CORE_BASE_URL, DNS failure,
+# Railway unreachable) need to surface quickly so DBOS can retry the step;
+# without this cap, a connectivity outage would tie up each retry for the
+# full 300s read budget. 10s is generous for connect on a healthy network
+# but short enough that 5 DBOS retries × 10s = 50s, not 25 minutes.
+# Codex M5.2 fix #1 R1 P2 finding (2026-05-18).
+_DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 
 
 class AgentActionCoreClient:
@@ -65,9 +75,16 @@ class AgentActionCoreClient:
         self,
         base_url: str,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        connect_timeout_seconds: float = _DEFAULT_CONNECT_TIMEOUT_SECONDS,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+        # Per-phase timeouts: short connect (fail fast on outages) + long
+        # read (accommodate slow agent enrichment). Pool + write inherit the
+        # read budget which is fine — they fire on the same long-lived
+        # response stream as read.
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds)
+        )
 
     async def enrich(
         self,
