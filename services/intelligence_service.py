@@ -121,6 +121,7 @@ class IntelligenceService:
                 await self._persist_contact_links(
                     interaction_id=interaction_id,
                     tenant_id=tenant_id,
+                    account_id=account_id,
                     contact_ids=contact_ids,
                     interaction_type=interaction_type,
                     calendar_event_id=calendar_event_id,
@@ -427,6 +428,7 @@ Do not invent or assume information not stated."""
         self,
         interaction_id: str,
         tenant_id: str,
+        account_id: str,
         contact_ids: list[str],
         interaction_type: str = "meeting",
         calendar_event_id: Optional[str] = None,
@@ -439,42 +441,52 @@ Do not invent or assume information not stated."""
         calendar_event_interaction_links.interaction_id FK to
         interaction_summaries.summary_id (not to the raw interaction_id).
 
-        The interaction_summaries row is normally created by the summaries-writer
-        service asynchronously, so it may not exist yet. We create a minimal
-        placeholder row so the FK is satisfied. The summaries-writer will create
-        its own separate row later (no unique constraint on interaction_id).
+        Idempotent on (tenant_id, interaction_id, summary_type): a retry of
+        the same transcript reuses the existing interaction_summaries row
+        (and its summary_id) instead of producing duplicate rows that would
+        cascade into duplicate interaction_contact_links and
+        calendar_event_interaction_links.
         """
         interaction_uuid = UUID(interaction_id)
         tenant_uuid = UUID(tenant_id)
+        account_uuid = UUID(account_id)
 
         async with get_async_session() as session:
             try:
                 # FK chain: raw_interactions → interaction_summaries → interaction_contact_links
                 # We must ensure both parent rows exist before writing contact links.
 
-                # Step 1: Ensure raw_interactions row exists (summaries-writer may
-                # have already created it; ON CONFLICT DO NOTHING is safe).
+                # Step 1: Ensure raw_interactions row exists. account_id is
+                # NOT NULL on the schema; the summaries-writer service may
+                # have already created the row, so ON CONFLICT DO NOTHING.
                 await session.execute(
                     sa_text("""
                         INSERT INTO raw_interactions (
-                            interaction_id, tenant_id, interaction_type, updated_at
+                            interaction_id, tenant_id, account_id,
+                            interaction_type, updated_at
                         ) VALUES (
-                            :interaction_id, :tenant_id, :interaction_type, NOW()
+                            :interaction_id, :tenant_id, :account_id,
+                            :interaction_type, NOW()
                         )
                         ON CONFLICT (interaction_id) DO NOTHING
                     """),
                     {
                         "interaction_id": interaction_uuid,
                         "tenant_id": tenant_uuid,
+                        "account_id": account_uuid,
                         "interaction_type": interaction_type,
                     },
                 )
 
-                # Step 2: Create interaction_summaries placeholder row.
-                # summary_id is a new UUID (PK), interaction_id links back
-                # to raw_interactions.
-                summary_uuid = uuid4()
-                await session.execute(
+                # Step 2: Upsert interaction_summaries placeholder, idempotent
+                # on (tenant_id, interaction_id, summary_type) — the composite
+                # UNIQUE added by the Phase-1-email-pipeline M1 Prisma
+                # migration. The DO UPDATE preserves updated_at (no-op write)
+                # so RETURNING gives back the existing summary_id on retry
+                # rather than allocating a new one. Mirrors
+                # UPSERT_PLACEHOLDER_SUMMARY_SQL in
+                # services/account_provisioning/materialization.py.
+                summary_result = await session.execute(
                     sa_text("""
                         INSERT INTO interaction_summaries (
                             summary_id, tenant_id, interaction_id,
@@ -483,14 +495,18 @@ Do not invent or assume information not stated."""
                             :summary_id, :tenant_id, :interaction_id,
                             :summary_type, NOW(), NOW()
                         )
+                        ON CONFLICT (tenant_id, interaction_id, summary_type) DO UPDATE
+                            SET updated_at = interaction_summaries.updated_at
+                        RETURNING summary_id
                     """),
                     {
-                        "summary_id": summary_uuid,
+                        "summary_id": uuid4(),
                         "tenant_id": tenant_uuid,
                         "interaction_id": interaction_uuid,
                         "summary_type": interaction_type,
                     },
                 )
+                summary_uuid = summary_result.scalar_one()
 
                 # Write interaction_contact_links (summary → contact)
                 # interaction_id column actually holds summary_id per FK

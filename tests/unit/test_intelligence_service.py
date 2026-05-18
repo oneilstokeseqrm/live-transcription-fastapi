@@ -290,3 +290,265 @@ def test_process_transcript_requires_account_id():
     assert "Optional" not in str(param.annotation), (
         f"account_id annotation should not be Optional, got {param.annotation}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug #8 regression tests
+# ---------------------------------------------------------------------------
+# Bug #8a: services/intelligence_service.py _persist_contact_links was
+# INSERTing into raw_interactions without account_id (schema is NOT NULL),
+# raising NotNullViolationError which was caught as "non-fatal" and rolled
+# back the whole _persist_contact_links transaction. Result: 0 rows in
+# raw_interactions(transcript), interaction_summaries, interaction_contact_links,
+# calendar_event_interaction_links for every transcript reaching the
+# conditional path.
+#
+# Bug #8b: the same function generated a fresh uuid4() for summary_id on
+# every call, with no idempotency. Retries would produce duplicate
+# interaction_summaries rows (and cascade duplicates into the link tables
+# via summary_id FKs). Fixed by ON CONFLICT (tenant_id, interaction_id,
+# summary_type) DO UPDATE ... RETURNING summary_id, mirroring the M2 pattern
+# in services/account_provisioning/materialization.py.
+
+
+def test_persist_contact_links_requires_account_id():
+    """Bug #8a: account_id must be a required positional parameter."""
+    sig = inspect.signature(IntelligenceService._persist_contact_links)
+    assert "account_id" in sig.parameters, (
+        "_persist_contact_links must accept account_id (required for "
+        "raw_interactions.account_id NOT NULL column)"
+    )
+    param = sig.parameters["account_id"]
+    assert param.default is inspect.Parameter.empty, (
+        "_persist_contact_links(account_id) must be required (no default), "
+        f"got default={param.default!r}"
+    )
+    assert "Optional" not in str(param.annotation), (
+        f"account_id annotation should not be Optional, got {param.annotation}"
+    )
+
+
+def _make_mock_session(summary_id_to_return):
+    """Build an AsyncMock session whose execute() returns a result object
+    with scalar_one() yielding the given summary_id (used for the upsert
+    RETURNING clause).
+    """
+    from unittest.mock import MagicMock, AsyncMock
+
+    mock_session = MagicMock()
+
+    # Result returned by the interaction_summaries upsert (the 2nd execute call).
+    # The other execute calls don't read .scalar_one(); we still need them to
+    # be awaitable AsyncMock calls.
+    upsert_result = MagicMock()
+    upsert_result.scalar_one = MagicMock(return_value=summary_id_to_return)
+
+    mock_session.execute = AsyncMock(return_value=upsert_result)
+    mock_session.commit = AsyncMock()
+    mock_session.rollback = AsyncMock()
+
+    # async context manager returning mock_session
+    mock_ctx = MagicMock()
+    mock_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    return mock_session, mock_ctx
+
+
+@pytest.mark.asyncio
+async def test_persist_contact_links_includes_account_id_in_raw_interactions_insert(service):
+    """Bug #8a: the raw_interactions INSERT must include account_id in both
+    the column list and the bound parameters.
+    """
+    from uuid import UUID
+    from unittest.mock import patch
+
+    account_uuid_str = "0e49a47e-0200-5e4f-962c-2b3df57e0624"
+    interaction_uuid_str = "11111111-1111-4111-8111-111111111111"
+    tenant_uuid_str = "22222222-2222-4222-8222-222222222222"
+    contact_uuid_str = "33333333-3333-4333-8333-333333333333"
+    existing_summary_uuid = UUID("44444444-4444-4444-8444-444444444444")
+
+    mock_session, mock_ctx = _make_mock_session(existing_summary_uuid)
+
+    with patch(
+        "services.intelligence_service.get_async_session", return_value=mock_ctx
+    ):
+        await service._persist_contact_links(
+            interaction_id=interaction_uuid_str,
+            tenant_id=tenant_uuid_str,
+            account_id=account_uuid_str,
+            contact_ids=[contact_uuid_str],
+            interaction_type="meeting",
+        )
+
+    # First execute() call must be the raw_interactions INSERT
+    first_call = mock_session.execute.call_args_list[0]
+    sql_text_arg = first_call.args[0]
+    params = first_call.args[1]
+    sql_str = str(sql_text_arg)
+
+    assert "INSERT INTO raw_interactions" in sql_str
+    assert "account_id" in sql_str, (
+        "raw_interactions INSERT must include account_id column"
+    )
+    assert ":account_id" in sql_str, (
+        "raw_interactions INSERT must bind :account_id placeholder"
+    )
+    assert "account_id" in params, (
+        "raw_interactions INSERT must pass account_id in params dict"
+    )
+    assert params["account_id"] == UUID(account_uuid_str)
+
+
+@pytest.mark.asyncio
+async def test_persist_contact_links_reuses_returned_summary_id_for_links(service):
+    """Bug #8b: the function must read summary_id from the upsert's
+    RETURNING clause (which yields the existing summary_id on retry, or the
+    candidate one on first call) and bind THAT id to downstream link inserts.
+    Proves the code doesn't fall back to a fresh uuid4() that ignores
+    RETURNING.
+    """
+    from uuid import UUID
+    from unittest.mock import patch
+
+    account_uuid_str = "0e49a47e-0200-5e4f-962c-2b3df57e0624"
+    interaction_uuid_str = "11111111-1111-4111-8111-111111111111"
+    tenant_uuid_str = "22222222-2222-4222-8222-222222222222"
+    contact_uuid_str = "33333333-3333-4333-8333-333333333333"
+    calendar_event_uuid_str = "55555555-5555-4555-8555-555555555555"
+
+    # Simulate retry: existing row has summary_id X; RETURNING gives X back.
+    existing_summary_uuid = UUID("44444444-4444-4444-8444-444444444444")
+
+    mock_session, mock_ctx = _make_mock_session(existing_summary_uuid)
+
+    with patch(
+        "services.intelligence_service.get_async_session", return_value=mock_ctx
+    ):
+        await service._persist_contact_links(
+            interaction_id=interaction_uuid_str,
+            tenant_id=tenant_uuid_str,
+            account_id=account_uuid_str,
+            contact_ids=[contact_uuid_str],
+            interaction_type="meeting",
+            calendar_event_id=calendar_event_uuid_str,
+        )
+
+    calls = mock_session.execute.call_args_list
+    # 1: raw_interactions INSERT, 2: interaction_summaries upsert,
+    # 3: interaction_contact_links INSERT, 4: calendar_event_interaction_links INSERT
+    assert len(calls) >= 4
+
+    # Step 2: interaction_summaries upsert MUST use ON CONFLICT ... RETURNING
+    upsert_sql = str(calls[1].args[0])
+    assert "INSERT INTO interaction_summaries" in upsert_sql
+    assert "ON CONFLICT" in upsert_sql
+    assert "tenant_id, interaction_id, summary_type" in upsert_sql, (
+        "Upsert must use the composite UNIQUE on (tenant_id, interaction_id, "
+        "summary_type) — column-tuple form, NOT named-constraint form (the "
+        "underlying index is unnamed-by-constraint, matching the Bug #1 lesson)"
+    )
+    assert "RETURNING summary_id" in upsert_sql, (
+        "Upsert must RETURN summary_id so the caller reuses existing id on retry"
+    )
+
+    # Step 3: interaction_contact_links INSERT must bind the RETURNED summary_id,
+    # NOT a fresh uuid4 the caller generated locally.
+    contact_link_params = calls[2].args[1]
+    assert contact_link_params["summary_id"] == existing_summary_uuid, (
+        f"interaction_contact_links.summary_id should be the RETURNING value "
+        f"({existing_summary_uuid}), got {contact_link_params['summary_id']!r}"
+    )
+
+    # Step 4: calendar_event_interaction_links INSERT must bind the same id.
+    cal_link_params = calls[3].args[1]
+    assert cal_link_params["summary_id"] == existing_summary_uuid, (
+        f"calendar_event_interaction_links.summary_id should be the RETURNING "
+        f"value ({existing_summary_uuid}), got {cal_link_params['summary_id']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_contact_links_uses_returned_id_when_summary_is_new(service):
+    """Bug #8b first-call path: on a fresh INSERT (no prior summary), the
+    upsert's RETURNING yields the candidate summary_id we just inserted.
+    The function must still read it from RETURNING (not from the local
+    uuid4 it generated) — otherwise the contract is brittle and a future
+    refactor that changes the candidate generation will silently break
+    retries.
+    """
+    from uuid import UUID
+    from unittest.mock import patch
+
+    account_uuid_str = "0e49a47e-0200-5e4f-962c-2b3df57e0624"
+    interaction_uuid_str = "11111111-1111-4111-8111-111111111111"
+    tenant_uuid_str = "22222222-2222-4222-8222-222222222222"
+    contact_uuid_str = "33333333-3333-4333-8333-333333333333"
+
+    # First-call path: RETURNING gives back a fresh UUID (simulating the
+    # candidate we just inserted). We control it via the mock.
+    returned_uuid = UUID("66666666-6666-4666-8666-666666666666")
+
+    mock_session, mock_ctx = _make_mock_session(returned_uuid)
+
+    with patch(
+        "services.intelligence_service.get_async_session", return_value=mock_ctx
+    ):
+        await service._persist_contact_links(
+            interaction_id=interaction_uuid_str,
+            tenant_id=tenant_uuid_str,
+            account_id=account_uuid_str,
+            contact_ids=[contact_uuid_str],
+            interaction_type="meeting",
+        )
+
+    calls = mock_session.execute.call_args_list
+
+    # The contact_links INSERT must bind the RETURNED uuid, not whatever
+    # local uuid4() the function happened to generate.
+    contact_link_params = calls[2].args[1]
+    assert contact_link_params["summary_id"] == returned_uuid
+
+
+@pytest.mark.asyncio
+async def test_process_transcript_threads_account_id_to_persist_contact_links(service):
+    """Bug #8a regression: process_transcript receives account_id and must
+    pass it to _persist_contact_links (the silent-param-drop pattern that
+    caused Bug #8). This catches the bug at the call site, not just the
+    callee signature.
+    """
+    from unittest.mock import AsyncMock
+
+    account_id = "0e49a47e-0200-5e4f-962c-2b3df57e0624"
+    contact_id = "33333333-3333-4333-8333-333333333333"
+
+    mock_analysis = InteractionAnalysis(
+        summaries=Summaries(
+            title="Test", headline="Test", brief="Test",
+            detailed="Test", spotlight="Test"
+        ),
+        action_items=[], decisions=[], risks=[],
+        key_takeaways=[], product_feedback=[], market_intelligence=[]
+    )
+
+    service._extract_intelligence = AsyncMock(return_value=mock_analysis)
+    service._persist_intelligence = AsyncMock()
+    service._persist_contact_links = AsyncMock()
+
+    await service.process_transcript(
+        cleaned_transcript="Test transcript",
+        interaction_id="550e8400-e29b-41d4-a716-446655440000",
+        tenant_id="550e8400-e29b-41d4-a716-446655440001",
+        account_id=account_id,
+        trace_id="550e8400-e29b-41d4-a716-446655440002",
+        interaction_type="meeting",
+        contact_ids=[contact_id],
+    )
+
+    service._persist_contact_links.assert_called_once()
+    call_kwargs = service._persist_contact_links.call_args.kwargs
+    assert call_kwargs.get("account_id") == account_id, (
+        f"process_transcript must thread account_id={account_id!r} to "
+        f"_persist_contact_links, got kwargs={call_kwargs!r}"
+    )
