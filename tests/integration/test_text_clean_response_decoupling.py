@@ -271,6 +271,169 @@ def test_text_clean_lane2_exception_is_logged_not_silenced(
     ), "No ERROR log carries the actual Lane 2 exception."
 
 
+def test_text_clean_backpressure_returns_503_when_at_capacity(
+    client, valid_headers, caplog, monkeypatch
+):
+    """When ``_INFLIGHT_LANE2`` is at the configured cap, /text/clean
+    returns 503 with a Retry-After header BEFORE Lane 1 publishes — so a
+    burst-rejected client retry doesn't produce duplicate Kinesis events.
+
+    Pins Codex /codex review round-3 P1 #2 + round-4 P1 fix: pre-PR,
+    response latency naturally throttled concurrency; fire-and-forget
+    removed that cap and bursts could spawn unbounded background
+    OpenAI/DB sessions. Round-4 found a check-then-await race in the
+    original fix — the v2 uses an atomic counter incremented BEFORE any
+    await, so concurrent bursts cannot all observe the same stale count.
+    """
+    import routers.text as text_module
+
+    # _max_background_tasks() reads the env var on each call so .env
+    # changes take effect. Force the cap to 1 for this test.
+    monkeypatch.setenv("TEXT_CLEAN_MAX_BG_TASKS", "1")
+    # Pre-fill the in-flight counter to trip the check.
+    text_module._INFLIGHT_LANE2[0] = 1
+    try:
+        intelligence_instance = MagicMock()
+        intelligence_instance.process_transcript = AsyncMock(return_value=MagicMock())
+
+        publisher_instance = MagicMock()
+        publisher_instance.publish_envelope = AsyncMock(
+            return_value={"kinesis_sequence": "seq-1", "eventbridge_id": "evt-1"}
+        )
+
+        cleaner_instance = MagicMock()
+        cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
+
+        with caplog.at_level(logging.WARNING, logger="routers.text"), \
+             patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
+             patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
+             patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+             patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
+             patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
+
+            body = {
+                "text": "This is some raw text to clean",
+                "account_id": valid_headers["X-Account-ID"],
+            }
+            response = client.post("/text/clean", json=body, headers=valid_headers)
+    finally:
+        text_module._INFLIGHT_LANE2[0] = 0
+
+    assert response.status_code == 503
+    assert response.headers.get("retry-after") == "60"
+
+    # Critical: Lane 1 must NOT have published — backpressure check is BEFORE
+    # the publish so a retry doesn't produce duplicate Kinesis events.
+    publisher_instance.publish_envelope.assert_not_called()
+    intelligence_instance.process_transcript.assert_not_called()
+
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        "backpressure" in r.getMessage().lower() for r in warning_records
+    ), "Backpressure rejection must produce a WARNING log."
+
+
+def test_text_clean_allows_null_publish_when_aws_disabled(
+    client, valid_headers, monkeypatch
+):
+    """When BOTH ``ENABLE_KINESIS_PUBLISHING=false`` and
+    ``ENABLE_EVENTBRIDGE_PUBLISHING=false`` are set, publish_envelope
+    legitimately returns ``{kinesis_sequence: None, eventbridge_id: None}``.
+    The handler must NOT 502 in that supported configuration (local/dev
+    mode without AWS credentials).
+
+    Pins Codex /codex review round-4 P2 + round-5 P2: discriminate
+    "null because outage" (502) from "null because configured-off / no
+    credentials" (200). Also covers the no-AWS-credentials case where
+    main.validate_aws_credentials() permits the app to start without them.
+    """
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.setenv("ENABLE_KINESIS_PUBLISHING", "false")
+    monkeypatch.setenv("ENABLE_EVENTBRIDGE_PUBLISHING", "false")
+
+    intelligence_instance = MagicMock()
+    intelligence_instance.process_transcript = AsyncMock(return_value=MagicMock())
+
+    publisher_instance = MagicMock()
+    publisher_instance.publish_envelope = AsyncMock(
+        return_value={"kinesis_sequence": None, "eventbridge_id": None}
+    )
+
+    cleaner_instance = MagicMock()
+    cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
+
+    with patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
+         patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
+         patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+         patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
+         patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
+
+        body = {
+            "text": "This is some raw text to clean",
+            "account_id": valid_headers["X-Account-ID"],
+        }
+        response = client.post("/text/clean", json=body, headers=valid_headers)
+
+    assert response.status_code == 200, (
+        f"Expected 200 with publishing disabled; got {response.status_code}: "
+        f"{response.text}"
+    )
+    intelligence_instance.process_transcript.assert_called_once()
+    publisher_instance.publish_envelope.assert_called_once()
+
+
+def test_text_clean_lane1_failure_produces_5xx(client, valid_headers, caplog):
+    """Lane 1 (Kinesis/EventBridge publish) is awaited synchronously before
+    the response. A Lane 1 failure produces HTTP 502 — preserves the
+    durable-publish contract that downstream envelope subscribers rely on.
+
+    Pins Codex /codex review P2 fix on PR #23: Lane 1 was originally
+    inside the asyncio.gather wrapper alongside Lane 2; the first round
+    of fire-and-forget moved both to the background, which made every
+    /text/clean call lossy on worker crash/restart between response and
+    publish. Lane 1 was not the long-running step that caused the
+    timeout, so there's no benefit to moving it off the response path.
+    """
+    intelligence_instance = MagicMock()
+    intelligence_instance.process_transcript = AsyncMock(return_value=MagicMock())
+
+    publisher_instance = MagicMock()
+    publisher_instance.publish_envelope = AsyncMock(
+        side_effect=RuntimeError("simulated Kinesis outage")
+    )
+
+    cleaner_instance = MagicMock()
+    cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
+
+    with caplog.at_level(logging.ERROR, logger="routers.text"), \
+         patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
+         patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
+         patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+         patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
+         patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
+
+        body = {
+            "text": "This is some raw text to clean",
+            "account_id": valid_headers["X-Account-ID"],
+        }
+        response = client.post("/text/clean", json=body, headers=valid_headers)
+
+    assert response.status_code == 502, (
+        f"Lane 1 failure must surface as 502, got {response.status_code}: {response.text}. "
+        "If this fails, Lane 1 publish has been silently moved back into the "
+        "background task — see routers/text.py and Codex P2 review notes."
+    )
+    # Lane 2 must NOT have run: the response path is gated on Lane 1.
+    intelligence_instance.process_transcript.assert_not_called()
+    publisher_instance.publish_envelope.assert_called_once()
+
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any(
+        "Lane 1 (publishing) raised" in r.getMessage() for r in error_records
+    ), "Lane 1 exception must produce an observable ERROR log."
+
+
 def test_on_done_callback_logs_unhandled_wrapper_exception(caplog):
     """The done-callback safety net surfaces wrapper-level crashes that
     occur OUTSIDE the gather (e.g., a future refactor adds logic above/below
@@ -332,3 +495,92 @@ def test_on_done_callback_logs_unhandled_wrapper_exception(caplog):
         r.exc_info and isinstance(r.exc_info[1], RuntimeError)
         for r in error_records
     ), "ERROR log is missing the exception traceback (exc_info)."
+
+
+def test_lifespan_drain_awaits_in_flight_background_tasks(caplog):
+    """The lifespan shutdown drain (main._drain_text_clean_background_tasks)
+    awaits in-flight ``/text/clean`` background tasks with a bounded
+    timeout, instead of letting them be silently cancelled by the event
+    loop's shutdown sequence.
+
+    Pins Codex /review P1 #2 mitigation: under fire-and-forget, container
+    restarts during the Lane 2 window can drop work that the client was
+    told succeeded. The drain doesn't eliminate that risk (Lane 2 is
+    100-160s, Railway grace is ~30s) but DOES close the window for tasks
+    nearing completion at shutdown.
+    """
+    import main as main_module
+    import routers.text as text_module
+
+    text_module._BACKGROUND_TASKS.clear()
+
+    completed = []
+
+    async def _short_task() -> None:
+        await asyncio.sleep(0.02)
+        completed.append("short")
+
+    async def _drive() -> None:
+        task = asyncio.create_task(_short_task())
+        text_module._BACKGROUND_TASKS.add(task)
+        task.add_done_callback(text_module._BACKGROUND_TASKS.discard)
+
+        with caplog.at_level(logging.INFO, logger="main"):
+            await main_module._drain_text_clean_background_tasks(timeout_s=1.0)
+
+    asyncio.run(_drive())
+
+    assert completed == ["short"], "Drain returned before the task finished."
+    drain_logs = [
+        r for r in caplog.records
+        if "drained" in r.getMessage() or "draining" in r.getMessage()
+    ]
+    assert drain_logs, (
+        "No drain log emitted — the drain helper ran silently. Operators "
+        "need visibility into shutdown behavior."
+    )
+
+
+def test_lifespan_drain_logs_warning_on_timeout(caplog):
+    """When the drain budget is too short for in-flight Lane 2 work, the
+    drain logs a WARNING that names how many tasks were cancelled.
+
+    Pins the observability of the partial-shutdown case: operators must
+    be able to grep Railway logs for "drain timed out" after a deploy to
+    audit how often work was lost.
+    """
+    import main as main_module
+    import routers.text as text_module
+
+    text_module._BACKGROUND_TASKS.clear()
+
+    async def _slow_task() -> None:
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            pass
+
+    async def _drive() -> None:
+        task = asyncio.create_task(_slow_task())
+        text_module._BACKGROUND_TASKS.add(task)
+        task.add_done_callback(text_module._BACKGROUND_TASKS.discard)
+
+        with caplog.at_level(logging.WARNING, logger="main"):
+            await main_module._drain_text_clean_background_tasks(timeout_s=0.1)
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_drive())
+
+    warning_logs = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and "drain budget exhausted" in r.getMessage()
+    ]
+    assert warning_logs, (
+        "Expected a WARNING log with 'drain budget exhausted' — without "
+        "it, silent work loss has no audit trail."
+    )

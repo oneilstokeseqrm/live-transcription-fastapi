@@ -90,18 +90,76 @@ validate_aws_credentials()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Compose DBOS launch with existing app startup tasks.
+    """Compose DBOS launch with existing app startup tasks + graceful drain.
 
     DBOS owns the account-provisioning workflow's durability layer
     (Phase 1.5 substrate). ``reap_stuck_jobs`` continues to recover from
     crashed upload jobs on startup. Both run in sequence: DBOS first so
     workflows are recoverable before any request lands.
+
+    Shutdown drain (added 2026-05-20, Codex /review P1 on PR #23): after
+    the ``yield``, give any in-flight ``/text/clean`` background tasks
+    (Lane 1 publishing + Lane 2 intelligence extraction) a bounded chance
+    to finish before the container is killed. Railway sends SIGTERM with
+    a ~30s grace period before SIGKILL; we drain up to 25s, leaving
+    buffer for the rest of the shutdown sequence.
+
+    NOTE: Lane 2 typically takes 100-160s in production, so the drain
+    saves only tasks that started recently. For full durability across
+    container restarts mid-Lane-2 the answer is a durable workflow engine
+    (DBOS, already in this codebase) — that's the Phase 2 path. The drain
+    is the cheapest mitigation that meaningfully reduces the silent-loss
+    surface area.
     """
     async with dbos_lifespan(app):
         logger.info("Running startup tasks...")
         await reap_stuck_jobs()
         logger.info("Startup tasks completed")
-        yield
+        try:
+            yield
+        finally:
+            await _drain_text_clean_background_tasks()
+
+
+async def _drain_text_clean_background_tasks(timeout_s: float = 25.0) -> None:
+    """Await in-flight /text/clean background tasks during graceful shutdown.
+
+    Bounded by ``timeout_s`` to fit inside Railway's SIGTERM grace window.
+    Tasks not completed within the budget remain in the set and will be
+    cancelled by the event loop's shutdown sequence — Python will emit a
+    "Task exception was never retrieved" warning per dropped task, which
+    is the intended observability signal (visible in Railway logs).
+    """
+    from routers.text import _BACKGROUND_TASKS as _TEXT_BG_TASKS
+
+    in_flight = list(_TEXT_BG_TASKS)
+    if not in_flight:
+        logger.info("Shutdown: no /text/clean background tasks in flight.")
+        return
+
+    logger.info(
+        f"Shutdown: draining {len(in_flight)} /text/clean background "
+        f"tasks (timeout={timeout_s:.0f}s)..."
+    )
+    # ``asyncio.wait`` instead of ``asyncio.wait_for``: when the timeout
+    # fires, pending tasks are NOT cancelled — they keep running on the
+    # event loop and may finish during the rest of Railway's SIGTERM
+    # grace window (Codex /codex review round-6 P2). Cancelling at
+    # timeout would drop work that's seconds away from completion.
+    done, pending = await asyncio.wait(in_flight, timeout=timeout_s)
+    if pending:
+        logger.warning(
+            f"Shutdown: drain budget exhausted ({timeout_s:.0f}s); "
+            f"{len(pending)} /text/clean background tasks still running "
+            f"and were NOT cancelled — they continue until the event loop "
+            f"stops. If they don't finish before SIGKILL, the Lane 2 work "
+            f"is LOST and clients saw HTTP 200. Re-derivable via "
+            f"reconciliation against raw_interactions if needed."
+        )
+    else:
+        logger.info(
+            f"Shutdown: all {len(done)} /text/clean background tasks drained."
+        )
 
 
 app = FastAPI(lifespan=lifespan)
