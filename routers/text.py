@@ -244,9 +244,37 @@ async def clean_text(body: TextCleanRequest, request: Request):
             f"Text cleaning background lanes complete: interaction_id={interaction_id_str}"
         )
 
+    def _on_done(task: asyncio.Task) -> None:
+        """Wrapper-level safety net for the background task itself.
+
+        _run_background_lanes() already catches and logs per-lane exceptions
+        inside the gather. This callback handles the orthogonal case: an
+        exception raised by the WRAPPER (outside the gather) — a bug in the
+        result-logging loop, an unexpected error in interpolation, anything
+        that would otherwise die silently as Python's "Task exception was
+        never retrieved" GC warning. Under the old synchronous-await model,
+        such failures became HTTP 5xx and were observable; after moving to
+        fire-and-forget, they MUST surface as a logger.error here.
+        """
+        _BACKGROUND_TASKS.discard(task)
+        if task.cancelled():
+            logger.warning(
+                f"Text cleaning background task cancelled: "
+                f"interaction_id={interaction_id_str}"
+            )
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                f"Text cleaning background task crashed (unhandled): "
+                f"interaction_id={interaction_id_str}, "
+                f"error={type(exc).__name__}: {str(exc)}",
+                exc_info=exc,
+            )
+
     task = asyncio.create_task(_run_background_lanes())
     _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    task.add_done_callback(_on_done)
 
     logger.info(
         f"Text cleaning response dispatched (lanes running in background): "
