@@ -1,0 +1,39 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "UseEqUserSecretsKeyWithBoundContext",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "arn:aws:kms:us-east-1:211125681610:key/59a0e2bc-c636-45e8-bccf-427ad2426ad8",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "kms:EncryptionContextKeys": [
+            "tenant_id",
+            "user_id",
+            "provider",
+            "credential_id"
+          ]
+        },
+        "Null": {
+          "kms:EncryptionContext:tenant_id": "false",
+          "kms:EncryptionContext:user_id": "false",
+          "kms:EncryptionContext:provider": "false",
+          "kms:EncryptionContext:credential_id": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DescribeKeyMetadata",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DescribeKey"
+      ],
+      "Resource": "arn:aws:kms:us-east-1:211125681610:key/59a0e2bc-c636-45e8-bccf-427ad2426ad8"
+    }
+  ]
+}

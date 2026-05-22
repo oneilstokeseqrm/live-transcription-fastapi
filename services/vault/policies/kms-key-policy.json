@@ -1,0 +1,69 @@
+{
+  "Version": "2012-10-17",
+  "Id": "key-policy-eq-user-secrets",
+  "Statement": [
+    {
+      "Sid": "EnableRootAccountAdministration",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::211125681610:root"
+      },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowAdminCLIToManageKey",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::211125681610:user/peter-admin-cli"
+      },
+      "Action": [
+        "kms:Describe*",
+        "kms:Get*",
+        "kms:List*",
+        "kms:Put*",
+        "kms:Update*",
+        "kms:Tag*",
+        "kms:Untag*",
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion",
+        "kms:EnableKey",
+        "kms:DisableKey",
+        "kms:CreateAlias",
+        "kms:DeleteAlias",
+        "kms:UpdateAlias"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowVaultServiceToUseKeyWithBoundContext",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::211125681610:user/eq-vault-service"
+      },
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "kms:EncryptionContextKeys": [
+            "tenant_id",
+            "user_id",
+            "provider",
+            "credential_id"
+          ]
+        },
+        "Null": {
+          "kms:EncryptionContext:tenant_id": "false",
+          "kms:EncryptionContext:user_id": "false",
+          "kms:EncryptionContext:provider": "false",
+          "kms:EncryptionContext:credential_id": "false"
+        }
+      }
+    }
+  ]
+}
