@@ -1,134 +1,147 @@
 # Next Session — Start Here
 
-**Project:** Contact Quality and Account-Anchoring Initiative — multi-phase data-quality foundation for an AI-native customer intelligence platform.
-**Last session:** 2026-05-18 (M5.4 shipped + deployed + verified end-to-end; **Phase-1-email-pipeline INITIATIVE COMPLETE**; Phase 2 PLANNING unblocked.)
-**Status:** ✅ **PHASE_1_EMAIL_PIPELINE_INITIATIVE_COMPLETE** — All 8 milestones shipped. §10.3 PASS on fresh UUID. §11 18/22 invariants PASS (1 soft, 3 out-of-scope). Multi-writer Neo4j coexistence verified. Test tenant atomically cleaned. Production state stable.
+**Project:** Phase 2 — Granola.ai transcript ingestion integration.
+**Last session:** 2026-05-22 (brainstorm closed; plan locked + reviewed via /plan-eng-review and /codex consult; build next).
+**Status:** ✅ BRAINSTORM_COMPLETE_PLAN_LOCKED_REVIEWED. Build session is the next step.
 
-**Next session scope:** Phase 2 BRAINSTORMING — explore what to build next, in what order, against what success criteria. NOT milestone execution. NOT new feature code. Brainstorming → CEO review → design doc → eng review → THEN execution sessions.
+**Review surfaced 22 LOCKED decisions (LOCKED-23 through LOCKED-44).** Of those, 6 came from the outside-voice Codex review and would have caused build-time bugs:
+- LOCKED-39: `@DBOS.scheduled` is deprecated per repo's own DBOS plan; use external Railway cron
+- LOCKED-40: KMS EncryptionContext must bind all 4 fields (was 2; tenant-internal row-swap gap)
+- LOCKED-41: Extract `/text/clean` core; don't HTTP-call from adapter
+- LOCKED-42: Single Postgres engine for MVP; second role + engine = Phase 2.1
+- LOCKED-43: Fresh DEK + fresh nonce on every encrypted_api_key write
+- LOCKED-44: Capture `granola_note_snapshot` at defer time for recoverability
 
 ---
 
-## SESSION SCOPE FOR THE NEXT SESSION
+## START BY READING THIS DOC
 
-This is a **transition session.** Phase 1 closed; Phase 2 hasn't been scoped. The next session's job:
+**Load-bearing executable plan:** `tasks/granola-integration-plan.md`
 
-| Item | Scope | Description |
+That plan is comprehensive (~660 lines). It contains:
+- All 16 new LOCKED decisions (LOCKED-23 through LOCKED-38)
+- 6 build phases (Phase 0 pre-flight → Phase 1 AWS → Phase 2 backend → Phase 3 frontend → Phase 4 testing → Phase 5 Codex gate → Phase 6 deploy)
+- 13 test scenarios mapped to Q7 failure modes
+- Phase-by-phase exit criteria
+- Pre-merge checklist
+- Cross-cutting constraint citations (Codex pre-merge gate, verify_consumer_contracts.py, tenant isolation, etc.)
+- Build session entry prompt (paste at the end)
+
+**Background brainstorm doc (don't re-litigate):** `docs/superpowers/specs/2026-05-22-granola-integration-brainstorm-decisions.md` (~600 lines).
+
+Read the plan first, then the brainstorm doc only if you need to understand WHY a decision was made.
+
+---
+
+## SESSION SCOPE — BUILD
+
+| Phase | Time | Description |
 |---|---|---|
-| 1 | **Re-orient** | Walk through Phase 1 milestone-by-milestone with the user. What surprised them? What felt easy vs. hard? Establish shared mental model before scoping Phase 2. |
-| 2 | **Phase 2 candidate scope** | The plan documents 7+ candidate Phase 2 features (Neo4j MERGE-everywhere, contact identity state machine, outbound, queue UI, audit log table, Outlook NULL-IMID dedup, `ensure_constraints` hardening). Discuss priority + sequencing with user. |
-| 3 | **YC office-hours brainstorm** | Invoke `/office-hours` skill to apply the 6 forcing questions: demand reality, status quo, desperate specificity, narrowest wedge, observation, future-fit. Build product narrative. |
-| 4 | **CEO review** | Invoke `/plan-ceo-review` with the brainstorm output. Decide whether to expand scope (10x mode) or hold scope (rigor mode). |
-| 5 | **Design doc draft** | Once direction is locked, write Phase 2 design doc to `docs/superpowers/specs/2026-05-XX-phase-2-design.md`. NOT yet an implementation plan. |
-| 6 | **Eng + design review** | `/plan-eng-review` for architecture; `/plan-design-review` if UI/UX is in scope. |
-| 7 | **Lock decisions** | Decisions land as LOCKED-23 onwards, building on the 22 Phase 1 LOCKED decisions. |
+| Phase 0 | ~0.5 day | Pre-flight verification: scripts/verify_consumer_contracts.py against proposed envelope (source="generic", interaction_type="meeting"). Fall back to source="api" if drift. |
+| Phase 1 | ~0.5 day | AWS infrastructure: KMS CMK `alias/eq-user-secrets` + IAM user `eq-vault-service` + Railway env vars |
+| Phase 2 | ~4-5 days | Backend: Prisma migrations (eq-frontend) → vault module → Granola API client → adapter (Path 2) → DBOS scheduler → admin endpoints → transactional email |
+| Phase 3 | ~2 days | Frontend (eq-frontend): Granola Connect settings page + EQ-native Pending Approvals component |
+| Phase 4 | ~1 day | Testing: unit + integration + production E2E on test tenant |
+| Phase 5 | varies | Pre-merge Codex review gate (4-round soft cap, extend if real P1s persist) |
+| Phase 6 | ~0.5 day | Deploy + verify |
 
-**Out of scope for the next session:** writing implementation plans, coding any Phase 2 features, deploying anything. The plan-locked execution gate is held until brainstorming → design → review is done.
-
-Estimated work: **1-3 hours** for re-orient + brainstorm + CEO review. Design doc + plan-eng-review may run into a follow-on session.
+**Estimated total:** ~6-7 days of focused engineering, likely 3-5 build sessions.
 
 ---
 
-## What's done (Phase 1 complete)
+## CRITICAL — WHAT NOT TO RELITIGATE
 
-| Milestone | Repo | PR | Merge SHA | What it shipped |
-|---|---|---|---|---|
-| M1 | eq-frontend | #392 | `de586bbc` | Prisma migration: pending_interactions table + 3 emails cols + composite UNIQUE |
-| M2 | live-transcription-fastapi | #19 | `756575d7` | Workflow promote step + EmailPromoted EventBridge emit |
-| M3 | eq-email-pipeline | #9 | `85c0295` | EmailPromoted SQS subscriber + 2-layer idempotency guard + 21 LOCKED decisions |
-| M4 | eq-email-pipeline | #10 | `6fa181a` | Orchestrator pending_interactions branch + atomic upsert_thread (FLIPPED THE SWITCH) |
-| M5.1 | eq-email-pipeline | #11 | `79862b6` | ON CONFLICT column-list fix (post-M4 deploy blocker) |
-| M5.2 | eq-frontend, live-tx-fastapi, eq-email-pipeline | #398, #20, #12, #13 | `c3bc162`, `929472e`, `ceea064`, `8b2c67a` | httpx timeout + NULLS NOT DISTINCT + INGEST_SUCCESS_STATUSES |
-| M5.3 | live-transcription-fastapi | #21 | `aa0fd23` | Agent /api/enrich v2-envelope parser adapter |
-| M5.4 | eq-email-pipeline | #14 | `4693de3` | Neo4j Interaction MERGE-key alignment to (tenant_id, interaction_id) |
+The plan's "LOCKED Decisions" table is non-negotiable without strong new information. The top constraints:
 
-**Production verification (this session's E2E walk):**
-- Fresh UUID `1a163ab75df` against test tenant `11111111-1111-4111-8111-111111111111`
-- §10.3 Steps 1-12 all PASS
-- §11 22-invariant walk: 18 PASS, 1 soft, 3 out-of-scope
-- Multi-writer Neo4j coexistence proven on the Interaction node
-- DLQ drained (the M5.3 leftover); 0 DLQ depth post-E2E
-- Test tenant atomically cleaned (LOCKED-11)
+1. **`interaction_type="meeting"`** — anything else trips the `raw_interactions` FK landmine. Verified live in `routers/text.py:80-95`.
+2. **`source="generic"`** with verification gate — fits existing downstream enum; do NOT add "granola" to action-item-graph or eq-structured-graph-core. See [[feedback-envelope-contract-immutable]] memory.
+3. **Path 2 (defer + re-poll)** for account resolution — not Path 1 (pending_transcripts table).
+4. **AWS KMS envelope encryption + `vault.user_credentials`** — not env vars, not Secrets Manager.
+5. **Per-user (not org-scoped) credentials** — Granola's API model is 1 key per user.
+6. **Snapshot-on-ingest** — no reverse-sync on Granola edits/deletes/folder-moves.
+7. **Soft-delete on disconnect** — preserves audit trail.
+8. **No Docker in tests** — AsyncMock unit tests + production E2E on test tenant (per [[test-pattern-no-docker-default]]).
 
 ---
 
-## What's deferred to Phase 2 (the candidate backlog)
+## OPEN ITEMS NOT IN MVP
 
-Pulled from plan §17.11 + V1 limitations + Codex challenge deferrals + user's own roadmap signals:
+Deferred but tracked in the plan's "Post-implementation follow-ups" section:
 
-| # | Item | Source | Notes |
-|---|---|---|---|
-| 1 | **Neo4j MERGE-everywhere refactor** | V1 #2 + Codex challenge #3 | Convert Chunk CREATEs to MERGE on `(tenant_id, interaction_id, chunk_index)`; switch Thread.message_count to an edge-count query. Closes V1 #2. |
-| 2 | **Contact identity state machine** | Plan §1.2 Phase 2 trajectory | The contact-side analog of pending_interactions. Pending → confirmed → merged. |
-| 3 | **Outbound pending path** | M4 §4.1 direction guard (Codex R1 P1) | Currently outbound preserves pre-M4 silent-drop fallthrough. Phase 2 enhancement to handle outbound-to-unknown-business. |
-| 4 | **Queue UI (user-facing approve/ignore/map)** | Long-standing roadmap | The screen where the user actually triages the pending queue. Currently /approve is API-only. |
-| 5 | **Audit log table** | V1 #1 roadmap | Personal/internal anchor cold-inbound is currently log+drop. V2 = audit log so we can re-process if user wants. |
-| 6 | **Outlook NULL-IMID dedup** | Codex consult caveat 3 | Postgres-side duplicate risk for IMID-less Outlook ingests. Phase 2 deduplication strategy. |
-| 7 | **`ensure_constraints` hardening** | Codex challenge #2 | Currently swallows all DDL errors silently. Phase 2 hardening for observable schema-state errors. |
-| 8 | **Shared MERGE-key contract document** | Plan §17.11 | A platform deliverable that documents the Neo4j Interaction MERGE-key convention (LOCKED-22) so future Neo4j writers don't drift. |
-| 9 | **Cross-queue link fill-in algorithm** | Plan §5.2 / §11 invariant #5 | When the same prospect is in two queues, link-summary join after both are approved. |
-| 10 | **Re-open after Ignore + new signal lifecycle** | Plan §11 invariant #8 | The reopen path that un-archives both queue and pending interactions. |
-| 11 | **20 orphan Interaction nodes hygiene** | Plan §17.7 | Cleanup of test-tenant leftovers from prior E2E runs. Low priority; hygiene only. |
-
-These are CANDIDATES — the brainstorming session will surface priorities + sequencing + any not-yet-listed items.
+1. **Alerting wire-up (Phase 2.1)** — Slack webhook OR Resend for critical conditions (KMS failure, adapter not running). User-deferred from Q7.
+2. **Org-admin bulk-onboarding (Phase 3)** — when >10 users.
+3. **Reverse-sync** — only if user feedback demands it; LOCKED-27 says no for MVP.
+4. **Webhooks instead of polling** — when Granola releases webhooks.
+5. **Other Phase 2 backlog candidates** (Neo4j MERGE-everywhere, contact identity state machine, etc.) — independent initiatives.
 
 ---
 
-## LOCKED decisions (22, post-Phase 1)
+## AWS ACCOUNT STATE (verified 2026-05-22, unchanged)
 
-The full LOCKED list lives in plan `2026-05-17-pending-interactions-cold-inbound-fix.md` §13 + §17.10. Quick reference for the most-load-bearing ones the next session will need:
-
-- **LOCKED-7:** `raw_interactions.account_id NOT NULL` invariant (the core architectural constraint Phase 1 protected)
-- **LOCKED-10:** Per-action merge authorization required (push, merge auth ask each time)
-- **LOCKED-11:** Test-tenant destructive ops require user authorization first
-- **LOCKED-15-16:** Lean+typed pending_interactions payload + EventBridge EmailPromoted event coordination pattern
-- **LOCKED-17:** Shared-tenant collision protocol (check concurrent agents before destructive writes)
-- **LOCKED-18-21:** SQS-from-EventBridge subscription + DB CAS TTL > SQS VT + HandlerOutcome tri-state + verify_*.py tooling
-- **LOCKED-22 (new):** Neo4j Interaction MERGE-key convention — `(tenant_id, interaction_id)` with defensive COALESCE pattern. M5.4 brought eq-email-pipeline into compliance.
+- Account ID: `211125681610`
+- Root: MFA on, no access keys
+- IAM user `peter-admin-cli` with AdministratorAccess (used by CLI + AWS MCP)
+- 8 KMS keys exist (7 AWS-managed for services + 1 unused custom from June 2024)
+- Build will add: KMS CMK aliased `alias/eq-user-secrets` + IAM user `eq-vault-service`
 
 ---
 
-## User posture (carries forward)
+## DESIGN PARTNER CONTEXT (unchanged)
 
-Non-developer founder. Make confident technical decisions; surface only product/strategic decisions. Strict OSS only.
-
-User's rules (load-bearing):
-1. Complete Phase N before Phase N+1 planning. **Phase 1 is now complete — Phase 2 planning is unblocked.**
-2. Cutting-edge-startup approach. No shortcuts unless the shortcut IS the correct architecture.
-3. AI agent doesn't push or merge without per-action authorization. (Doesn't apply this session — brainstorming has no destructive actions.)
-4. Plain-English explanations when user asks "why" / "what happened".
-5. Investigate thoroughly; use the right gstack skills (`/office-hours`, `/plan-ceo-review`, `/plan-eng-review`, `/codex consult`).
-6. Don't go beyond scope. **For brainstorming session: don't try to lock decisions before user has reviewed brainstorm output.**
+- 3 design partners on Granola Business plan
+- Peter (you) has personal Business plan account = design partner #0 for testing
+- Granola Personal API released late March 2026, included in Business plan
+- Each user generates their own `grn_…` API key + creates a designated "EQ" folder
+- Empirical API validation done 2026-05-21 against Peter's real account
 
 ---
 
-## STOP conditions (hard — surface to user)
+## TASK LIST STATE AT END OF LAST SESSION (2026-05-22)
 
-- /context-restore returns NO_CHECKPOINTS or wrong title.
-- MEMORY.md status isn't `PHASE_1_EMAIL_PIPELINE_INITIATIVE_COMPLETE`.
-- Production /api/health returns non-200 anywhere (regression of Phase 1 deploy).
-- Test tenant has leftover artifacts from this session's M5.4 E2E (verify clean baseline before any Phase 2 brainstorm sample-data work).
-- User asks to write implementation code before brainstorm + design doc + review gauntlet is done.
-
----
-
-## Reference artifacts
-
-- **The Phase 1 plan (closed):** `/Users/peteroneil/eq-email-pipeline/docs/superpowers/plans/2026-05-17-pending-interactions-cold-inbound-fix.md`. §17 is the M5.4 design addendum.
-- **The original design doc:** `/Users/peteroneil/EQ-CORE/live-transcription-fastapi/docs/superpowers/specs/2026-05-12-contact-quality-initiative-design.md`. §9 phased trajectory has Phase 2 hooks.
-- **Phase 1.5 DBOS plan:** `/Users/peteroneil/EQ-CORE/live-transcription-fastapi/docs/superpowers/plans/2026-05-15-async-orchestration-dbos.md`. Foundation for what Phase 2 builds on.
-- **M5.4 bug evidence (closed bug):** `/Users/peteroneil/EQ-CORE/live-transcription-fastapi/tasks/m5.4-bug-evidence.md`. Useful reference for understanding cross-service Neo4j writer coordination.
-- **Lessons:** `/Users/peteroneil/EQ-CORE/live-transcription-fastapi/tasks/lessons.md`. 9+ load-bearing lessons from Phase 1.
-- **Railway project IDs:** `~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/reference_railway_project_ids.md`.
-- **Feedback memories:** the project's memory directory has 2 critical ones — `feedback_test_pattern_no_docker.md` and `feedback_complete_all_handoff_reads_before_action.md`.
+| # | Status | Subject |
+|---|---|---|
+| 1 | completed | Walk through Q6 — Granola Connect settings page UX |
+| 2 | completed | Walk through Q7 — error handling |
+| 3 | completed | Walk through Q8 — envelope labels |
+| 4 | completed | Write tasks/granola-integration-plan.md |
+| 5 | optional | Plan reviews (/plan-eng-review and/or /codex consult) |
+| 6 | pending | End session — commit plan + memory update |
 
 ---
 
-## Tools available for Phase 2 brainstorming
+## PHASE 1 STATUS (REFERENCE)
 
-- **`/office-hours`** — YC office-hours-style brainstorm with 6 forcing questions. Use FIRST.
-- **`/plan-ceo-review`** — CEO/founder-mode plan review for scope expansion vs holding. Use after `/office-hours`.
-- **`/plan-eng-review`** — Architecture review once direction is locked.
-- **`/plan-design-review`** — Designer's-eye plan review if Phase 2 has UI scope.
-- **`/codex consult`** — For surfacing constraints + risks BEFORE writing the implementation plan.
+Phase 1 email pipeline initiative: ✅ COMPLETE 2026-05-18. All 8 milestones shipped + verified end-to-end. 22 LOCKED decisions captured. Production stable.
 
-NOT applicable for brainstorming: `/qa`, `/ship`, `/review` — those are execution-phase tools.
+Granola integration is Phase 2 work — the first concrete initiative after Phase 1 closed. Prior Phase 1 session-handoff content has been superseded by this file (Phase 1 docs live in git history).
+
+---
+
+## BUILD SESSION ENTRY PROMPT
+
+Paste this block as the opening message of the next session:
+
+```
+You're starting the Granola integration build. The brainstorm is closed; the plan is locked.
+
+START BY READING:
+1. tasks/granola-integration-plan.md (executable plan) — top-to-bottom
+2. docs/superpowers/specs/2026-05-22-granola-integration-brainstorm-decisions.md (background; don't re-litigate)
+3. ~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/MEMORY.md (auto-loaded)
+4. ~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/project_granola_integration.md (status snapshot)
+5. ~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/feedback_envelope_contract_immutable.md (load-bearing rule)
+6. tasks/lessons.md (1820 lines of cross-cutting discipline)
+
+Then execute Phase 0 (pre-flight verification) to confirm source="generic" works downstream. If verify_consumer_contracts.py surfaces drift, fall back to source="api" and update LOCKED-35 in the plan; do NOT modify downstream.
+
+Then execute Phase 1 (AWS) → Phase 2 (backend) → Phase 3 (frontend) → Phase 4 (testing) sequentially.
+
+Codex pre-merge gate is mandatory; 4-round soft cap.
+
+Coordinate with user before:
+- Running any destructive SQL on the test tenant
+- Merging the eq-frontend Prisma migration PR (cross-repo coordination)
+- Any decision that deviates from the locked plan
+
+User posture: non-developer founder; plain-English explanations; investigate thoroughly; no shortcuts.
+```
