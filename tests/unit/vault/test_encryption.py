@@ -368,6 +368,37 @@ class TestBotoCoreErrorWrapping:
             )
         assert exc_info.value.code == VaultErrorCode.VAULT_KMS_DECRYPT_FAILED
 
+    def test_client_construction_error_wrapped(self, monkeypatch):
+        """Codex R7 [P2]: boto session-construction failures (e.g.,
+        ProfileNotFound) must also surface as structured VaultError.
+        The client lookup must run INSIDE the try block.
+        """
+        from botocore.exceptions import ProfileNotFound
+
+        def _bad_get_kms_client():
+            raise ProfileNotFound(profile="nonexistent")
+
+        monkeypatch.setattr(encryption, "_get_kms_client", _bad_get_kms_client)
+        # Pass kms_client=None to force the production code path that calls
+        # _get_kms_client().
+        with pytest.raises(VaultError) as exc_info:
+            encryption.encrypt_credential(
+                plaintext="grn_test",
+                encryption_context=_VALID_CONTEXT,
+                kms_client=None,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_KMS_ENCRYPT_FAILED
+        # Decrypt path mirror
+        with pytest.raises(VaultError) as exc_info2:
+            encryption.decrypt_credential(
+                encrypted_api_key=b"abc",
+                encrypted_dek=b"wrapped",
+                nonce=b"\x00" * 12,
+                encryption_context=_VALID_CONTEXT,
+                kms_client=None,
+            )
+        assert exc_info2.value.code == VaultErrorCode.VAULT_KMS_DECRYPT_FAILED
+
 
 class TestEnvVarRequirements:
     """``EQ_VAULT_KMS_KEY_ALIAS`` is required for any encrypt call."""

@@ -143,10 +143,14 @@ def encrypt_credential(
     All three are persisted to ``vault.user_credentials``.
     """
     _validate_context(encryption_context)
-    client = kms_client if kms_client is not None else _get_kms_client()
     key_id = _get_kms_key_id()
 
+    # Client lookup is inside the try so session-construction failures
+    # (ProfileNotFound, MissingConfigError, etc.) raised by
+    # _get_kms_client() / boto3.client(...) also surface as structured
+    # VaultError instead of leaking past the boundary (Codex R7 [P2]).
     try:
+        client = kms_client if kms_client is not None else _get_kms_client()
         resp = client.generate_data_key(
             KeyId=key_id,
             KeySpec=_DEK_SPEC,
@@ -167,12 +171,13 @@ def encrypt_credential(
         ) from exc
     except BotoCoreError as exc:
         # Catches NoCredentialsError, EndpointConnectionError,
-        # ConnectTimeoutError, ReadTimeoutError, etc. — boto operational
-        # failures that don't come from the AWS service itself (per Codex
-        # R6 [P1]). Without this, AWS misconfiguration or transient
-        # network drops would leak raw botocore exceptions past the
-        # VaultError boundary, breaking the structured-error + audit
-        # contract that the accessor layer depends on.
+        # ConnectTimeoutError, ReadTimeoutError, ProfileNotFound, etc. —
+        # boto operational failures that don't come from the AWS service
+        # itself (per Codex R6 [P1] + R7 [P2]). Without this, AWS
+        # misconfiguration or transient network drops would leak raw
+        # botocore exceptions past the VaultError boundary, breaking the
+        # structured-error + audit contract that the accessor layer
+        # depends on.
         raise VaultError(
             VaultErrorCode.VAULT_KMS_ENCRYPT_FAILED,
             f"KMS GenerateDataKey botocore error: {exc.__class__.__name__}",
@@ -216,9 +221,10 @@ def decrypt_credential(
             f"nonce must be {_AES_GCM_NONCE_BYTES} bytes, got {len(nonce)}",
         )
 
-    client = kms_client if kms_client is not None else _get_kms_client()
-
+    # Client lookup inside try so session-construction failures map to
+    # structured VaultError (Codex R7 [P2]; same rationale as encrypt path).
     try:
+        client = kms_client if kms_client is not None else _get_kms_client()
         resp = client.decrypt(
             CiphertextBlob=encrypted_dek,
             EncryptionContext=encryption_context,
