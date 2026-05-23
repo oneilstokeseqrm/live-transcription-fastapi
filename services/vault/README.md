@@ -2,9 +2,73 @@
 
 Stores per-user third-party API keys (e.g., Granola `grn_…`) encrypted at rest using AWS KMS envelope encryption. Every credential row's plaintext is wrapped by a fresh per-row data encryption key (DEK), which is itself wrapped by a long-lived AWS KMS customer master key (CMK).
 
-**Status:** Phase 1 (AWS infrastructure) PROVISIONED 2026-05-22. Python module ships in Phase 2b.
+**Status:** Phase 1 (AWS infrastructure) PROVISIONED 2026-05-22. Phase 2b Python module SHIPPED 2026-05-23.
 
 **Locked decisions this module implements:** LOCKED-40, LOCKED-42, LOCKED-43.
+
+---
+
+## Python module (Phase 2b, shipped 2026-05-23)
+
+The module lives at `services/vault/`. Public API exported from `services.vault`:
+
+```python
+from services.vault import (
+    GranolaCredential,                  # decrypted credential snapshot
+    get_granola_credential_for_user,    # read + decrypt
+    store_credential,                   # encrypt + insert
+    rotate_credential_key,              # replace key material in place
+    ALLOWLIST,                          # caller modules permitted to use the accessor
+    VaultError, VaultErrorCode,         # structured failure types
+    VaultPermissionError,               # caller_module not in ALLOWLIST
+)
+```
+
+### Signatures
+
+```python
+async def get_granola_credential_for_user(
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    caller_module: str,
+    conn: asyncpg.Connection,
+    trace_id: str | None = None,
+) -> GranolaCredential | None: ...
+
+async def store_credential(
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    provider: str,
+    api_key: str,
+    config: dict[str, Any],
+    caller_module: str,
+    conn: asyncpg.Connection,
+    trace_id: str | None = None,
+) -> UUID: ...  # new credential row's UUID
+
+async def rotate_credential_key(
+    *,
+    credential_id: UUID,
+    new_api_key: str,
+    caller_module: str,
+    conn: asyncpg.Connection,
+    trace_id: str | None = None,
+) -> None: ...
+```
+
+`caller_module` must be one of:
+
+* `services.granola_ingestion.adapter`
+* `services.granola_ingestion.scheduler`
+* `routers.granola`
+
+Anything else fails with `VaultPermissionError` (`error_code = vault_caller_not_allowed`). Adding a new caller requires editing `ALLOWLIST` in `services/vault/user_credentials.py` and a code review.
+
+### Audit log
+
+Every accessor call writes one row to `vault.credential_access_log` via the caller's `conn`. The audit write shares the caller's transaction: a logging failure aborts the credential operation, so there is never a successful credential access without a forensic record. The audit module exposes no UPDATE or DELETE function (append-only invariant, app-layer enforced; a unit test greps the module source to catch regressions).
 
 ---
 
@@ -204,6 +268,7 @@ Every call into the vault accessor module writes a row to `vault.credential_acce
 | 2026-05-22T19:57:33Z | peter-admin-cli | Created access key `AKIATCKASHXFPCDN6NXX` |
 | 2026-05-22 (post-MCP) | peteroneil | Added 4 env vars to Railway production environment |
 | 2026-05-23T09:41:00Z | peter-admin-cli | Enabled KMS auto-rotation on CMK `59a0e2bc-...` (annual, next 2027-05-23) |
+| 2026-05-23 (Phase 2b) | peteroneil + Claude | Shipped Python vault module: `services/vault/{errors,encryption,audit,user_credentials,__init__}.py` + 46 AsyncMock-based unit tests (`tests/unit/vault/`). Pinned `cryptography>=44.0.0` in requirements.txt. |
 
 ---
 
