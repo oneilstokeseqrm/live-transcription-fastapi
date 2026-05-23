@@ -23,6 +23,12 @@ class VaultErrorCode(str, Enum):
     VAULT_AES_GCM_TAG_MISMATCH = "vault_aes_gcm_tag_mismatch"
     VAULT_DB_INSERT_FAILED = "vault_db_insert_failed"
     VAULT_DB_NOT_FOUND = "vault_db_not_found"
+    # Generic DB-layer failure (connection lost, pool exhausted, transaction
+    # commit RPC failed, etc.) — distinct from the semantic VAULT_DB_NOT_FOUND
+    # (row legitimately doesn't exist) and VAULT_DB_INSERT_FAILED (the SQL
+    # itself was rejected, e.g., unique violation). Use VAULT_DB_QUERY_FAILED
+    # when raw asyncpg / connection errors leak up from the DB boundary.
+    VAULT_DB_QUERY_FAILED = "vault_db_query_failed"
     VAULT_CALLER_NOT_ALLOWED = "vault_caller_not_allowed"
     VAULT_AUDIT_LOG_WRITE_FAILED = "vault_audit_log_write_failed"
 

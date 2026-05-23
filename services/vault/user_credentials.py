@@ -129,6 +129,7 @@ FROM vault.user_credentials
 WHERE tenant_id = $1
   AND user_id = $2
   AND provider = $3
+  AND status = 'active'
   AND archived_at IS NULL
 """
 
@@ -160,10 +161,16 @@ INSERT INTO vault.user_credentials (
 )
 """
 
+# Per Codex R3 [P1] tenant-isolation fix: rotate's lookup filters on
+# (id, tenant_id, user_id) so a caller bug supplying a wrong-tenant
+# credential_id cannot mutate the wrong tenant's secret. Provider is
+# returned for the EncryptionContext.
 _SELECT_ROTATE_IDENTITY_SQL = """
-SELECT tenant_id, user_id, provider
+SELECT provider
 FROM vault.user_credentials
 WHERE id = $1
+  AND tenant_id = $2
+  AND user_id = $3
   AND archived_at IS NULL
 """
 
@@ -177,6 +184,8 @@ SET encrypted_api_key = $1,
     consecutive_failures = 0,
     updated_at = CURRENT_TIMESTAMP
 WHERE id = $4
+  AND tenant_id = $5
+  AND user_id = $6
   AND archived_at IS NULL
 RETURNING tenant_id
 """
@@ -221,6 +230,26 @@ def _check_allowlist(caller_module: str) -> None:
     """
     if caller_module not in ALLOWLIST:
         raise VaultPermissionError(caller_module)
+
+
+def _wrap_db_error(
+    exc: BaseException,
+    *,
+    code: VaultErrorCode = VaultErrorCode.VAULT_DB_QUERY_FAILED,
+    operation: str = "db",
+) -> VaultError:
+    """Convert a raw asyncpg / connection exception into a structured
+    :class:`VaultError`.
+
+    Used at every DB boundary (``pool.acquire()``, ``fetchrow``, transaction
+    enter/commit) so callers see ``VaultError`` regardless of which layer
+    failed. The original exception is attached via ``__cause__``.
+    """
+    return VaultError(
+        code,
+        f"unexpected DB error during {operation}: {exc.__class__.__name__}",
+        cause=exc,
+    )
 
 
 async def _best_effort_failure_audit(
@@ -304,16 +333,24 @@ async def get_granola_credential_for_user(
 ) -> GranolaCredential | None:
     """Look up and decrypt a user's active Granola credential.
 
-    Returns ``None`` if no active credential exists (the row may be archived
-    or never created). Raises :class:`VaultPermissionError` if the caller is
-    not in :data:`ALLOWLIST`; raises :class:`VaultError` on KMS or DB failure.
+    Returns ``None`` if no ACTIVE credential exists. "Active" means:
+    ``status='active'`` AND ``archived_at IS NULL``. Revoked, error, and
+    archived credentials are all hidden from this accessor — callers do not
+    need to check ``status`` themselves (Codex R3 [P2] fix). For admin
+    endpoints that need to inspect non-active state, Phase 2f will add a
+    separate ``get_credential_status`` accessor.
+
+    Raises :class:`VaultPermissionError` if the caller is not in
+    :data:`ALLOWLIST`; raises :class:`VaultError` on KMS or DB failure.
 
     Writes one audit row to ``vault.credential_access_log`` per call (on a
     dedicated connection acquired from ``pool``, independent of any
     transaction the caller may have open):
 
       * ALLOWLIST rejection → ``success=false, error_code=VAULT_CALLER_NOT_ALLOWED``
-      * No credential row → ``success=true, credential_id=NULL``
+      * No active credential row → ``success=true, credential_id=NULL``
+      * DB-layer failure (pool exhausted, connection lost) →
+        ``success=false, error_code=VAULT_DB_QUERY_FAILED``
       * Decrypt success → ``success=true, credential_id=<row id>``
       * Decrypt failure → ``success=false, error_code=<KMS/AES code>``
     """
@@ -333,13 +370,29 @@ async def get_granola_credential_for_user(
         )
         raise
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            _SELECT_GRANOLA_CREDENTIAL_SQL,
-            tenant_id,
-            user_id,
-            _GRANOLA_PROVIDER,
+    # DB read wrapped to convert raw asyncpg errors into VaultError + audit.
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                _SELECT_GRANOLA_CREDENTIAL_SQL,
+                tenant_id,
+                user_id,
+                _GRANOLA_PROVIDER,
+            )
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="read SELECT")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="read",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
         )
+        raise wrapped from exc
 
     if row is None:
         await audit.write_audit_row(
@@ -494,6 +547,11 @@ async def store_credential(
     # If step 2 fails, cred_conn transaction rolls back (audit raise propagates).
     # If step 2 succeeds and step 3 fails, we get a phantom audit (rare;
     # detectable by reconciliation).
+    #
+    # Outer try wraps both VaultError (from internal raise) AND raw asyncpg
+    # exceptions (from pool.acquire / txn enter / txn commit boundaries —
+    # Codex R3 [P1] fix). Raw exceptions are converted to VAULT_DB_QUERY_FAILED
+    # so the caller never sees a non-VaultError.
     try:
         async with pool.acquire() as cred_conn:
             async with cred_conn.transaction():
@@ -543,12 +601,30 @@ async def store_credential(
             trace_id=trace_id,
         )
         raise
+    except Exception as exc:
+        # Raw asyncpg from pool.acquire / txn enter / txn commit. Convert
+        # to structured VaultError and write the failure-audit.
+        wrapped = _wrap_db_error(exc, operation="store_credential DB section")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="write",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
+        )
+        raise wrapped from exc
 
     return credential_id
 
 
 async def rotate_credential_key(
     *,
+    tenant_id: UUID,
+    user_id: UUID,
     credential_id: UUID,
     new_api_key: str,
     caller_module: str,
@@ -561,6 +637,13 @@ async def rotate_credential_key(
     same so the 4-field EncryptionContext (and therefore existing reader
     invariants) does not change — only the wrapped key material rotates.
 
+    **Tenant isolation (Codex R3 [P1] fix):** caller MUST pass ``tenant_id``
+    and ``user_id``, and both the lookup and the UPDATE filter on all three
+    of ``(id, tenant_id, user_id)``. A caller bug that supplies a wrong-tenant
+    ``credential_id`` returns ``VAULT_DB_NOT_FOUND`` rather than mutating
+    another tenant's secret. Callers should source ``tenant_id``/``user_id``
+    from the JWT claims, not from any in-memory lookup.
+
     Resets ``status='active'``, ``last_error=NULL``, and
     ``consecutive_failures=0`` so the next poll cycle starts clean after
     a manual rotation. An operator rotating a ``revoked`` or ``error``
@@ -568,7 +651,8 @@ async def rotate_credential_key(
     immediately eligible for polling again.
 
     Raises :class:`VaultError` with ``VAULT_DB_NOT_FOUND`` if the credential
-    row is missing or already archived. Same atomicity ordering as
+    row is missing, already archived, or owned by a different
+    ``(tenant_id, user_id)``. Same atomicity ordering as
     :func:`store_credential`.
     """
     try:
@@ -577,8 +661,8 @@ async def rotate_credential_key(
         await _best_effort_failure_audit(
             pool=pool,
             credential_id=credential_id,
-            tenant_id=_NULL_UUID,
-            user_id=_NULL_UUID,
+            tenant_id=tenant_id,
+            user_id=user_id,
             provider=_UNKNOWN_PROVIDER,
             caller_module=caller_module,
             operation="rotate",
@@ -587,20 +671,41 @@ async def rotate_credential_key(
         )
         raise
 
-    # Look up the credential row's identity fields first so the audit row
-    # and the EncryptionContext both have authoritative tenant_id/user_id/
-    # provider values. Identity lookup uses its own short-lived connection.
-    async with pool.acquire() as lookup_conn:
-        identity_row = await lookup_conn.fetchrow(
-            _SELECT_ROTATE_IDENTITY_SQL,
-            credential_id,
-        )
-    if identity_row is None:
+    # Identity lookup — filters on (id, tenant_id, user_id) so cross-tenant
+    # credential_ids return None rather than leaking another tenant's row.
+    # Wrapped to convert raw asyncpg errors into VaultError + audit.
+    try:
+        async with pool.acquire() as lookup_conn:
+            identity_row = await lookup_conn.fetchrow(
+                _SELECT_ROTATE_IDENTITY_SQL,
+                credential_id,
+                tenant_id,
+                user_id,
+            )
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="rotate identity lookup")
         await _best_effort_failure_audit(
             pool=pool,
             credential_id=credential_id,
-            tenant_id=_NULL_UUID,
-            user_id=_NULL_UUID,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_UNKNOWN_PROVIDER,
+            caller_module=caller_module,
+            operation="rotate",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
+        )
+        raise wrapped from exc
+
+    if identity_row is None:
+        # Either the credential doesn't exist, or it belongs to a different
+        # tenant/user, or it's archived. All collapse to NOT_FOUND so we
+        # don't leak existence of other tenants' credentials via timing.
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
             provider=_UNKNOWN_PROVIDER,
             caller_module=caller_module,
             operation="rotate",
@@ -609,11 +714,10 @@ async def rotate_credential_key(
         )
         raise VaultError(
             VaultErrorCode.VAULT_DB_NOT_FOUND,
-            f"no active credential row with id={credential_id}",
+            f"no active credential row with id={credential_id} "
+            f"for tenant_id={tenant_id} user_id={user_id}",
         )
 
-    tenant_id: UUID = identity_row["tenant_id"]
-    user_id: UUID = identity_row["user_id"]
     provider: str = identity_row["provider"]
     context = _build_encryption_context(
         tenant_id=tenant_id,
@@ -650,6 +754,8 @@ async def rotate_credential_key(
                     encrypted_dek,
                     nonce,
                     credential_id,
+                    tenant_id,
+                    user_id,
                 )
                 if updated is None:
                     # Lost to a concurrent archive between identity lookup
@@ -682,6 +788,20 @@ async def rotate_credential_key(
             trace_id=trace_id,
         )
         raise
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="rotate DB section")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="rotate",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
+        )
+        raise wrapped from exc
 
 
 async def reactivate_credential(
@@ -731,14 +851,30 @@ async def reactivate_credential(
         )
         raise
 
-    # SELECT existing row to get its id + verify it is archived.
-    async with pool.acquire() as lookup_conn:
-        existing = await lookup_conn.fetchrow(
-            _SELECT_ANY_CREDENTIAL_ID_SQL,
-            tenant_id,
-            user_id,
-            provider,
+    # SELECT existing row to get its id + verify it is archived. Wrapped to
+    # convert raw asyncpg errors into VaultError + audit.
+    try:
+        async with pool.acquire() as lookup_conn:
+            existing = await lookup_conn.fetchrow(
+                _SELECT_ANY_CREDENTIAL_ID_SQL,
+                tenant_id,
+                user_id,
+                provider,
+            )
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="reactivate identity lookup")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="reactivate",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
         )
+        raise wrapped from exc
 
     if existing is None:
         await _best_effort_failure_audit(
@@ -848,14 +984,27 @@ async def reactivate_credential(
             trace_id=trace_id,
         )
         raise
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="reactivate DB section")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="reactivate",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
+        )
+        raise wrapped from exc
 
     return credential_id
 
 
-# Sentinel values for audit rows written when the credential identity is
-# unknown (ALLOWLIST violation on rotate, where the caller passes only
-# credential_id and we haven't read the row yet). The schema requires NOT
-# NULL tenant_id/user_id; the all-zero UUID is a recognizable forensic
-# marker.
-_NULL_UUID = UUID("00000000-0000-0000-0000-000000000000")
+# Sentinel for the "provider unknown" case in audit rows. Used by rotate
+# when the ALLOWLIST gate or identity lookup fails before we've read the
+# row's provider field. The all-zero UUIDs that used to be needed here
+# went away when rotate_credential_key started taking tenant_id + user_id
+# as explicit arguments (Codex R3 [P1] tenant-isolation fix).
 _UNKNOWN_PROVIDER = "unknown"

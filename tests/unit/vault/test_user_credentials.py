@@ -636,6 +636,8 @@ class TestRotateCredentialKey:
     ):
         with pytest.raises(VaultPermissionError):
             await user_credentials.rotate_credential_key(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
                 credential_id=uuid.uuid4(),
                 new_api_key="grn_new",
                 caller_module=_BLOCKED_CALLER,
@@ -659,6 +661,8 @@ class TestRotateCredentialKey:
 
         with pytest.raises(VaultError) as exc_info:
             await user_credentials.rotate_credential_key(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
                 credential_id=uuid.uuid4(),
                 new_api_key="grn_new",
                 caller_module=_ALLOWED_CALLER,
@@ -671,6 +675,50 @@ class TestRotateCredentialKey:
         encrypt_spy.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_cross_tenant_credential_id_returns_not_found(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Codex R3 [P1] tenant-isolation fix: caller passing a credential_id
+        that belongs to a different (tenant_id, user_id) tuple gets
+        VAULT_DB_NOT_FOUND, not access to the other tenant's row.
+
+        We assert this by feeding the lookup SQL the WRONG tenant_id/user_id
+        and confirming the lookup is parameterized with all three (the live
+        SQL filters on id + tenant_id + user_id; a real DB would return
+        nothing)."""
+        attacker_tenant = uuid.uuid4()
+        attacker_user = uuid.uuid4()
+        victim_credential_id = uuid.uuid4()
+        # The fake lookup returns None (mimicking real DB filter rejecting
+        # the wrong-tenant lookup):
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [lookup_conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.rotate_credential_key(
+                tenant_id=attacker_tenant,
+                user_id=attacker_user,
+                credential_id=victim_credential_id,
+                new_api_key="grn_attacker",
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
+        # Lookup SQL was called with all three (id, tenant_id, user_id)
+        lookup_args = lookup_conn.fetchrow.await_args.args
+        assert lookup_args[1] == victim_credential_id
+        assert lookup_args[2] == attacker_tenant
+        assert lookup_args[3] == attacker_user
+        # Lookup SQL filters on all three identity fields
+        sql = lookup_args[0]
+        assert "WHERE id = $1" in sql
+        assert "AND tenant_id = $2" in sql
+        assert "AND user_id = $3" in sql
+        # No mutation happened
+        encrypt_spy.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_happy_path_rotates_with_same_credential_id_in_context(
         self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
@@ -678,14 +726,14 @@ class TestRotateCredentialKey:
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
         lookup_conn = _make_fake_conn()
-        lookup_conn.fetchrow.return_value = {
-            "tenant_id": tenant_id, "user_id": user_id, "provider": "granola",
-        }
+        lookup_conn.fetchrow.return_value = {"provider": "granola"}
         cred_conn = _make_fake_conn()
         cred_conn.fetchrow.return_value = {"tenant_id": tenant_id}
         _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
 
         await user_credentials.rotate_credential_key(
+            tenant_id=tenant_id,
+            user_id=user_id,
             credential_id=credential_id,
             new_api_key="grn_new_key",
             caller_module=_ALLOWED_CALLER,
@@ -707,23 +755,22 @@ class TestRotateCredentialKey:
         assert kw["credential_id"] == credential_id
 
     @pytest.mark.asyncio
-    async def test_rotate_update_sql_resets_status_to_active(
+    async def test_rotate_update_sql_resets_status_and_filters_tenant(
         self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
-        """Codex round 2 P2: rotating a revoked/error credential must
-        also reset status='active' so the next poll picks it up clean."""
+        """Codex R2 P2: status reset. Codex R3 P1: UPDATE filters tenant_id."""
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
         lookup_conn = _make_fake_conn()
-        lookup_conn.fetchrow.return_value = {
-            "tenant_id": tenant_id, "user_id": user_id, "provider": "granola",
-        }
+        lookup_conn.fetchrow.return_value = {"provider": "granola"}
         cred_conn = _make_fake_conn()
         cred_conn.fetchrow.return_value = {"tenant_id": tenant_id}
         _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
 
         await user_credentials.rotate_credential_key(
+            tenant_id=tenant_id,
+            user_id=user_id,
             credential_id=credential_id,
             new_api_key="grn_new",
             caller_module=_ALLOWED_CALLER,
@@ -737,6 +784,14 @@ class TestRotateCredentialKey:
         )
         assert "last_error = NULL" in sql
         assert "consecutive_failures = 0" in sql
+        # Codex R3 [P1] tenant-isolation: UPDATE filters all three identity
+        # fields, not just id.
+        assert "AND tenant_id = $5" in sql
+        assert "AND user_id = $6" in sql
+        update_args = cred_conn.fetchrow.await_args.args
+        assert update_args[4] == credential_id
+        assert update_args[5] == tenant_id
+        assert update_args[6] == user_id
 
     @pytest.mark.asyncio
     async def test_archive_race_between_lookup_and_update_audits_not_found(
@@ -746,15 +801,15 @@ class TestRotateCredentialKey:
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
         lookup_conn = _make_fake_conn()
-        lookup_conn.fetchrow.return_value = {
-            "tenant_id": tenant_id, "user_id": user_id, "provider": "granola",
-        }
+        lookup_conn.fetchrow.return_value = {"provider": "granola"}
         cred_conn = _make_fake_conn()
         cred_conn.fetchrow.return_value = None  # UPDATE returned nothing
         _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
 
         with pytest.raises(VaultError) as exc_info:
             await user_credentials.rotate_credential_key(
+                tenant_id=tenant_id,
+                user_id=user_id,
                 credential_id=credential_id,
                 new_api_key="grn_new",
                 caller_module=_ALLOWED_CALLER,
@@ -773,21 +828,21 @@ class TestRotateCredentialKey:
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
-        # 2 rotates × 2 conns each (lookup + cred) = 4 conns
-        identity = {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"}
 
         def _factory():
             conn = _make_fake_conn()
-            conn.fetchrow.return_value = identity
+            conn.fetchrow.return_value = {"provider": "granola"}
             return conn
 
         fake_pool._conn_factory = _factory
 
         await user_credentials.rotate_credential_key(
+            tenant_id=tenant_id, user_id=user_id,
             credential_id=credential_id, new_api_key="grn_a",
             caller_module=_ALLOWED_CALLER, pool=fake_pool,
         )
         await user_credentials.rotate_credential_key(
+            tenant_id=tenant_id, user_id=user_id,
             credential_id=credential_id, new_api_key="grn_b",
             caller_module=_ALLOWED_CALLER, pool=fake_pool,
         )
@@ -936,6 +991,172 @@ class TestReactivateCredential:
         assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
         tx = cred_conn._transactions[0]
         assert tx.rolled_back is True
+
+
+class TestGetFiltersByStatus:
+    """Codex R3 [P2] fix: get returns only ACTIVE credentials.
+
+    The SQL must filter status='active' so revoked/error/archived
+    credentials are all hidden from the read accessor — callers shouldn't
+    have to remember to check status themselves before using the API key.
+    """
+
+    @pytest.mark.asyncio
+    async def test_select_sql_filters_status_active(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+    ):
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
+        await user_credentials.get_granola_credential_for_user(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            caller_module=_ALLOWED_CALLER,
+            pool=fake_pool,
+        )
+        sql = cred_conn.fetchrow.await_args.args[0]
+        assert "status = 'active'" in sql, (
+            "get must filter status='active' so revoked/error credentials "
+            "are not returned as if they were active"
+        )
+        assert "archived_at IS NULL" in sql
+
+
+class TestRawDbErrorConversion:
+    """Codex R3 [P1] fix: raw asyncpg exceptions are converted to
+    structured VaultError at every DB boundary, AND failure-audit is
+    written. Callers never see a non-VaultError from the vault module."""
+
+    @pytest.mark.asyncio
+    async def test_get_wraps_pool_acquire_failure(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+    ):
+        class _FailingAcquire:
+            async def __aenter__(self):
+                raise ConnectionError("pool exhausted")
+
+            async def __aexit__(self, *_):
+                return False
+
+        fake_pool.acquire = MagicMock(return_value=_FailingAcquire())
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.get_granola_credential_for_user(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_QUERY_FAILED
+        assert isinstance(exc_info.value.__cause__, ConnectionError)
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["success"] is False
+        assert (
+            audit_spy.await_args.kwargs["error_code"]
+            == VaultErrorCode.VAULT_DB_QUERY_FAILED.value
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_wraps_fetchrow_failure(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+    ):
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow = AsyncMock(side_effect=ConnectionError("network drop"))
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.get_granola_credential_for_user(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_QUERY_FAILED
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_store_wraps_pool_acquire_failure(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        class _FailingAcquire:
+            async def __aenter__(self):
+                raise ConnectionError("pool exhausted")
+
+            async def __aexit__(self, *_):
+                return False
+
+        fake_pool.acquire = MagicMock(return_value=_FailingAcquire())
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.store_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                api_key="grn_test",
+                config={"folder_id": "fol_x"},
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_QUERY_FAILED
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_rotate_wraps_pool_acquire_failure(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        class _FailingAcquire:
+            async def __aenter__(self):
+                raise ConnectionError("pool exhausted")
+
+            async def __aexit__(self, *_):
+                return False
+
+        fake_pool.acquire = MagicMock(return_value=_FailingAcquire())
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.rotate_credential_key(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                credential_id=uuid.uuid4(),
+                new_api_key="grn_new",
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_QUERY_FAILED
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["success"] is False
+        encrypt_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reactivate_wraps_pool_acquire_failure(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        class _FailingAcquire:
+            async def __aenter__(self):
+                raise ConnectionError("pool exhausted")
+
+            async def __aexit__(self, *_):
+                return False
+
+        fake_pool.acquire = MagicMock(return_value=_FailingAcquire())
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.reactivate_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                new_api_key="grn_new",
+                new_config={},
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_QUERY_FAILED
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["success"] is False
+        encrypt_spy.assert_not_called()
 
 
 class TestAllowlistDefaults:
