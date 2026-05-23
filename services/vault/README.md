@@ -138,13 +138,9 @@ Cadence recommendation: every 90 days, or immediately on suspected compromise. (
 
 ### Rotating the KMS CMK
 
-KMS supports automatic annual key rotation for symmetric CMKs. Enable via:
+**Auto-rotation: ENABLED 2026-05-23.** AWS auto-generates new key material annually. Next rotation: 2027-05-23. Existing ciphertexts remain decryptable indefinitely (KMS tracks all historical key material). Application code is unaffected — keep using `alias/eq-user-secrets`.
 
-```bash
-aws kms enable-key-rotation --key-id 59a0e2bc-c636-45e8-bccf-427ad2426ad8
-```
-
-With rotation enabled, KMS auto-generates new key material annually; existing ciphertexts continue to be decryptable indefinitely (KMS tracks all historical key material). Application code is unaffected — keep using `alias/eq-user-secrets`.
+To verify: `aws kms get-key-rotation-status --key-id 59a0e2bc-c636-45e8-bccf-427ad2426ad8` → `KeyRotationEnabled: true`.
 
 Manual rotation (replacing the CMK entirely) requires re-encrypting every row of `vault.user_credentials` against the new CMK. Out of scope for V1.
 
@@ -163,10 +159,37 @@ If the KMS CMK is suspected compromised: the threat model considered (insider ab
 
 ## Phase 2.1 hardening (deferred — do not pull forward without explicit user approval)
 
-1. **Second Postgres role + engine for vault** — currently `services/vault/user_credentials.py`'s allowlist is the only gate; a role-scoped `DATABASE_URL` would harden at the DB layer.
+1. **Second Postgres role + engine for vault** — currently `services/vault/user_credentials.py`'s allowlist is the only gate; a role-scoped `DATABASE_URL` would harden at the DB layer. **Paired with**: bringing the credential audit log into a separate role-restricted writer (the vault module would have write-only access to `vault.credential_access_log`, never UPDATE/DELETE, even though application code already follows that invariant at the function layer).
+
+**Note on Phase 2a discovery (2026-05-23):** While generating the Phase 2a Prisma migration in eq-frontend, significant pre-existing schema drift was discovered between `prisma/schema.prisma` and the production Neon DB (63 `DROP TABLE`s in the auto-generated diff, plus enum/index/FK drift). The Granola migration was hand-written to bypass this drift cleanly. Investigation + cutting-edge prevention design is tracked separately at **Linear EQ-11** ([Investigate Prisma schema drift in eq-frontend + design cutting-edge prevention approach](https://linear.app/eq-core/issue/EQ-11/investigate-prisma-schema-drift-in-eq-frontend-design-cutting-edge)). This is repo-level Prisma hygiene, not a vault-specific concern.
 2. **AES-GCM nonce-reuse detection monitoring** — random 96-bit nonces collide with negligible probability at our scale, but explicit detection costs nothing.
-3. **IAM Roles instead of programmatic access keys** — Railway federated identity (or AssumeRole via a Railway integration) eliminates long-lived access keys entirely.
-4. **Cross-region replicated CMK** — currently us-east-1 only; if EQ goes multi-region, replicate the CMK to keep KMS calls in-region.
+3. **Federated identity (eliminate long-lived AWS access keys)** — would replace `eq-vault-service` user + access keys with an IAM role assumed via OIDC federation from Railway. **Currently blocked**: Railway does not publicly support OIDC federation to AWS (verified 2026-05-23). Workarounds (IAM Roles Anywhere with X.509 certs, sidecar credentials broker, STS AssumeRole chain) all add significantly more complexity than the half-day estimate would suggest. **Status:** revisit when Railway adds OIDC support, OR if/when EQ evaluates platform migration. Until then, MVP hardening = minimum-privilege IAM policy (already applied) + 90-day key rotation cadence + the audit log this README adds in Phase 2a.
+4. **Automated access-key rotation reminder** — periodic check that warns if `EQ_VAULT_AWS_ACCESS_KEY_ID` age exceeds 90 days. Trivial implementation; deferred only because not load-bearing for MVP scale (3 design partners) and rotation procedure is documented above.
+5. **Cross-region replicated CMK** — currently us-east-1 only; if EQ goes multi-region, replicate the CMK to keep KMS calls in-region.
+6. **CloudTrail-based anomaly detection** — alert on unusual `kms:Decrypt` patterns (unexpected source IP, off-hours, burst). Requires alerting infrastructure (Phase 2.1 also defers Slack/Resend wire-up for vault breakage events).
+
+---
+
+## Credential audit log (added 2026-05-23)
+
+Every call into the vault accessor module writes a row to `vault.credential_access_log` BEFORE returning the decrypted secret. This is the forensic guarantee: post-incident, you can answer "what credential was read, when, by which caller, with what outcome."
+
+**Append-only invariant (enforced at application layer, MVP):** the vault module's audit-writer is the ONLY path that touches `vault.credential_access_log`. The module exposes no UPDATE or DELETE method. Phase 2.1's second-engine + role split MAY enforce this at the Postgres role level (revoke UPDATE/DELETE on the table for the runtime role); for MVP the invariant is application-enforced + documented + tested.
+
+**Row shape:**
+- `id` (UUID, PK)
+- `timestamp` (timestamptz, NOT NULL, default now())
+- `credential_id` (UUID, FK to `vault.user_credentials.id` — nullable for compromised-credential audit gaps)
+- `tenant_id`, `user_id`, `provider` (denormalized so audit row stands alone if credential row is deleted)
+- `caller_module` (text, NOT NULL — `services.granola_ingestion.adapter`, `services.granola_ingestion.scheduler`, `routers.granola`, etc.)
+- `operation` (text, NOT NULL — `read`, `write`, `rotate`, `archive`)
+- `success` (boolean, NOT NULL)
+- `error_code` (text, nullable — only set when success=false)
+- `trace_id` (text, nullable — for tying audit rows to request/workflow IDs)
+
+**Indexes:** `(tenant_id, timestamp DESC)` for tenant-scoped audit views; `(credential_id, timestamp DESC)` for per-credential history.
+
+**Retention:** unlimited for MVP. Phase 2.1+: tier to cold storage after 90 days; full purge after 7 years per typical compliance bounds.
 
 ---
 
@@ -180,6 +203,7 @@ If the KMS CMK is suspected compromised: the threat model considered (insider ab
 | 2026-05-22T19:57:16Z | peter-admin-cli | Attached inline policy `eq-vault-service-kms-policy` |
 | 2026-05-22T19:57:33Z | peter-admin-cli | Created access key `AKIATCKASHXFPCDN6NXX` |
 | 2026-05-22 (post-MCP) | peteroneil | Added 4 env vars to Railway production environment |
+| 2026-05-23T09:41:00Z | peter-admin-cli | Enabled KMS auto-rotation on CMK `59a0e2bc-...` (annual, next 2027-05-23) |
 
 ---
 
