@@ -10,9 +10,16 @@ Public API:
 * :func:`get_granola_credential_for_user` — read-and-decrypt accessor.
 * :func:`store_credential` — encrypt-and-insert accessor.
 * :func:`rotate_credential_key` — replace key material on an existing row.
+* :func:`reactivate_credential` — re-enable a previously archived row.
 * :data:`ALLOWLIST` — caller modules permitted to use the accessor.
 * :class:`VaultError`, :class:`VaultPermissionError`, :class:`VaultErrorCode`
   — structured failure signaling.
+
+All accessors take ``pool: asyncpg.Pool`` rather than a single
+``Connection``. The pool is used to acquire dedicated connections for the
+credential SQL AND for audit writes — separately — so audit rows are
+durable regardless of any transaction the caller may have open on a
+different connection.
 
 Callers MUST pass their own ``__name__`` (or a string matching one of the
 :data:`ALLOWLIST` entries) as the ``caller_module`` argument. Adding a new
@@ -27,6 +34,7 @@ from .user_credentials import (
     ALLOWLIST,
     GranolaCredential,
     get_granola_credential_for_user,
+    reactivate_credential,
     rotate_credential_key,
     store_credential,
 )
@@ -38,6 +46,7 @@ __all__ = [
     "VaultErrorCode",
     "VaultPermissionError",
     "get_granola_credential_for_user",
+    "reactivate_credential",
     "rotate_credential_key",
     "store_credential",
 ]

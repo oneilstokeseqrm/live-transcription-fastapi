@@ -18,6 +18,7 @@ from services.vault import (
     get_granola_credential_for_user,    # read + decrypt
     store_credential,                   # encrypt + insert
     rotate_credential_key,              # replace key material in place
+    reactivate_credential,              # re-enable a previously archived row
     ALLOWLIST,                          # caller modules permitted to use the accessor
     VaultError, VaultErrorCode,         # structured failure types
     VaultPermissionError,               # caller_module not in ALLOWLIST
@@ -26,13 +27,15 @@ from services.vault import (
 
 ### Signatures
 
+All accessors take `pool: asyncpg.Pool` rather than a single `Connection`. The pool is used to acquire dedicated connections for credential SQL AND for audit writes — separately (see "Audit log" below).
+
 ```python
 async def get_granola_credential_for_user(
     *,
     tenant_id: UUID,
     user_id: UUID,
     caller_module: str,
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     trace_id: str | None = None,
 ) -> GranolaCredential | None: ...
 
@@ -44,7 +47,7 @@ async def store_credential(
     api_key: str,
     config: dict[str, Any],
     caller_module: str,
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     trace_id: str | None = None,
 ) -> UUID: ...  # new credential row's UUID
 
@@ -53,9 +56,21 @@ async def rotate_credential_key(
     credential_id: UUID,
     new_api_key: str,
     caller_module: str,
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     trace_id: str | None = None,
 ) -> None: ...
+
+async def reactivate_credential(
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    provider: str,
+    new_api_key: str,
+    new_config: dict[str, Any],
+    caller_module: str,
+    pool: asyncpg.Pool,
+    trace_id: str | None = None,
+) -> UUID: ...  # archived row's preserved UUID
 ```
 
 `caller_module` must be one of:
@@ -66,9 +81,37 @@ async def rotate_credential_key(
 
 Anything else fails with `VaultPermissionError` (`error_code = vault_caller_not_allowed`). Adding a new caller requires editing `ALLOWLIST` in `services/vault/user_credentials.py` and a code review.
 
+### Reconnect-after-disconnect
+
+`store_credential` is INSERT-only and fails with `VAULT_DB_INSERT_FAILED` if a row already exists for `(tenant_id, user_id, provider)` (the schema's UNIQUE constraint covers archived rows too). Callers handling reconnect-after-disconnect should:
+
+1. Try `store_credential` first.
+2. If it raises `VAULT_DB_INSERT_FAILED`: call `reactivate_credential` to re-enable the archived row in place. The archived row's UUID is preserved (so any code holding a reference to the credential_id still works).
+3. If the row is currently ACTIVE: `reactivate_credential` rejects with `VAULT_DB_INSERT_FAILED` and a "use rotate_credential_key" message. The caller should call `rotate_credential_key` instead.
+
 ### Audit log
 
-Every accessor call writes one row to `vault.credential_access_log` via the caller's `conn`. The audit write shares the caller's transaction: a logging failure aborts the credential operation, so there is never a successful credential access without a forensic record. The audit module exposes no UPDATE or DELETE function (append-only invariant, app-layer enforced; a unit test greps the module source to catch regressions).
+Every accessor call writes one row to `vault.credential_access_log` via a **dedicated connection acquired from the pool** (NOT the caller's connection, and NOT the connection used for the credential SQL). This means audit rows are durable independent of any transaction the caller may have open elsewhere — the "failure to log = failure to access" guarantee holds unconditionally.
+
+The audit module exposes no UPDATE or DELETE function (append-only invariant, app-layer enforced; a unit test greps the module source to catch regressions).
+
+#### Atomicity of writes (store / rotate / reactivate)
+
+The credential SQL and the audit insert run on DIFFERENT connections, so they are not a single atomic SQL transaction. Atomicity is enforced by **ordering**:
+
+1. Credential SQL runs inside a transaction on `cred_conn` (UNCOMMITTED).
+2. Success-audit is written on a SEPARATE connection (autocommits immediately).
+3. Credential transaction commits.
+
+If step 2 fails, the credential transaction rolls back — no credential is persisted without a forensic record. If step 2 succeeds and step 3 fails (rare; typically a network drop during the commit RPC), we get a phantom audit row referring to a credential that doesn't exist. This is operationally a false positive (no actual credential exists, so no secret is being accessed without record) and is detectable by a periodic reconciliation job — see "Phase 2.1 hardening" below.
+
+#### Audit on read
+
+`get_granola_credential_for_user` writes one audit row per call. Reads don't need atomicity because the credential is only "accessed" if the caller receives it; any failure path re-raises before the value crosses the API boundary.
+
+#### Failure-audits
+
+Failure paths write `success=false` audit rows on a dedicated connection too, so forensic data persists even when the primary operation was rolled back. A double-fault (the failure-audit also fails) is logged but not re-raised — the original `VaultError` is what the caller sees.
 
 ---
 
@@ -231,6 +274,7 @@ If the KMS CMK is suspected compromised: the threat model considered (insider ab
 4. **Automated access-key rotation reminder** — periodic check that warns if `EQ_VAULT_AWS_ACCESS_KEY_ID` age exceeds 90 days. Trivial implementation; deferred only because not load-bearing for MVP scale (3 design partners) and rotation procedure is documented above.
 5. **Cross-region replicated CMK** — currently us-east-1 only; if EQ goes multi-region, replicate the CMK to keep KMS calls in-region.
 6. **CloudTrail-based anomaly detection** — alert on unusual `kms:Decrypt` patterns (unexpected source IP, off-hours, burst). Requires alerting infrastructure (Phase 2.1 also defers Slack/Resend wire-up for vault breakage events).
+7. **Audit-credential reconciliation job** — daily check that flags phantom audit rows (audit says `success=true` for a credential_id that has no matching row in `vault.user_credentials`) and silent credentials (rows in `user_credentials` with no corresponding audit row). The Phase 2b architecture orders audit-before-credential-commit to make silent credentials structurally impossible, so the realistic mode is phantom audits from rare commit-after-audit races. The job sets the bound on how long a phantom can go undetected.
 
 ---
 
@@ -269,6 +313,8 @@ Every call into the vault accessor module writes a row to `vault.credential_acce
 | 2026-05-22 (post-MCP) | peteroneil | Added 4 env vars to Railway production environment |
 | 2026-05-23T09:41:00Z | peter-admin-cli | Enabled KMS auto-rotation on CMK `59a0e2bc-...` (annual, next 2027-05-23) |
 | 2026-05-23 (Phase 2b) | peteroneil + Claude | Shipped Python vault module: `services/vault/{errors,encryption,audit,user_credentials,__init__}.py` + 46 AsyncMock-based unit tests (`tests/unit/vault/`). Pinned `cryptography>=44.0.0` in requirements.txt. |
+| 2026-05-23 (Phase 2b Codex R1) | peteroneil + Claude | Folded Codex round 1 findings: atomic write+audit via `conn.transaction()`; narrowed `AccessDeniedException` mapping so it surfaces as `VAULT_KMS_ENCRYPT_FAILED`/`VAULT_KMS_DECRYPT_FAILED` rather than the misleading `VAULT_KMS_CONTEXT_MISMATCH`. 53 tests pass. |
+| 2026-05-23 (Phase 2b Codex R2) | peteroneil + Claude | Folded Codex round 2 findings: audit module refactored to take `asyncpg.Pool` and acquire its own connection per write (unconditional durability vs caller transaction state); audit-before-credential-commit ordering preserves atomicity; added `reactivate_credential` for reconnect-after-disconnect; `rotate_credential_key` UPDATE now resets `status='active'`. Phantom-audit reconciliation job added to Phase 2.1 hardening list. 56 tests pass. |
 
 ---
 

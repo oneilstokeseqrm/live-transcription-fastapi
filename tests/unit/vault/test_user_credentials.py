@@ -1,22 +1,31 @@
 """Unit tests for ``services.vault.user_credentials``.
 
 AsyncMock-style per ``feedback_test_pattern_no_docker.md``. The asyncpg
-``Connection`` is mocked, ``encryption`` is monkeypatched to deterministic
-fakes, and ``audit.write_audit_row`` is replaced with a spy so we can assert
-on every audit-row write.
+``Pool`` is mocked to hand out separate connections per ``acquire()`` call
+so tests can assert on the audit-on-separate-connection contract.
+
+``encryption`` is monkeypatched to deterministic fakes and
+``audit.write_audit_row`` is replaced with a spy so we can assert on every
+audit-row write.
 
 Coverage:
 
-* LOCKED-42 — ALLOWLIST gate fails closed on every accessor; audit row
-  is still written
+* LOCKED-42 — ALLOWLIST gate fails closed on every accessor; audit row is
+  still written (via the failure-audit path) on a dedicated connection
 * LOCKED-40 — 4-field EncryptionContext built correctly (including the
   credential row's UUID as the fourth field)
-* LOCKED-41 — ``tenant_id`` / ``user_id`` flow as explicit arguments;
-  the accessor never reaches for any global
-* LOCKED-43 — ``store_credential`` and ``rotate_credential_key`` both call
-  ``encryption.encrypt_credential`` once per invocation (which itself mints a
-  fresh DEK + fresh nonce, asserted in test_encryption.py)
-* Every accessor call results in at least one audit-row write
+* LOCKED-41 — ``tenant_id`` / ``user_id`` flow as explicit arguments; the
+  accessor never reaches for any global
+* LOCKED-43 — ``store_credential``, ``rotate_credential_key``, and
+  ``reactivate_credential`` all call ``encryption.encrypt_credential``
+  once per invocation (which mints a fresh DEK + fresh nonce; asserted in
+  test_encryption.py)
+* Audit-before-credential-commit ordering: every successful write path
+  acquires a SEPARATE connection for the success-audit and writes it
+  BEFORE the credential transaction commits
+* Reconnect-after-disconnect: ``reactivate_credential`` handles archived
+  rows; ``store_credential`` does not
+* Rotate resets ``status='active'`` (Codex round 2 P2 fix)
 """
 
 from __future__ import annotations
@@ -34,14 +43,7 @@ _BLOCKED_CALLER = "not.in.allowlist"
 
 
 class _FakeTransaction:
-    """Mimics asyncpg's Transaction async context manager.
-
-    asyncpg's ``Connection.transaction()`` returns a Transaction object that
-    is itself an async context manager. ``__aenter__`` BEGINs (or opens a
-    savepoint) and ``__aexit__`` commits if no exception, rolls back if there
-    was one. Returning False from ``__aexit__`` propagates the exception so
-    the surrounding ``try`` sees it — that matches asyncpg's real behavior.
-    """
+    """Mimics asyncpg's Transaction async context manager."""
 
     def __init__(self) -> None:
         self.entered = False
@@ -59,13 +61,21 @@ class _FakeTransaction:
         return False  # propagate exceptions
 
 
-@pytest.fixture
-def fake_conn() -> AsyncMock:
-    """asyncpg ``Connection`` mock with overridable fetchrow + execute.
+class _FakeAcquireContextManager:
+    """Mimics ``asyncpg.Pool.acquire()``'s async context manager."""
 
-    ``conn.transaction()`` returns a fresh ``_FakeTransaction`` per call so
-    tests can introspect rollback behavior.
-    """
+    def __init__(self, conn: AsyncMock) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> AsyncMock:
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+def _make_fake_conn() -> AsyncMock:
+    """Build one fake asyncpg connection with txn + execute + fetchrow."""
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="INSERT 0 1")
     conn.fetchrow = AsyncMock(return_value=None)
@@ -77,18 +87,42 @@ def fake_conn() -> AsyncMock:
         return tx
 
     conn.transaction = MagicMock(side_effect=_new_txn)
-    # Expose the per-test list for assertions:
     conn._transactions = transactions  # type: ignore[attr-defined]
     return conn
 
 
 @pytest.fixture
-def audit_spy(monkeypatch):
-    """Replace audit.write_audit_row with an AsyncMock spy.
+def fake_pool() -> MagicMock:
+    """Mock ``asyncpg.Pool`` that hands out a fresh connection per acquire().
 
-    The spy mimics the real function's return type so callers receive a UUID.
-    Tests inspect ``spy.await_args_list`` to assert on each audit-row write.
+    Each acquire() yields a NEW AsyncMock connection so tests can assert
+    that audit and credential operations use SEPARATE connections.
+
+    The pool exposes ``_acquired_conns`` (list, in acquisition order) and
+    ``_conn_factory`` (callable; tests can override to return a specific
+    pre-configured conn).
     """
+    pool = MagicMock()
+    acquired_conns: list[AsyncMock] = []
+
+    def _default_factory() -> AsyncMock:
+        return _make_fake_conn()
+
+    pool._conn_factory = _default_factory  # type: ignore[attr-defined]
+
+    def _acquire() -> _FakeAcquireContextManager:
+        conn = pool._conn_factory()  # type: ignore[attr-defined]
+        acquired_conns.append(conn)
+        return _FakeAcquireContextManager(conn)
+
+    pool.acquire = MagicMock(side_effect=_acquire)
+    pool._acquired_conns = acquired_conns  # type: ignore[attr-defined]
+    return pool
+
+
+@pytest.fixture
+def audit_spy(monkeypatch):
+    """Replace audit.write_audit_row with an AsyncMock spy."""
     spy = AsyncMock(side_effect=lambda **kw: uuid.uuid4())
     monkeypatch.setattr(user_credentials.audit, "write_audit_row", spy)
     return spy
@@ -101,7 +135,6 @@ def encrypt_spy(monkeypatch):
 
     def fake_encrypt(*, plaintext: str, encryption_context: dict[str, str], **_kw):
         counter["n"] += 1
-        # Different bytes per call so test_fresh_dek_and_nonce assertions hold.
         return (
             f"ciphertext-{counter['n']}-{plaintext}".encode(),
             f"wrapped-dek-{counter['n']}".encode(),
@@ -126,7 +159,7 @@ def decrypt_spy(monkeypatch):
 
 
 def _credential_row(*, credential_id: uuid.UUID, tenant_id: uuid.UUID, user_id: uuid.UUID) -> dict:
-    """Fake asyncpg ``Record`` (dict access works on real Records too)."""
+    """Fake asyncpg Record (dict access works on real Records too)."""
     return {
         "id": credential_id,
         "tenant_id": tenant_id,
@@ -146,10 +179,23 @@ def _credential_row(*, credential_id: uuid.UUID, tenant_id: uuid.UUID, user_id: 
     }
 
 
+def _configure_pool_to_yield(pool: MagicMock, conns: list[AsyncMock]) -> None:
+    """Configure the pool to yield specific conns in order, then default factory."""
+    iterator = iter(conns)
+
+    def _factory() -> AsyncMock:
+        try:
+            return next(iterator)
+        except StopIteration:
+            return _make_fake_conn()
+
+    pool._conn_factory = _factory  # type: ignore[attr-defined]
+
+
 class TestGetGranolaCredential:
     @pytest.mark.asyncio
     async def test_caller_not_in_allowlist_raises_and_audits(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
     ):
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
@@ -158,9 +204,8 @@ class TestGetGranolaCredential:
                 tenant_id=tenant_id,
                 user_id=user_id,
                 caller_module=_BLOCKED_CALLER,
-                conn=fake_conn,
+                pool=fake_pool,
             )
-        # Audit row written even though access was denied
         audit_spy.assert_awaited_once()
         kw = audit_spy.await_args.kwargs
         assert kw["operation"] == "read"
@@ -168,19 +213,24 @@ class TestGetGranolaCredential:
         assert kw["error_code"] == VaultErrorCode.VAULT_CALLER_NOT_ALLOWED.value
         assert kw["caller_module"] == _BLOCKED_CALLER
         assert kw["credential_id"] is None
-        # No SQL ran
-        fake_conn.fetchrow.assert_not_called()
+        assert kw["pool"] is fake_pool
+        # Pool was NOT acquired for any credential SQL — ALLOWLIST short-circuits
+        # before any DB work
+        fake_pool.acquire.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_row_returns_none_and_audits_success(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
     ):
-        fake_conn.fetchrow.return_value = None
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
         result = await user_credentials.get_granola_credential_for_user(
             tenant_id=uuid.uuid4(),
             user_id=uuid.uuid4(),
             caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            pool=fake_pool,
         )
         assert result is None
         audit_spy.assert_awaited_once()
@@ -192,20 +242,22 @@ class TestGetGranolaCredential:
 
     @pytest.mark.asyncio
     async def test_happy_path_returns_credential_with_decrypted_key(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
     ):
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
-        fake_conn.fetchrow.return_value = _credential_row(
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = _credential_row(
             credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
         )
+        _configure_pool_to_yield(fake_pool, [cred_conn])
 
         result = await user_credentials.get_granola_credential_for_user(
             tenant_id=tenant_id,
             user_id=user_id,
             caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            pool=fake_pool,
             trace_id="trace-1",
         )
 
@@ -215,8 +267,6 @@ class TestGetGranolaCredential:
         assert result.user_id == user_id
         assert result.api_key.startswith("grn_decrypted_")
         assert result.config == {"folder_id": "fol_abc"}
-
-        # Audit row: success, credential_id matches
         audit_spy.assert_awaited_once()
         kw = audit_spy.await_args.kwargs
         assert kw["operation"] == "read"
@@ -226,21 +276,23 @@ class TestGetGranolaCredential:
 
     @pytest.mark.asyncio
     async def test_decrypt_passes_4_field_context_with_row_id(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
     ):
         """LOCKED-40 — credential_id from the row, not the caller."""
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
-        fake_conn.fetchrow.return_value = _credential_row(
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = _credential_row(
             credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
         )
+        _configure_pool_to_yield(fake_pool, [cred_conn])
 
         await user_credentials.get_granola_credential_for_user(
             tenant_id=tenant_id,
             user_id=user_id,
             caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            pool=fake_pool,
         )
 
         decrypt_spy.assert_called_once()
@@ -254,14 +306,16 @@ class TestGetGranolaCredential:
 
     @pytest.mark.asyncio
     async def test_decrypt_failure_audits_and_reraises(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
     ):
         credential_id = uuid.uuid4()
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
-        fake_conn.fetchrow.return_value = _credential_row(
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = _credential_row(
             credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
         )
+        _configure_pool_to_yield(fake_pool, [cred_conn])
         decrypt_spy.side_effect = VaultError(
             VaultErrorCode.VAULT_KMS_CONTEXT_MISMATCH, "tampered"
         )
@@ -271,7 +325,7 @@ class TestGetGranolaCredential:
                 tenant_id=tenant_id,
                 user_id=user_id,
                 caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
+                pool=fake_pool,
             )
         assert exc_info.value.code == VaultErrorCode.VAULT_KMS_CONTEXT_MISMATCH
         audit_spy.assert_awaited_once()
@@ -282,33 +336,41 @@ class TestGetGranolaCredential:
 
     @pytest.mark.asyncio
     async def test_select_filters_archived_at_is_null(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
     ):
         """The accessor must not return archived rows."""
-        fake_conn.fetchrow.return_value = None
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
         await user_credentials.get_granola_credential_for_user(
             tenant_id=uuid.uuid4(),
             user_id=uuid.uuid4(),
             caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            pool=fake_pool,
         )
-        sql = fake_conn.fetchrow.await_args.args[0]
+        sql = cred_conn.fetchrow.await_args.args[0]
         assert "archived_at IS NULL" in sql
         assert "provider = $3" in sql
 
     @pytest.mark.asyncio
-    async def test_select_filters_tenant_and_user(self, fake_conn, audit_spy, decrypt_spy):
+    async def test_select_filters_tenant_and_user(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+    ):
         """LOCKED-41 — the SELECT MUST include tenant_id in the WHERE."""
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
-        fake_conn.fetchrow.return_value = None
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
         await user_credentials.get_granola_credential_for_user(
             tenant_id=tenant_id,
             user_id=user_id,
             caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            pool=fake_pool,
         )
-        args = fake_conn.fetchrow.await_args.args
+        args = cred_conn.fetchrow.await_args.args
         assert args[1] == tenant_id
         assert args[2] == user_id
         assert args[3] == "granola"
@@ -317,7 +379,7 @@ class TestGetGranolaCredential:
 class TestStoreCredential:
     @pytest.mark.asyncio
     async def test_caller_not_in_allowlist_raises_and_audits(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
         with pytest.raises(VaultPermissionError):
             await user_credentials.store_credential(
@@ -327,7 +389,7 @@ class TestStoreCredential:
                 api_key="grn_test",
                 config={"folder_id": "fol_x"},
                 caller_module=_BLOCKED_CALLER,
-                conn=fake_conn,
+                pool=fake_pool,
             )
         audit_spy.assert_awaited_once()
         kw = audit_spy.await_args.kwargs
@@ -335,11 +397,11 @@ class TestStoreCredential:
         assert kw["success"] is False
         assert kw["error_code"] == VaultErrorCode.VAULT_CALLER_NOT_ALLOWED.value
         encrypt_spy.assert_not_called()
-        fake_conn.execute.assert_not_called()
+        fake_pool.acquire.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_happy_path_inserts_and_audits(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
@@ -350,37 +412,39 @@ class TestStoreCredential:
             api_key="grn_test_123",
             config={"folder_id": "fol_abc", "folder_name": "EQ"},
             caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            pool=fake_pool,
         )
 
         assert isinstance(new_id, uuid.UUID)
         encrypt_spy.assert_called_once()
         ctx = encrypt_spy.call_args.kwargs["encryption_context"]
-        # LOCKED-40 — the new row's UUID is the credential_id in the context
         assert ctx == {
             "tenant_id": str(tenant_id),
             "user_id": str(user_id),
             "provider": "granola",
             "credential_id": str(new_id),
         }
-        # INSERT call
-        fake_conn.execute.assert_awaited_once()
-        execute_args = fake_conn.execute.await_args.args
+        # Exactly one acquire for the credential connection. Audit goes
+        # through the spy (which is monkeypatched, so no real acquire).
+        fake_pool.acquire.assert_called_once()
+        cred_conn = fake_pool._acquired_conns[0]
+        cred_conn.execute.assert_awaited_once()
+        execute_args = cred_conn.execute.await_args.args
         assert "INSERT INTO vault.user_credentials" in execute_args[0]
         assert execute_args[1] == new_id
         assert execute_args[2] == tenant_id
-        assert execute_args[3] == user_id
-        assert execute_args[4] == "granola"
-        # Audit row
+        # Success-audit happened
         audit_spy.assert_awaited_once()
         kw = audit_spy.await_args.kwargs
         assert kw["operation"] == "write"
         assert kw["success"] is True
         assert kw["credential_id"] == new_id
+        # Audit was passed the pool (so it acquires its own conn)
+        assert kw["pool"] is fake_pool
 
     @pytest.mark.asyncio
     async def test_encrypt_failure_audits_and_reraises_without_insert(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
         encrypt_spy.side_effect = VaultError(
             VaultErrorCode.VAULT_KMS_ENCRYPT_FAILED, "kms down"
@@ -393,18 +457,21 @@ class TestStoreCredential:
                 api_key="grn_test",
                 config={"folder_id": "fol_x"},
                 caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
+                pool=fake_pool,
             )
         assert exc_info.value.code == VaultErrorCode.VAULT_KMS_ENCRYPT_FAILED
-        fake_conn.execute.assert_not_called()
+        fake_pool.acquire.assert_not_called()
         audit_spy.assert_awaited_once()
         assert audit_spy.await_args.kwargs["success"] is False
 
     @pytest.mark.asyncio
     async def test_insert_failure_audits_and_wraps_as_db_insert_failed(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
-        fake_conn.execute = AsyncMock(side_effect=RuntimeError("unique violation"))
+        cred_conn = _make_fake_conn()
+        cred_conn.execute = AsyncMock(side_effect=RuntimeError("unique violation"))
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
         with pytest.raises(VaultError) as exc_info:
             await user_credentials.store_credential(
                 tenant_id=uuid.uuid4(),
@@ -413,9 +480,13 @@ class TestStoreCredential:
                 api_key="grn_test",
                 config={"folder_id": "fol_x"},
                 caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
+                pool=fake_pool,
             )
         assert exc_info.value.code == VaultErrorCode.VAULT_DB_INSERT_FAILED
+        # Transaction rolled back
+        tx = cred_conn._transactions[0]
+        assert tx.rolled_back is True
+        # Failure-audit written
         audit_spy.assert_awaited_once()
         assert audit_spy.await_args.kwargs["success"] is False
         assert (
@@ -425,15 +496,9 @@ class TestStoreCredential:
 
     @pytest.mark.asyncio
     async def test_two_consecutive_stores_call_encrypt_twice(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
-        """LOCKED-43 contract — every write triggers its own encrypt call.
-
-        The encrypt function itself is what mints a fresh DEK + nonce on
-        every call (verified in test_encryption.py). user_credentials's
-        contract is: never short-circuit, never reuse stored encryption
-        output.
-        """
+        """LOCKED-43 contract — every write triggers its own encrypt call."""
         kwargs = dict(
             tenant_id=uuid.uuid4(),
             user_id=uuid.uuid4(),
@@ -441,24 +506,140 @@ class TestStoreCredential:
             api_key="grn_test",
             config={"folder_id": "fol_x"},
             caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            pool=fake_pool,
         )
         await user_credentials.store_credential(**kwargs)
         await user_credentials.store_credential(**kwargs)
         assert encrypt_spy.call_count == 2
 
 
+class TestStoreAtomicityAndOrdering:
+    """Audit-before-credential-commit ordering enforces the durability claim."""
+
+    @pytest.mark.asyncio
+    async def test_audit_runs_before_credential_commit(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """The success-audit must complete BEFORE the credential transaction
+        exits. Operationally: if audit fails, txn rolls back; we never commit
+        a credential without first having committed the audit."""
+        call_order: list[str] = []
+
+        # Subclass _FakeTransaction so we can override __aexit__ on the
+        # CLASS (Python dunder methods are class-resolved, not
+        # instance-resolved, so per-instance assignment doesn't work).
+        class _TracedTransaction(_FakeTransaction):
+            async def __aexit__(self_, exc_type, exc, tb):
+                call_order.append("credential_commit")
+                return await super().__aexit__(exc_type, exc, tb)
+
+        async def _audit_record(**_kw):
+            call_order.append("audit")
+            return uuid.uuid4()
+
+        audit_spy.side_effect = _audit_record
+
+        cred_conn = AsyncMock()
+        cred_conn.fetchrow = AsyncMock(return_value=None)
+        cred_conn._transactions = []  # type: ignore[attr-defined]
+
+        async def _trace_execute(*_args, **_kw):
+            call_order.append("credential_insert")
+            return "INSERT 0 1"
+
+        cred_conn.execute = AsyncMock(side_effect=_trace_execute)
+
+        def _new_txn():
+            tx = _TracedTransaction()
+            cred_conn._transactions.append(tx)
+            return tx
+
+        cred_conn.transaction = MagicMock(side_effect=_new_txn)
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
+        await user_credentials.store_credential(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            provider="granola",
+            api_key="grn_test",
+            config={"folder_id": "fol_x"},
+            caller_module=_ALLOWED_CALLER,
+            pool=fake_pool,
+        )
+
+        # Order must be: INSERT → audit → commit
+        assert call_order == ["credential_insert", "audit", "credential_commit"], (
+            f"audit must commit BEFORE credential commit; got {call_order}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_audit_failure_inside_txn_rolls_back_credential(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """If the success-audit (separate conn) raises, the cred_conn txn
+        must roll back AND a failure-audit is attempted on its own conn."""
+        audit_spy.side_effect = [
+            VaultError(VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED, "audit died"),
+            uuid.uuid4(),  # outside-txn failure audit succeeds
+        ]
+
+        cred_conn = _make_fake_conn()
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.store_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                api_key="grn_test",
+                config={"folder_id": "fol_x"},
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED
+        tx = cred_conn._transactions[0]
+        assert tx.rolled_back is True
+        assert audit_spy.await_count == 2
+        # Second call is the failure-audit
+        second_kw = audit_spy.await_args_list[1].kwargs
+        assert second_kw["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_double_fault_does_not_mask_original_error(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        audit_spy.side_effect = [
+            VaultError(VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED, "primary failure"),
+            VaultError(VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED, "secondary failure"),
+        ]
+        cred_conn = _make_fake_conn()
+        _configure_pool_to_yield(fake_pool, [cred_conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.store_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                api_key="grn_test",
+                config={"folder_id": "fol_x"},
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert "primary failure" in str(exc_info.value)
+        assert audit_spy.await_count == 2
+
+
 class TestRotateCredentialKey:
     @pytest.mark.asyncio
     async def test_caller_not_in_allowlist_raises_and_audits(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
         with pytest.raises(VaultPermissionError):
             await user_credentials.rotate_credential_key(
                 credential_id=uuid.uuid4(),
                 new_api_key="grn_new",
                 caller_module=_BLOCKED_CALLER,
-                conn=fake_conn,
+                pool=fake_pool,
             )
         audit_spy.assert_awaited_once()
         kw = audit_spy.await_args.kwargs
@@ -466,18 +647,22 @@ class TestRotateCredentialKey:
         assert kw["success"] is False
         assert kw["error_code"] == VaultErrorCode.VAULT_CALLER_NOT_ALLOWED.value
         encrypt_spy.assert_not_called()
+        fake_pool.acquire.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_credential_not_found_raises_db_not_found_and_audits(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
-        fake_conn.fetchrow.return_value = None
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [lookup_conn])
+
         with pytest.raises(VaultError) as exc_info:
             await user_credentials.rotate_credential_key(
                 credential_id=uuid.uuid4(),
                 new_api_key="grn_new",
                 caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
+                pool=fake_pool,
             )
         assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
         audit_spy.assert_awaited_once()
@@ -487,23 +672,24 @@ class TestRotateCredentialKey:
 
     @pytest.mark.asyncio
     async def test_happy_path_rotates_with_same_credential_id_in_context(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
-
-        # First fetchrow: identity lookup; second fetchrow: UPDATE RETURNING
-        fake_conn.fetchrow.side_effect = [
-            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
-            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
-        ]
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {
+            "tenant_id": tenant_id, "user_id": user_id, "provider": "granola",
+        }
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = {"tenant_id": tenant_id}
+        _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
 
         await user_credentials.rotate_credential_key(
             credential_id=credential_id,
             new_api_key="grn_new_key",
             caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            pool=fake_pool,
         )
 
         encrypt_spy.assert_called_once()
@@ -514,7 +700,6 @@ class TestRotateCredentialKey:
             "provider": "granola",
             "credential_id": str(credential_id),
         }
-        # Audit row: success rotate
         audit_spy.assert_awaited_once()
         kw = audit_spy.await_args.kwargs
         assert kw["operation"] == "rotate"
@@ -522,56 +707,235 @@ class TestRotateCredentialKey:
         assert kw["credential_id"] == credential_id
 
     @pytest.mark.asyncio
+    async def test_rotate_update_sql_resets_status_to_active(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Codex round 2 P2: rotating a revoked/error credential must
+        also reset status='active' so the next poll picks it up clean."""
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {
+            "tenant_id": tenant_id, "user_id": user_id, "provider": "granola",
+        }
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = {"tenant_id": tenant_id}
+        _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
+
+        await user_credentials.rotate_credential_key(
+            credential_id=credential_id,
+            new_api_key="grn_new",
+            caller_module=_ALLOWED_CALLER,
+            pool=fake_pool,
+        )
+
+        sql = cred_conn.fetchrow.await_args.args[0]
+        assert "status = 'active'" in sql, (
+            "rotate must reset status to 'active' so revoked/error credentials "
+            "become active again after manual rotation"
+        )
+        assert "last_error = NULL" in sql
+        assert "consecutive_failures = 0" in sql
+
+    @pytest.mark.asyncio
     async def test_archive_race_between_lookup_and_update_audits_not_found(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
-        # Identity lookup succeeds; UPDATE RETURNING returns nothing
-        fake_conn.fetchrow.side_effect = [
-            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
-            None,
-        ]
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {
+            "tenant_id": tenant_id, "user_id": user_id, "provider": "granola",
+        }
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = None  # UPDATE returned nothing
+        _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
 
         with pytest.raises(VaultError) as exc_info:
             await user_credentials.rotate_credential_key(
                 credential_id=credential_id,
                 new_api_key="grn_new",
                 caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
+                pool=fake_pool,
             )
         assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
+        tx = cred_conn._transactions[0]
+        assert tx.rolled_back is True
         audit_spy.assert_awaited_once()
         assert audit_spy.await_args.kwargs["success"] is False
 
     @pytest.mark.asyncio
     async def test_two_consecutive_rotates_each_call_encrypt(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
-        """LOCKED-43 — each rotate mints a fresh DEK + nonce via encrypt."""
         tenant_id = uuid.uuid4()
         user_id = uuid.uuid4()
         credential_id = uuid.uuid4()
+        # 2 rotates × 2 conns each (lookup + cred) = 4 conns
         identity = {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"}
-        update_returning = {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"}
-        fake_conn.fetchrow.side_effect = [
-            identity, update_returning, identity, update_returning,
-        ]
+
+        def _factory():
+            conn = _make_fake_conn()
+            conn.fetchrow.return_value = identity
+            return conn
+
+        fake_pool._conn_factory = _factory
 
         await user_credentials.rotate_credential_key(
-            credential_id=credential_id,
-            new_api_key="grn_a",
-            caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            credential_id=credential_id, new_api_key="grn_a",
+            caller_module=_ALLOWED_CALLER, pool=fake_pool,
         )
         await user_credentials.rotate_credential_key(
-            credential_id=credential_id,
-            new_api_key="grn_b",
-            caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
+            credential_id=credential_id, new_api_key="grn_b",
+            caller_module=_ALLOWED_CALLER, pool=fake_pool,
         )
         assert encrypt_spy.call_count == 2
+
+
+class TestReactivateCredential:
+    """Codex round 2 P1: reconnect-after-disconnect needs a working primitive."""
+
+    @pytest.mark.asyncio
+    async def test_caller_not_in_allowlist_raises_and_audits(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        with pytest.raises(VaultPermissionError):
+            await user_credentials.reactivate_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                new_api_key="grn_x",
+                new_config={"folder_id": "fol_x"},
+                caller_module=_BLOCKED_CALLER,
+                pool=fake_pool,
+            )
+        audit_spy.assert_awaited_once()
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "reactivate"
+        assert kw["success"] is False
+        assert kw["error_code"] == VaultErrorCode.VAULT_CALLER_NOT_ALLOWED.value
+        encrypt_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_row_raises_db_not_found(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [lookup_conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.reactivate_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                new_api_key="grn_x",
+                new_config={},
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
+        assert "store_credential" in str(exc_info.value)
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["operation"] == "reactivate"
+        encrypt_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_active_row_rejects_with_db_insert_failed(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """An active (non-archived) row means caller should rotate instead."""
+        existing_id = uuid.uuid4()
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {"id": existing_id, "archived_at": None}
+        _configure_pool_to_yield(fake_pool, [lookup_conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.reactivate_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                new_api_key="grn_x",
+                new_config={},
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_INSERT_FAILED
+        assert "rotate_credential_key" in str(exc_info.value)
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["credential_id"] == existing_id
+        encrypt_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_happy_path_preserves_credential_id_in_context(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Reactivating preserves the archived row's id (per docstring)."""
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        existing_id = uuid.uuid4()
+        archived_at = MagicMock()  # any truthy datetime-like
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {"id": existing_id, "archived_at": archived_at}
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = {"tenant_id": tenant_id}
+        _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
+
+        returned_id = await user_credentials.reactivate_credential(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider="granola",
+            new_api_key="grn_new",
+            new_config={"folder_id": "fol_y"},
+            caller_module=_ALLOWED_CALLER,
+            pool=fake_pool,
+        )
+        assert returned_id == existing_id
+        encrypt_spy.assert_called_once()
+        ctx = encrypt_spy.call_args.kwargs["encryption_context"]
+        assert ctx["credential_id"] == str(existing_id)
+        assert ctx["tenant_id"] == str(tenant_id)
+        # UPDATE SQL targets archived rows
+        sql = cred_conn.fetchrow.await_args.args[0]
+        assert "archived_at IS NOT NULL" in sql
+        assert "archived_at = NULL" in sql
+        assert "status = 'active'" in sql
+        # Audit success
+        audit_spy.assert_awaited_once()
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "reactivate"
+        assert kw["success"] is True
+        assert kw["credential_id"] == existing_id
+
+    @pytest.mark.asyncio
+    async def test_race_concurrent_reactivate_audits_not_found(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """If another caller reactivates between lookup and UPDATE, the
+        WHERE archived_at IS NOT NULL clause makes UPDATE return nothing."""
+        existing_id = uuid.uuid4()
+        archived_at = MagicMock()
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {"id": existing_id, "archived_at": archived_at}
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = None  # UPDATE matched nothing
+        _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.reactivate_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                new_api_key="grn_new",
+                new_config={},
+                caller_module=_ALLOWED_CALLER,
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
+        tx = cred_conn._transactions[0]
+        assert tx.rolled_back is True
 
 
 class TestAllowlistDefaults:
@@ -585,218 +949,4 @@ class TestAllowlistDefaults:
         )
 
     def test_allowlist_is_frozen(self):
-        # frozenset has no .add method — guards against in-process mutation
         assert not hasattr(user_credentials.ALLOWLIST, "add")
-
-
-class TestStoreAtomicity:
-    """Per Codex round 1 P1: INSERT + success-audit are atomic.
-
-    asyncpg.Connection.execute autocommits per statement by default, so we
-    must wrap the credential write + success-audit in an explicit
-    ``conn.transaction()``. Without this, a failed audit-write would leave
-    the credential row committed with no forensic record — violating the
-    README/API guarantee that "failure to log = failure to access."
-    """
-
-    @pytest.mark.asyncio
-    async def test_happy_path_uses_explicit_transaction(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
-    ):
-        await user_credentials.store_credential(
-            tenant_id=uuid.uuid4(),
-            user_id=uuid.uuid4(),
-            provider="granola",
-            api_key="grn_test",
-            config={"folder_id": "fol_x"},
-            caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
-        )
-        assert fake_conn.transaction.call_count == 1
-        # The transaction entered + exited cleanly (no rollback)
-        tx = fake_conn._transactions[0]
-        assert tx.entered is True
-        assert tx.exited is True
-        assert tx.rolled_back is False
-
-    @pytest.mark.asyncio
-    async def test_audit_success_failure_inside_txn_triggers_rollback(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
-    ):
-        """If the success-audit fails INSIDE the transaction, the credential
-        INSERT must be rolled back AND a failure-audit attempted outside."""
-        from services.vault.errors import VaultError as _VE
-        from services.vault.errors import VaultErrorCode as _VEC
-
-        # First audit call (the success one, inside txn) fails.
-        # Second audit call (the failure one, outside txn) succeeds.
-        audit_spy.side_effect = [
-            _VE(_VEC.VAULT_AUDIT_LOG_WRITE_FAILED, "txn-side audit failed"),
-            uuid.uuid4(),  # outside-txn failure audit
-        ]
-
-        with pytest.raises(VaultError) as exc_info:
-            await user_credentials.store_credential(
-                tenant_id=uuid.uuid4(),
-                user_id=uuid.uuid4(),
-                provider="granola",
-                api_key="grn_test",
-                config={"folder_id": "fol_x"},
-                caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
-            )
-        assert exc_info.value.code == VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED
-
-        # Transaction rolled back (the success-audit failure propagated):
-        tx = fake_conn._transactions[0]
-        assert tx.entered is True
-        assert tx.rolled_back is True
-
-        # Two audit calls total: the success attempt (failed) + the failure-audit
-        assert audit_spy.await_count == 2
-        # First call was the success attempt
-        first_kw = audit_spy.await_args_list[0].kwargs
-        assert first_kw["success"] is True
-        # Second call was the best-effort failure-audit
-        second_kw = audit_spy.await_args_list[1].kwargs
-        assert second_kw["success"] is False
-        assert second_kw["error_code"] == VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED.value
-
-    @pytest.mark.asyncio
-    async def test_double_fault_does_not_mask_original_error(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
-    ):
-        """If the failure-audit ALSO fails, the caller sees the original
-        VaultError, not the secondary audit failure."""
-        from services.vault.errors import VaultError as _VE
-        from services.vault.errors import VaultErrorCode as _VEC
-
-        # First audit (success inside txn) fails with VAULT_AUDIT_LOG_WRITE_FAILED.
-        # Second audit (failure outside txn) also fails; should be swallowed.
-        audit_spy.side_effect = [
-            _VE(_VEC.VAULT_AUDIT_LOG_WRITE_FAILED, "primary failure"),
-            _VE(_VEC.VAULT_AUDIT_LOG_WRITE_FAILED, "secondary failure"),
-        ]
-
-        with pytest.raises(VaultError) as exc_info:
-            await user_credentials.store_credential(
-                tenant_id=uuid.uuid4(),
-                user_id=uuid.uuid4(),
-                provider="granola",
-                api_key="grn_test",
-                config={"folder_id": "fol_x"},
-                caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
-            )
-        # Caller sees the ORIGINAL error, not the swallowed double-fault
-        assert "primary failure" in str(exc_info.value)
-        assert audit_spy.await_count == 2
-
-
-class TestRotateAtomicity:
-    """Same atomicity contract for rotate (Codex round 1 P1)."""
-
-    @pytest.mark.asyncio
-    async def test_happy_path_uses_explicit_transaction(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
-    ):
-        tenant_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        credential_id = uuid.uuid4()
-        fake_conn.fetchrow.side_effect = [
-            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
-            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
-        ]
-
-        await user_credentials.rotate_credential_key(
-            credential_id=credential_id,
-            new_api_key="grn_new",
-            caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
-        )
-        assert fake_conn.transaction.call_count == 1
-        tx = fake_conn._transactions[0]
-        assert tx.entered is True
-        assert tx.rolled_back is False
-
-    @pytest.mark.asyncio
-    async def test_audit_failure_inside_txn_triggers_rollback(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
-    ):
-        from services.vault.errors import VaultError as _VE
-        from services.vault.errors import VaultErrorCode as _VEC
-
-        tenant_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        credential_id = uuid.uuid4()
-        fake_conn.fetchrow.side_effect = [
-            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
-            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
-        ]
-        audit_spy.side_effect = [
-            _VE(_VEC.VAULT_AUDIT_LOG_WRITE_FAILED, "txn-side audit failed"),
-            uuid.uuid4(),
-        ]
-
-        with pytest.raises(VaultError) as exc_info:
-            await user_credentials.rotate_credential_key(
-                credential_id=credential_id,
-                new_api_key="grn_new",
-                caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
-            )
-        assert exc_info.value.code == VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED
-        tx = fake_conn._transactions[0]
-        assert tx.rolled_back is True
-        assert audit_spy.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_not_found_inside_txn_audits_outside_txn(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
-    ):
-        """Race scenario: identity lookup succeeded, UPDATE RETURNING none
-        (concurrent archive). Inside-txn raise → rollback → outside-txn audit."""
-        tenant_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        credential_id = uuid.uuid4()
-        # Identity lookup (outside txn) succeeds; UPDATE RETURNING (inside txn) returns None
-        fake_conn.fetchrow.side_effect = [
-            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
-            None,
-        ]
-
-        with pytest.raises(VaultError) as exc_info:
-            await user_credentials.rotate_credential_key(
-                credential_id=credential_id,
-                new_api_key="grn_new",
-                caller_module=_ALLOWED_CALLER,
-                conn=fake_conn,
-            )
-        assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
-        # Transaction was entered and rolled back
-        assert len(fake_conn._transactions) == 1
-        tx = fake_conn._transactions[0]
-        assert tx.entered is True
-        assert tx.rolled_back is True
-        # Failure-audit happened OUTSIDE the rolled-back transaction
-        audit_spy.assert_awaited_once()
-        assert audit_spy.await_args.kwargs["success"] is False
-        assert audit_spy.await_args.kwargs["error_code"] == VaultErrorCode.VAULT_DB_NOT_FOUND.value
-
-
-class TestGetDoesNotUseTransaction:
-    """Reads don't need atomicity — failure to log + exception = no API access.
-    Confirms the txn refactor didn't accidentally wrap the read path."""
-
-    @pytest.mark.asyncio
-    async def test_get_does_not_open_transaction(
-        self, fake_conn: AsyncMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
-    ):
-        fake_conn.fetchrow.return_value = None
-        await user_credentials.get_granola_credential_for_user(
-            tenant_id=uuid.uuid4(),
-            user_id=uuid.uuid4(),
-            caller_module=_ALLOWED_CALLER,
-            conn=fake_conn,
-        )
-        fake_conn.transaction.assert_not_called()

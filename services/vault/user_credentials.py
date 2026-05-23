@@ -17,28 +17,35 @@ Invariants:
 * **LOCKED-42** — the :data:`ALLOWLIST` is the load-bearing app-layer gate.
   Anything not in the set fails closed with
   :class:`~services.vault.errors.VaultPermissionError` before SQL or KMS runs.
-* **LOCKED-43** — :func:`store_credential` and :func:`rotate_credential_key`
-  both mint a fresh DEK + fresh nonce via the encryption module on every call.
+* **LOCKED-43** — :func:`store_credential`, :func:`rotate_credential_key`, and
+  :func:`reactivate_credential` all mint a fresh DEK + fresh nonce via the
+  encryption module on every call.
 
-Atomicity (writes only): :func:`store_credential` and :func:`rotate_credential_key`
-wrap the credential DML + success-audit in an explicit ``conn.transaction()``
-so a failed audit-write rolls back the credential change. asyncpg's
-``Connection.execute`` autocommits by default; without this wrapping, the
-credential row would persist even when its audit row failed, violating the
-README/API guarantee that "failure to log = failure to access." asyncpg
-nests transactions as savepoints, so callers that wrap a larger unit of
-work in their own transaction still get correct savepoint-rollback
-semantics.
+**Pool-based architecture (Codex round 2 [P1] fix):** accessors take
+``asyncpg.Pool`` rather than ``Connection``. The pool is used to acquire
+dedicated connections for credential SQL AND for audit writes — separately.
+This gives audit writes unconditional durability: the audit row commits on
+its own connection regardless of any transaction the caller may have open on
+a different connection.
 
-Failure-audit rows (success=false) are written OUTSIDE the failed transaction
-on a best-effort basis so forensic data persists even when the primary
-operation was rolled back. A double-fault (failure-audit ALSO fails) is
-logged but not re-raised — the original VaultError is what the caller sees.
+**Atomicity of writes** (store / rotate / reactivate) is enforced by ordering
+the operations: credential SQL runs inside an inner transaction, and the
+success-audit is committed on a SEPARATE connection BEFORE the credential
+transaction commits. If the audit fails, the credential transaction rolls
+back. If the audit succeeds and the credential commit subsequently fails
+(rare; typically a network drop during commit), we get a phantom audit row
+referring to a non-existent credential — operationally a false positive,
+detectable by reconciliation (Phase 2.1 follow-up).
 
-For reads (:func:`get_granola_credential_for_user`), atomicity is not
-required: the credential is not "accessed" at the API boundary unless the
-caller receives it, and any failure path re-raises so the caller never
-sees the decrypted value. The audit write still happens on every code path.
+**Failure-audits** are written via the same separate-connection path, so
+they survive an outer transaction rollback. A double-fault (failure-audit
+ALSO fails) is logged but not re-raised — the original ``VaultError`` is
+what the caller sees.
+
+**Reads** (:func:`get_granola_credential_for_user`) do not need atomicity:
+the credential is not "accessed" at the API boundary unless the caller
+receives it, and any failure path re-raises before the value crosses the
+API boundary. The audit write still happens on every code path.
 """
 
 from __future__ import annotations
@@ -125,6 +132,14 @@ WHERE tenant_id = $1
   AND archived_at IS NULL
 """
 
+_SELECT_ANY_CREDENTIAL_ID_SQL = """
+SELECT id, archived_at
+FROM vault.user_credentials
+WHERE tenant_id = $1
+  AND user_id = $2
+  AND provider = $3
+"""
+
 _INSERT_CREDENTIAL_SQL = """
 INSERT INTO vault.user_credentials (
     id,
@@ -145,17 +160,41 @@ INSERT INTO vault.user_credentials (
 )
 """
 
+_SELECT_ROTATE_IDENTITY_SQL = """
+SELECT tenant_id, user_id, provider
+FROM vault.user_credentials
+WHERE id = $1
+  AND archived_at IS NULL
+"""
+
 _UPDATE_ROTATE_SQL = """
 UPDATE vault.user_credentials
 SET encrypted_api_key = $1,
     encrypted_dek = $2,
     nonce = $3,
-    updated_at = CURRENT_TIMESTAMP,
+    status = 'active',
     last_error = NULL,
-    consecutive_failures = 0
+    consecutive_failures = 0,
+    updated_at = CURRENT_TIMESTAMP
 WHERE id = $4
   AND archived_at IS NULL
-RETURNING tenant_id, user_id, provider
+RETURNING tenant_id
+"""
+
+_UPDATE_REACTIVATE_SQL = """
+UPDATE vault.user_credentials
+SET encrypted_api_key = $1,
+    encrypted_dek = $2,
+    nonce = $3,
+    config = $4::jsonb,
+    status = 'active',
+    archived_at = NULL,
+    last_error = NULL,
+    consecutive_failures = 0,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $5
+  AND archived_at IS NOT NULL
+RETURNING tenant_id
 """
 
 
@@ -186,7 +225,7 @@ def _check_allowlist(caller_module: str) -> None:
 
 async def _best_effort_failure_audit(
     *,
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     credential_id: UUID | None,
     tenant_id: UUID,
     user_id: UUID,
@@ -196,16 +235,17 @@ async def _best_effort_failure_audit(
     error_code: str,
     trace_id: str | None,
 ) -> None:
-    """Write a failure-audit row outside any failed transaction.
+    """Write a failure-audit row on a dedicated connection.
 
-    The audit write itself may fail (DB unreachable, table missing). When it
-    does, we log + swallow because the original VaultError is the
-    operationally-meaningful signal — double-faulting on the forensic write
-    would mask it.
+    Acquires its own connection from ``pool`` so the write survives any
+    outer transaction rollback. If the audit write itself fails (DB
+    unreachable, table missing), log + swallow — the original
+    ``VaultError`` is the operationally-meaningful signal; double-faulting
+    on the forensic write would mask it.
     """
     try:
         await audit.write_audit_row(
-            conn=conn,
+            pool=pool,
             credential_id=credential_id,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -226,12 +266,40 @@ async def _best_effort_failure_audit(
         )
 
 
+def _coerce_jsonb(value: Any) -> dict[str, Any] | None:
+    """Normalize asyncpg's JSONB return shape to a dict-or-None.
+
+    asyncpg may return JSONB as a parsed dict (when the codec is registered)
+    or as a raw JSON string (default). We handle both so callers see a
+    consistent shape.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        import json
+
+        return json.loads(value)
+    raise VaultError(
+        VaultErrorCode.VAULT_DB_NOT_FOUND,
+        f"unexpected JSONB shape: {type(value).__name__}",
+    )
+
+
+def _dumps_jsonb(value: dict[str, Any]) -> str:
+    """Serialize a dict for the ``$N::jsonb`` cast on INSERT."""
+    import json
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 async def get_granola_credential_for_user(
     *,
     tenant_id: UUID,
     user_id: UUID,
     caller_module: str,
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     trace_id: str | None = None,
 ) -> GranolaCredential | None:
     """Look up and decrypt a user's active Granola credential.
@@ -240,7 +308,10 @@ async def get_granola_credential_for_user(
     or never created). Raises :class:`VaultPermissionError` if the caller is
     not in :data:`ALLOWLIST`; raises :class:`VaultError` on KMS or DB failure.
 
-    Writes one audit row to ``vault.credential_access_log`` per call:
+    Writes one audit row to ``vault.credential_access_log`` per call (on a
+    dedicated connection acquired from ``pool``, independent of any
+    transaction the caller may have open):
+
       * ALLOWLIST rejection → ``success=false, error_code=VAULT_CALLER_NOT_ALLOWED``
       * No credential row → ``success=true, credential_id=NULL``
       * Decrypt success → ``success=true, credential_id=<row id>``
@@ -249,29 +320,30 @@ async def get_granola_credential_for_user(
     try:
         _check_allowlist(caller_module)
     except VaultPermissionError as exc:
-        await audit.write_audit_row(
-            conn=conn,
+        await _best_effort_failure_audit(
+            pool=pool,
             credential_id=None,
             tenant_id=tenant_id,
             user_id=user_id,
             provider=_GRANOLA_PROVIDER,
             caller_module=caller_module,
             operation="read",
-            success=False,
             error_code=exc.code.value,
             trace_id=trace_id,
         )
         raise
 
-    row = await conn.fetchrow(
-        _SELECT_GRANOLA_CREDENTIAL_SQL,
-        tenant_id,
-        user_id,
-        _GRANOLA_PROVIDER,
-    )
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            _SELECT_GRANOLA_CREDENTIAL_SQL,
+            tenant_id,
+            user_id,
+            _GRANOLA_PROVIDER,
+        )
+
     if row is None:
         await audit.write_audit_row(
-            conn=conn,
+            pool=pool,
             credential_id=None,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -299,22 +371,21 @@ async def get_granola_credential_for_user(
             encryption_context=context,
         )
     except VaultError as exc:
-        await audit.write_audit_row(
-            conn=conn,
+        await _best_effort_failure_audit(
+            pool=pool,
             credential_id=credential_id,
             tenant_id=tenant_id,
             user_id=user_id,
             provider=_GRANOLA_PROVIDER,
             caller_module=caller_module,
             operation="read",
-            success=False,
             error_code=exc.code.value,
             trace_id=trace_id,
         )
         raise
 
     await audit.write_audit_row(
-        conn=conn,
+        pool=pool,
         credential_id=credential_id,
         tenant_id=tenant_id,
         user_id=user_id,
@@ -350,7 +421,7 @@ async def store_credential(
     api_key: str,
     config: dict[str, Any],
     caller_module: str,
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     trace_id: str | None = None,
 ) -> UUID:
     """Encrypt and insert a new credential row.
@@ -359,24 +430,29 @@ async def store_credential(
     bound into the 4-field EncryptionContext at GenerateDataKey time, so the
     row's keys can only be decrypted by callers passing that same UUID later.
 
+    Ordering for atomicity: INSERT runs inside a transaction on a dedicated
+    credential-connection; the success-audit then commits on a SEPARATE
+    connection from the same pool; finally the credential transaction
+    commits. If the audit fails, the credential transaction rolls back —
+    no credential is persisted without a forensic record.
+
     Returns the new credential UUID. If a row already exists for
     ``(tenant_id, user_id, provider)`` and is not archived, the INSERT fails
     with a uniqueness violation surfaced as :class:`VaultError` with code
-    ``VAULT_DB_INSERT_FAILED`` (admin layer handles re-connect by archiving
-    then re-storing, or by calling :func:`rotate_credential_key`).
+    ``VAULT_DB_INSERT_FAILED``. Callers handling reconnect-after-disconnect
+    should call :func:`reactivate_credential` for archived rows.
     """
     try:
         _check_allowlist(caller_module)
     except VaultPermissionError as exc:
-        await audit.write_audit_row(
-            conn=conn,
+        await _best_effort_failure_audit(
+            pool=pool,
             credential_id=None,
             tenant_id=tenant_id,
             user_id=user_id,
             provider=provider,
             caller_module=caller_module,
             operation="write",
-            success=False,
             error_code=exc.code.value,
             trace_id=trace_id,
         )
@@ -396,15 +472,14 @@ async def store_credential(
             encryption_context=context,
         )
     except VaultError as exc:
-        await audit.write_audit_row(
-            conn=conn,
+        await _best_effort_failure_audit(
+            pool=pool,
             credential_id=None,
             tenant_id=tenant_id,
             user_id=user_id,
             provider=provider,
             caller_module=caller_module,
             operation="write",
-            success=False,
             error_code=exc.code.value,
             trace_id=trace_id,
         )
@@ -412,48 +487,52 @@ async def store_credential(
 
     config_json = _dumps_jsonb(config)
 
-    # Atomic critical section: INSERT + success-audit succeed together or
-    # neither persists. asyncpg's Connection.execute autocommits per
-    # statement by default; without this explicit transaction, a failed
-    # audit-write would leave the credential row committed.
+    # Atomic critical section. Ordering:
+    #   1. INSERT credential inside cred_conn.transaction (UNCOMMITTED)
+    #   2. Write success-audit on a SEPARATE connection (autocommits)
+    #   3. Commit cred_conn.transaction
+    # If step 2 fails, cred_conn transaction rolls back (audit raise propagates).
+    # If step 2 succeeds and step 3 fails, we get a phantom audit (rare;
+    # detectable by reconciliation).
     try:
-        async with conn.transaction():
-            try:
-                await conn.execute(
-                    _INSERT_CREDENTIAL_SQL,
-                    credential_id,
-                    tenant_id,
-                    user_id,
-                    provider,
-                    encrypted_api_key,
-                    encrypted_dek,
-                    nonce,
-                    config_json,
-                    "active",
+        async with pool.acquire() as cred_conn:
+            async with cred_conn.transaction():
+                try:
+                    await cred_conn.execute(
+                        _INSERT_CREDENTIAL_SQL,
+                        credential_id,
+                        tenant_id,
+                        user_id,
+                        provider,
+                        encrypted_api_key,
+                        encrypted_dek,
+                        nonce,
+                        config_json,
+                        "active",
+                    )
+                except Exception as insert_exc:
+                    raise VaultError(
+                        VaultErrorCode.VAULT_DB_INSERT_FAILED,
+                        f"insert into vault.user_credentials failed: {insert_exc.__class__.__name__}",
+                        cause=insert_exc,
+                    ) from insert_exc
+                # Audit on a SEPARATE connection — autocommits independent
+                # of cred_conn's transaction. Must succeed before the
+                # credential transaction commits.
+                await audit.write_audit_row(
+                    pool=pool,
+                    credential_id=credential_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    provider=provider,
+                    caller_module=caller_module,
+                    operation="write",
+                    success=True,
+                    trace_id=trace_id,
                 )
-            except Exception as insert_exc:
-                raise VaultError(
-                    VaultErrorCode.VAULT_DB_INSERT_FAILED,
-                    f"insert into vault.user_credentials failed: {insert_exc.__class__.__name__}",
-                    cause=insert_exc,
-                ) from insert_exc
-            await audit.write_audit_row(
-                conn=conn,
-                credential_id=credential_id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                provider=provider,
-                caller_module=caller_module,
-                operation="write",
-                success=True,
-                trace_id=trace_id,
-            )
     except VaultError as exc:
-        # Either INSERT or success-audit failed inside the transaction;
-        # transaction rolled back, credential NOT persisted. Best-effort
-        # failure-audit OUTSIDE the rolled-back transaction.
         await _best_effort_failure_audit(
-            conn=conn,
+            pool=pool,
             credential_id=None,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -473,7 +552,7 @@ async def rotate_credential_key(
     credential_id: UUID,
     new_api_key: str,
     caller_module: str,
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     trace_id: str | None = None,
 ) -> None:
     """Replace the encrypted key material on an existing credential row.
@@ -482,50 +561,49 @@ async def rotate_credential_key(
     same so the 4-field EncryptionContext (and therefore existing reader
     invariants) does not change — only the wrapped key material rotates.
 
-    Resets ``last_error`` and ``consecutive_failures`` so the next poll cycle
-    starts clean after a manual rotation (a healthy rotate signals operator
-    intent to retry).
+    Resets ``status='active'``, ``last_error=NULL``, and
+    ``consecutive_failures=0`` so the next poll cycle starts clean after
+    a manual rotation. An operator rotating a ``revoked`` or ``error``
+    credential signals intent to retry, and the credential becomes
+    immediately eligible for polling again.
 
     Raises :class:`VaultError` with ``VAULT_DB_NOT_FOUND`` if the credential
-    row is missing or already archived.
+    row is missing or already archived. Same atomicity ordering as
+    :func:`store_credential`.
     """
     try:
         _check_allowlist(caller_module)
     except VaultPermissionError as exc:
-        await audit.write_audit_row(
-            conn=conn,
+        await _best_effort_failure_audit(
+            pool=pool,
             credential_id=credential_id,
             tenant_id=_NULL_UUID,
             user_id=_NULL_UUID,
             provider=_UNKNOWN_PROVIDER,
             caller_module=caller_module,
             operation="rotate",
-            success=False,
             error_code=exc.code.value,
             trace_id=trace_id,
         )
         raise
 
-    # Look up the credential row's identity fields first so the audit row and
-    # the EncryptionContext both have authoritative tenant_id/user_id/provider
-    # values (the caller only passes credential_id to rotate, by design — the
-    # row's identity is the source of truth, not anything the caller might
-    # mis-remember).
-    identity_row = await conn.fetchrow(
-        "SELECT tenant_id, user_id, provider FROM vault.user_credentials "
-        "WHERE id = $1 AND archived_at IS NULL",
-        credential_id,
-    )
+    # Look up the credential row's identity fields first so the audit row
+    # and the EncryptionContext both have authoritative tenant_id/user_id/
+    # provider values. Identity lookup uses its own short-lived connection.
+    async with pool.acquire() as lookup_conn:
+        identity_row = await lookup_conn.fetchrow(
+            _SELECT_ROTATE_IDENTITY_SQL,
+            credential_id,
+        )
     if identity_row is None:
-        await audit.write_audit_row(
-            conn=conn,
+        await _best_effort_failure_audit(
+            pool=pool,
             credential_id=credential_id,
             tenant_id=_NULL_UUID,
             user_id=_NULL_UUID,
             provider=_UNKNOWN_PROVIDER,
             caller_module=caller_module,
             operation="rotate",
-            success=False,
             error_code=VaultErrorCode.VAULT_DB_NOT_FOUND.value,
             trace_id=trace_id,
         )
@@ -550,54 +628,50 @@ async def rotate_credential_key(
             encryption_context=context,
         )
     except VaultError as exc:
-        await audit.write_audit_row(
-            conn=conn,
+        await _best_effort_failure_audit(
+            pool=pool,
             credential_id=credential_id,
             tenant_id=tenant_id,
             user_id=user_id,
             provider=provider,
             caller_module=caller_module,
             operation="rotate",
-            success=False,
             error_code=exc.code.value,
             trace_id=trace_id,
         )
         raise
 
-    # Atomic critical section: UPDATE + success-audit succeed together or
-    # neither persists. Same rationale as store_credential — asyncpg
-    # autocommits per statement without an explicit transaction.
     try:
-        async with conn.transaction():
-            updated = await conn.fetchrow(
-                _UPDATE_ROTATE_SQL,
-                encrypted_api_key,
-                encrypted_dek,
-                nonce,
-                credential_id,
-            )
-            if updated is None:
-                # Lost to a concurrent archive between the identity lookup
-                # and the UPDATE. The transaction rolls back cleanly even
-                # though no INSERT/UPDATE actually changed state.
-                raise VaultError(
-                    VaultErrorCode.VAULT_DB_NOT_FOUND,
-                    f"credential id={credential_id} archived between lookup and rotate",
+        async with pool.acquire() as cred_conn:
+            async with cred_conn.transaction():
+                updated = await cred_conn.fetchrow(
+                    _UPDATE_ROTATE_SQL,
+                    encrypted_api_key,
+                    encrypted_dek,
+                    nonce,
+                    credential_id,
                 )
-            await audit.write_audit_row(
-                conn=conn,
-                credential_id=credential_id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                provider=provider,
-                caller_module=caller_module,
-                operation="rotate",
-                success=True,
-                trace_id=trace_id,
-            )
+                if updated is None:
+                    # Lost to a concurrent archive between identity lookup
+                    # and the UPDATE.
+                    raise VaultError(
+                        VaultErrorCode.VAULT_DB_NOT_FOUND,
+                        f"credential id={credential_id} archived between lookup and rotate",
+                    )
+                await audit.write_audit_row(
+                    pool=pool,
+                    credential_id=credential_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    provider=provider,
+                    caller_module=caller_module,
+                    operation="rotate",
+                    success=True,
+                    trace_id=trace_id,
+                )
     except VaultError as exc:
         await _best_effort_failure_audit(
-            conn=conn,
+            pool=pool,
             credential_id=credential_id,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -608,39 +682,180 @@ async def rotate_credential_key(
             trace_id=trace_id,
         )
         raise
+
+
+async def reactivate_credential(
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    provider: str,
+    new_api_key: str,
+    new_config: dict[str, Any],
+    caller_module: str,
+    pool: asyncpg.Pool,
+    trace_id: str | None = None,
+) -> UUID:
+    """Reactivate a previously archived credential row.
+
+    Used by the /connect endpoint when a user re-connects after disconnecting.
+    The schema's ``UNIQUE(tenant_id, user_id, provider)`` covers archived
+    rows too, so :func:`store_credential` can't simply INSERT a fresh row
+    on reconnect; this function handles that case by UPDATING the archived
+    row in place.
+
+    The archived row's ``id`` is preserved (so the EncryptionContext binding
+    semantics stay consistent — anyone who held a reference to the
+    credential UUID can still decrypt after a reactivate). The encrypted
+    key material AND config are replaced; ``status`` is reset to ``active``,
+    ``archived_at`` is cleared, ``last_error`` and ``consecutive_failures``
+    are reset.
+
+    Raises ``VAULT_DB_NOT_FOUND`` if no row exists for the given
+    ``(tenant_id, user_id, provider)``. Raises ``VAULT_DB_INSERT_FAILED``
+    with descriptive message if a row exists but is currently ACTIVE —
+    caller should call :func:`rotate_credential_key` instead.
+    """
+    try:
+        _check_allowlist(caller_module)
+    except VaultPermissionError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="reactivate",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+
+    # SELECT existing row to get its id + verify it is archived.
+    async with pool.acquire() as lookup_conn:
+        existing = await lookup_conn.fetchrow(
+            _SELECT_ANY_CREDENTIAL_ID_SQL,
+            tenant_id,
+            user_id,
+            provider,
+        )
+
+    if existing is None:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="reactivate",
+            error_code=VaultErrorCode.VAULT_DB_NOT_FOUND.value,
+            trace_id=trace_id,
+        )
+        raise VaultError(
+            VaultErrorCode.VAULT_DB_NOT_FOUND,
+            f"no credential row for tenant_id={tenant_id} user_id={user_id} "
+            f"provider={provider}; use store_credential for new connections",
+        )
+
+    if existing["archived_at"] is None:
+        # Active row; caller should rotate, not reactivate.
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=existing["id"],
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="reactivate",
+            error_code=VaultErrorCode.VAULT_DB_INSERT_FAILED.value,
+            trace_id=trace_id,
+        )
+        raise VaultError(
+            VaultErrorCode.VAULT_DB_INSERT_FAILED,
+            f"credential id={existing['id']} is active; use rotate_credential_key",
+        )
+
+    credential_id: UUID = existing["id"]
+    context = _build_encryption_context(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        provider=provider,
+        credential_id=credential_id,
+    )
+
+    try:
+        encrypted_api_key, encrypted_dek, nonce = encryption.encrypt_credential(
+            plaintext=new_api_key,
+            encryption_context=context,
+        )
+    except VaultError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="reactivate",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+
+    config_json = _dumps_jsonb(new_config)
+
+    try:
+        async with pool.acquire() as cred_conn:
+            async with cred_conn.transaction():
+                updated = await cred_conn.fetchrow(
+                    _UPDATE_REACTIVATE_SQL,
+                    encrypted_api_key,
+                    encrypted_dek,
+                    nonce,
+                    config_json,
+                    credential_id,
+                )
+                if updated is None:
+                    # Lost to a concurrent reactivate (another caller
+                    # already cleared archived_at).
+                    raise VaultError(
+                        VaultErrorCode.VAULT_DB_NOT_FOUND,
+                        f"credential id={credential_id} reactivated by another caller "
+                        f"between lookup and update",
+                    )
+                await audit.write_audit_row(
+                    pool=pool,
+                    credential_id=credential_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    provider=provider,
+                    caller_module=caller_module,
+                    operation="reactivate",
+                    success=True,
+                    trace_id=trace_id,
+                )
+    except VaultError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="reactivate",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+
+    return credential_id
 
 
 # Sentinel values for audit rows written when the credential identity is
 # unknown (ALLOWLIST violation on rotate, where the caller passes only
-# credential_id and we haven't read the row yet). The schema requires NOT NULL
-# tenant_id/user_id; the all-zero UUID is a recognizable forensic marker.
+# credential_id and we haven't read the row yet). The schema requires NOT
+# NULL tenant_id/user_id; the all-zero UUID is a recognizable forensic
+# marker.
 _NULL_UUID = UUID("00000000-0000-0000-0000-000000000000")
 _UNKNOWN_PROVIDER = "unknown"
-
-
-def _coerce_jsonb(value: Any) -> dict[str, Any] | None:
-    """Normalize asyncpg's JSONB return shape to a dict-or-None.
-
-    asyncpg may return JSONB as a parsed dict (when the codec is registered)
-    or as a raw JSON string (default). We handle both so callers see a
-    consistent shape.
-    """
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        import json
-
-        return json.loads(value)
-    raise VaultError(
-        VaultErrorCode.VAULT_DB_NOT_FOUND,
-        f"unexpected JSONB shape: {type(value).__name__}",
-    )
-
-
-def _dumps_jsonb(value: dict[str, Any]) -> str:
-    """Serialize a dict for the ``$N::jsonb`` cast on INSERT."""
-    import json
-
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
