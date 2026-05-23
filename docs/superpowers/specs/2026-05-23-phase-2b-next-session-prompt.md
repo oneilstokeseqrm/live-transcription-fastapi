@@ -370,6 +370,16 @@ Rules:
    before any git commit in shared checkouts. The prior session experienced
    a silent branch switch caused by another active agent in the same
    directory; recovery required a user-authorized git reset --hard.
+9. *NEW from prior session:* When pausing or running /context-save in a
+   shared checkout, courtesy-switch the checkout back to main so the next
+   agent doesn't inherit your feature branch. After Phase 2b commits land
+   on eq-frontend's phase-2/granola-vault-schema (if any Phase 2b work
+   touches eq-frontend; most Phase 2b is in live-transcription-fastapi),
+   run `git -C /Users/peteroneil/eq-frontend checkout main` before
+   /context-save. Resume the feature branch with `git checkout
+   phase-2/granola-vault-schema` next session. See
+   feedback_branch_safety memory + lessons.md "Return to main when
+   pausing in shared checkouts".
 
 ═══════════════════════════════════════════════════════════════════════
 STOP CONDITIONS (hard — surface to user immediately)

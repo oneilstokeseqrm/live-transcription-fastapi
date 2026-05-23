@@ -102,11 +102,13 @@ All 6 commits are **local-only**. Nothing pushed. Future PR pushes require expli
 
 1. **Always verify branch BEFORE commits in shared checkouts.** Prior session experienced a silent branch switch (likely caused by another active agent in the same checkout). Recovery required a user-authorized `git reset --hard`. Discipline: `git branch --show-current` immediately before every `git commit`.
 
-2. **Never auto-apply Prisma migrate diff against drifted production.** Prior session generated a 52KB / 375-statement diff that included 63 DROP TABLEs unrelated to our work. Hand-write the migration with only additive statements. The drift itself goes to a dedicated investigation issue.
+2. **Return to main when pausing in shared checkouts.** Matched half of #1. After committing on a feature branch + before /context-save, switch the checkout back to main as cross-agent courtesy. The next agent's pre-flight expects main. Resume the feature branch with `git checkout <feature-branch>` when continuing. Surfaced by another agent's blocked Session 26 of the UCC initiative on 2026-05-23 PM.
 
-3. **Cutting-edge security posture is platform-relative.** Federated identity is the cutting-edge pattern when the deployment platform supports it. Railway doesn't (today). The cutting-edge MVP move on Railway becomes: long-lived AWS keys + minimum-privilege IAM + Encryption Context binding + audit log + rotation cadence. Match the pattern to the platform.
+3. **Never auto-apply Prisma migrate diff against drifted production.** Prior session generated a 52KB / 375-statement diff that included 63 DROP TABLEs unrelated to our work. Hand-write the migration with only additive statements. The drift itself goes to a dedicated investigation issue.
 
-4. **Cross-repo deploy coordination matters.** Phase 2a Prisma migration in eq-frontend must deploy BEFORE Phase 2b vault module in live-transcription-fastapi can be smoke-tested against the test tenant. The Phase 6 deploy ordering is non-negotiable. Document this in PR descriptions when they go up.
+4. **Cutting-edge security posture is platform-relative.** Federated identity is the cutting-edge pattern when the deployment platform supports it. Railway doesn't (today). The cutting-edge MVP move on Railway becomes: long-lived AWS keys + minimum-privilege IAM + Encryption Context binding + audit log + rotation cadence. Match the pattern to the platform.
+
+5. **Cross-repo deploy coordination matters.** Phase 2a Prisma migration in eq-frontend must deploy BEFORE Phase 2b vault module in live-transcription-fastapi can be smoke-tested against the test tenant. The Phase 6 deploy ordering is non-negotiable. Document this in PR descriptions when they go up.
 
 ---
 

@@ -1999,3 +1999,61 @@ that's actually correct-for-the-platform.
 trade-off during the prior session's discussion). The user's
 "are we cutting-edge?" question is a useful periodic check — answer
 honestly with platform context, not aspirationally.
+
+## Return to main when pausing in shared checkouts (2026-05-23 PM)
+
+### Lesson
+
+After committing on a feature branch in a shared checkout, switch
+back to main before pausing or running /context-save. The committed
+work is safe on its branch; the checkout's HEAD pointer just becomes
+a courtesy to the next agent that uses the same directory.
+
+```bash
+cd /path/to/shared/repo
+git status --short              # verify no uncommitted work to lose
+git branch --contains <SHA>     # confirm commits preserved on feature branch
+git checkout main               # courtesy switch
+```
+
+Resuming the feature work later is one command:
+`git checkout <feature-branch>`.
+
+### Why
+
+2026-05-23 PM: another agent's Session 26 of the UCC initiative was
+blocked from starting because eq-frontend's primary checkout was still
+on `phase-2/granola-vault-schema` (the Phase 2a Granola work) after
+our commit. Their pre-flight checks expected `main` at `4cdebec`. The
+user surfaced this as cross-agent etiquette.
+
+The committed work (cf870b4 + 556b046) was fully safe — git keeps
+all commits regardless of checkout HEAD. The friction was purely the
+next agent having to deal with a working tree pointed at our branch.
+
+### How to apply
+
+1. **After every commit-and-pause cycle in a shared repo**, switch
+   back to main:
+   ```bash
+   git checkout main
+   ```
+2. **Before /context-save**: do the courtesy switch as part of the
+   "wrap up session" routine. Note in the checkpoint that you switched
+   so the next session knows to `git checkout <feature-branch>` to
+   resume.
+3. **Mental model**: "verify branch BEFORE commits" is the receiving
+   end of shared-checkout discipline (don't accept work on the wrong
+   branch). "Return to main when pausing" is the giving end (don't
+   strand the next agent on YOUR branch). Two halves of the same
+   shared-infrastructure discipline.
+4. **Worktree alternative**: this entire problem disappears if you
+   use a Conductor worktree at
+   `/Users/peteroneil/conductor/workspaces/<repo>/<name>/`. Worktrees
+   isolate HEAD state per directory. Worth doing for any multi-day
+   feature work in a shared repo.
+
+### Related
+
+[[feedback_branch_safety]] — the parent rule (branch verification
+before commits) is the matched half of this discipline.
