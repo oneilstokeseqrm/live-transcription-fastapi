@@ -329,6 +329,46 @@ class TestAesGcmTagMismatch:
         kms.decrypt.assert_not_called()
 
 
+class TestBotoCoreErrorWrapping:
+    """Codex R6 [P1]: non-ClientError botocore exceptions (missing AWS
+    credentials, network errors, timeouts) must also map to structured
+    VaultError so the accessor layer's audit + structured-error contract
+    holds during AWS misconfiguration or transient outages."""
+
+    def _make_botocore_error(self) -> Exception:
+        """Use a real botocore exception to exercise the BotoCoreError branch."""
+        from botocore.exceptions import NoCredentialsError
+
+        return NoCredentialsError()
+
+    def test_botocore_error_on_encrypt_maps_to_encrypt_failed(self):
+        kms = _make_kms_client()
+        kms.generate_data_key.side_effect = self._make_botocore_error()
+        with pytest.raises(VaultError) as exc_info:
+            encryption.encrypt_credential(
+                plaintext="grn_test",
+                encryption_context=_VALID_CONTEXT,
+                kms_client=kms,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_KMS_ENCRYPT_FAILED
+        assert "botocore" in str(exc_info.value).lower() or "NoCredentialsError" in str(
+            exc_info.value
+        )
+
+    def test_botocore_error_on_decrypt_maps_to_decrypt_failed(self):
+        kms = _make_kms_client()
+        kms.decrypt.side_effect = self._make_botocore_error()
+        with pytest.raises(VaultError) as exc_info:
+            encryption.decrypt_credential(
+                encrypted_api_key=b"abc",
+                encrypted_dek=b"wrapped",
+                nonce=b"\x00" * 12,
+                encryption_context=_VALID_CONTEXT,
+                kms_client=kms,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_KMS_DECRYPT_FAILED
+
+
 class TestEnvVarRequirements:
     """``EQ_VAULT_KMS_KEY_ALIAS`` is required for any encrypt call."""
 

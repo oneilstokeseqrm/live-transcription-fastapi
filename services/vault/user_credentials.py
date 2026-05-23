@@ -666,9 +666,13 @@ async def rotate_credential_key(
     try:
         _check_allowlist(caller_module)
     except VaultPermissionError as exc:
+        # Pass credential_id=None — we have not verified the credential
+        # exists, and the audit table's FK to vault.user_credentials.id
+        # would reject a nonexistent UUID (Codex R6 [P2] fix). The audit
+        # row still records the rejected caller + operation + tenant/user.
         await _best_effort_failure_audit(
             pool=pool,
-            credential_id=credential_id,
+            credential_id=None,
             tenant_id=tenant_id,
             user_id=user_id,
             provider=_UNKNOWN_PROVIDER,
@@ -691,10 +695,13 @@ async def rotate_credential_key(
                 user_id,
             )
     except Exception as exc:
+        # DB error during lookup — we don't know if the credential exists.
+        # Pass credential_id=None to avoid potential audit FK violation
+        # (Codex R6 [P2]).
         wrapped = _wrap_db_error(exc, operation="rotate identity lookup")
         await _best_effort_failure_audit(
             pool=pool,
-            credential_id=credential_id,
+            credential_id=None,
             tenant_id=tenant_id,
             user_id=user_id,
             provider=_UNKNOWN_PROVIDER,
@@ -709,9 +716,11 @@ async def rotate_credential_key(
         # Either the credential doesn't exist, or it belongs to a different
         # tenant/user, or it's archived. All collapse to NOT_FOUND so we
         # don't leak existence of other tenants' credentials via timing.
+        # credential_id=None on the audit row because the credential
+        # definitively isn't in the table for this caller (Codex R6 [P2]).
         await _best_effort_failure_audit(
             pool=pool,
-            credential_id=credential_id,
+            credential_id=None,
             tenant_id=tenant_id,
             user_id=user_id,
             provider=_UNKNOWN_PROVIDER,

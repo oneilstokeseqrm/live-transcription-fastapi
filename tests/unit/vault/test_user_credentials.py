@@ -711,9 +711,40 @@ class TestRotateCredentialKey:
             )
         assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
         audit_spy.assert_awaited_once()
-        assert audit_spy.await_args.kwargs["operation"] == "rotate"
-        assert audit_spy.await_args.kwargs["success"] is False
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "rotate"
+        assert kw["success"] is False
+        # Codex R6 [P2] fix: failure-audit must pass credential_id=None
+        # because the credential definitively does not exist (we just
+        # SELECTed and got nothing). Passing the unverified UUID would
+        # violate the audit table's FK to vault.user_credentials.id and
+        # cause _best_effort_failure_audit to swallow the FK violation
+        # as a double-fault, leaving no forensic record.
+        assert kw["credential_id"] is None, (
+            "rotate's not-found failure-audit must pass credential_id=None "
+            "to avoid audit-table FK violation (Codex R6 P2)"
+        )
         encrypt_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allowlist_violation_audits_credential_id_as_none(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Codex R6 [P2]: ALLOWLIST violation audit must pass
+        credential_id=None because we have not verified the credential
+        exists (and the audit FK would reject a nonexistent UUID)."""
+        with pytest.raises(VaultPermissionError):
+            await user_credentials.rotate_credential_key(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                credential_id=uuid.uuid4(),
+                new_api_key="grn_new",
+                caller_module=_BLOCKED_CALLER,
+                pool=fake_pool,
+            )
+        kw = audit_spy.await_args.kwargs
+        assert kw["credential_id"] is None
+        assert kw["error_code"] == VaultErrorCode.VAULT_CALLER_NOT_ALLOWED.value
 
     @pytest.mark.asyncio
     async def test_cross_tenant_credential_id_returns_not_found(

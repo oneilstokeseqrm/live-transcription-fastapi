@@ -28,7 +28,7 @@ import os
 from typing import Any
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -165,6 +165,19 @@ def encrypt_credential(
             f"KMS GenerateDataKey failed: {error_code or 'unknown'}",
             cause=exc,
         ) from exc
+    except BotoCoreError as exc:
+        # Catches NoCredentialsError, EndpointConnectionError,
+        # ConnectTimeoutError, ReadTimeoutError, etc. — boto operational
+        # failures that don't come from the AWS service itself (per Codex
+        # R6 [P1]). Without this, AWS misconfiguration or transient
+        # network drops would leak raw botocore exceptions past the
+        # VaultError boundary, breaking the structured-error + audit
+        # contract that the accessor layer depends on.
+        raise VaultError(
+            VaultErrorCode.VAULT_KMS_ENCRYPT_FAILED,
+            f"KMS GenerateDataKey botocore error: {exc.__class__.__name__}",
+            cause=exc,
+        ) from exc
 
     dek_plaintext = resp["Plaintext"]
     encrypted_dek = resp["CiphertextBlob"]
@@ -221,6 +234,13 @@ def decrypt_credential(
         raise VaultError(
             VaultErrorCode.VAULT_KMS_DECRYPT_FAILED,
             f"KMS Decrypt failed: {error_code or 'unknown'}",
+            cause=exc,
+        ) from exc
+    except BotoCoreError as exc:
+        # Mirror of the GenerateDataKey botocore handler above (Codex R6 P1).
+        raise VaultError(
+            VaultErrorCode.VAULT_KMS_DECRYPT_FAILED,
+            f"KMS Decrypt botocore error: {exc.__class__.__name__}",
             cause=exc,
         ) from exc
 
