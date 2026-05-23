@@ -97,13 +97,11 @@ The audit module exposes no UPDATE or DELETE function (append-only invariant, ap
 
 #### Atomicity of writes (store / rotate / reactivate)
 
-The credential SQL and the audit insert run on DIFFERENT connections, so they are not a single atomic SQL transaction. Atomicity is enforced by **ordering**:
+The credential SQL and the success-audit run on the SAME connection inside the SAME transaction (single SQL transaction; strongest possible atomicity). This works without compromising audit durability because the Pool-based API structurally prevents callers from wrapping the vault in their own outer transaction: vault acquires its own connection from the pool, so the caller's connection state cannot influence vault's transaction.
 
-1. Credential SQL runs inside a transaction on `cred_conn` (UNCOMMITTED).
-2. Success-audit is written on a SEPARATE connection (autocommits immediately).
-3. Credential transaction commits.
+Failure-audits run on a separate connection (acquired from the pool AFTER the credential transaction rolled back, so no nesting risk).
 
-If step 2 fails, the credential transaction rolls back — no credential is persisted without a forensic record. If step 2 succeeds and step 3 fails (rare; typically a network drop during the commit RPC), we get a phantom audit row referring to a credential that doesn't exist. This is operationally a false positive (no actual credential exists, so no secret is being accessed without record) and is detectable by a periodic reconciliation job — see "Phase 2.1 hardening" below.
+The earlier "audit on separate connection inside the cred_conn transaction" design (Codex R2) introduced a nested-pool-acquire deadlock that Codex R4 caught: holding `cred_conn` while acquiring a second conn from the same pool deadlocks at `pool.max_size=1` or under N concurrent writes on a pool of size N. The single-transaction design (Codex R4 fix) avoids that entirely.
 
 #### Audit on read
 
@@ -316,6 +314,7 @@ Every call into the vault accessor module writes a row to `vault.credential_acce
 | 2026-05-23 (Phase 2b Codex R1) | peteroneil + Claude | Folded Codex round 1 findings: atomic write+audit via `conn.transaction()`; narrowed `AccessDeniedException` mapping so it surfaces as `VAULT_KMS_ENCRYPT_FAILED`/`VAULT_KMS_DECRYPT_FAILED` rather than the misleading `VAULT_KMS_CONTEXT_MISMATCH`. 53 tests pass. |
 | 2026-05-23 (Phase 2b Codex R2) | peteroneil + Claude | Folded Codex round 2 findings: audit module refactored to take `asyncpg.Pool` and acquire its own connection per write (unconditional durability vs caller transaction state); audit-before-credential-commit ordering preserves atomicity; added `reactivate_credential` for reconnect-after-disconnect; `rotate_credential_key` UPDATE now resets `status='active'`. Phantom-audit reconciliation job added to Phase 2.1 hardening list. 56 tests pass. |
 | 2026-05-23 (Phase 2b Codex R3) | peteroneil + Claude | Folded Codex round 3 findings: `rotate_credential_key` now requires `tenant_id` + `user_id` and filters both at lookup AND UPDATE (tenant-isolation rule enforced); raw asyncpg exceptions converted to structured `VaultError(VAULT_DB_QUERY_FAILED)` at every DB boundary so the API never leaks raw connection errors; `get_granola_credential_for_user` SQL filters `status='active'` so revoked/error credentials are not returned. New `VAULT_DB_QUERY_FAILED` error code. 63 tests pass. |
+| 2026-05-23 (Phase 2b Codex R4) | peteroneil + Claude | Folded Codex round 4 P1: write accessors no longer nest pool acquires (held cred_conn while audit acquired second conn → deadlock at pool max_size=1 or N concurrent writes on pool size N). New `audit.write_audit_row_on_conn(conn=...)` variant used inside the cred_conn transaction so audit + credential commit atomically as a single SQL transaction. Pool variant kept for failure-audits + reads (paths where no nesting risk exists). New `test_no_nested_pool_acquire_during_write` locks the invariant. 64 tests pass. |
 
 ---
 

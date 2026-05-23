@@ -122,9 +122,16 @@ def fake_pool() -> MagicMock:
 
 @pytest.fixture
 def audit_spy(monkeypatch):
-    """Replace audit.write_audit_row with an AsyncMock spy."""
+    """Replace both audit writer variants with the same AsyncMock spy.
+
+    Tests don't care which variant the accessor uses; the spy catches
+    both. After Codex R4 the write accessors use ``write_audit_row_on_conn``
+    (same-transaction, no nested acquire); reads + failure-audits still
+    use the pool-based ``write_audit_row``.
+    """
     spy = AsyncMock(side_effect=lambda **kw: uuid.uuid4())
     monkeypatch.setattr(user_credentials.audit, "write_audit_row", spy)
+    monkeypatch.setattr(user_credentials.audit, "write_audit_row_on_conn", spy)
     return spy
 
 
@@ -439,8 +446,9 @@ class TestStoreCredential:
         assert kw["operation"] == "write"
         assert kw["success"] is True
         assert kw["credential_id"] == new_id
-        # Audit was passed the pool (so it acquires its own conn)
-        assert kw["pool"] is fake_pool
+        # Audit was passed the cred_conn (same-transaction, no nested
+        # pool acquire — Codex R4 [P1] deadlock fix)
+        assert kw["conn"] is cred_conn
 
     @pytest.mark.asyncio
     async def test_encrypt_failure_audits_and_reraises_without_insert(
@@ -511,6 +519,39 @@ class TestStoreCredential:
         await user_credentials.store_credential(**kwargs)
         await user_credentials.store_credential(**kwargs)
         assert encrypt_spy.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_nested_pool_acquire_during_write(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Codex R4 [P1] deadlock fix: success-audit must NOT acquire a
+        second connection from the pool while cred_conn is still held.
+
+        Verified by asserting (a) pool.acquire is called exactly once per
+        successful store, and (b) the success-audit was passed the
+        cred_conn directly (not the pool).
+        """
+        await user_credentials.store_credential(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            provider="granola",
+            api_key="grn_test",
+            config={"folder_id": "fol_x"},
+            caller_module=_ALLOWED_CALLER,
+            pool=fake_pool,
+        )
+        # Exactly ONE pool.acquire — the cred_conn for the INSERT.
+        # If this were 2, the second acquire would nest inside the first's
+        # transaction and deadlock under realistic pool sizing.
+        assert fake_pool.acquire.call_count == 1, (
+            "store_credential must not nest pool.acquire calls (Codex R4 P1)"
+        )
+        # Success-audit was passed a Connection (cred_conn), not a Pool.
+        audit_kw = audit_spy.await_args.kwargs
+        assert "conn" in audit_kw and "pool" not in audit_kw, (
+            "success-audit must use write_audit_row_on_conn(conn=...) "
+            "not write_audit_row(pool=...) to avoid nested acquires"
+        )
 
 
 class TestStoreAtomicityAndOrdering:

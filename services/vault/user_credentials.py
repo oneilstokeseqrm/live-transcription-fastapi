@@ -574,11 +574,18 @@ async def store_credential(
                         f"insert into vault.user_credentials failed: {insert_exc.__class__.__name__}",
                         cause=insert_exc,
                     ) from insert_exc
-                # Audit on a SEPARATE connection — autocommits independent
-                # of cred_conn's transaction. Must succeed before the
-                # credential transaction commits.
-                await audit.write_audit_row(
-                    pool=pool,
+                # Audit on the SAME cred_conn inside the same transaction
+                # so it commits atomically with the credential INSERT. Using
+                # write_audit_row_on_conn (instead of write_audit_row(pool=...))
+                # avoids nesting a second pool acquire while cred_conn is
+                # still held — that nesting would deadlock at pool.max_size=1
+                # or under N concurrent writes on a pool of size N
+                # (Codex R4 [P1] fix). Safe because the Pool-based API
+                # structurally prevents callers from wrapping us in their
+                # own outer transaction (we acquire our own conn from the
+                # pool; the caller cannot influence its txn state).
+                await audit.write_audit_row_on_conn(
+                    conn=cred_conn,
                     credential_id=credential_id,
                     tenant_id=tenant_id,
                     user_id=user_id,
