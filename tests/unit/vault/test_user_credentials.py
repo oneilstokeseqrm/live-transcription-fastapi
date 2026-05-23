@@ -889,6 +889,45 @@ class TestRotateCredentialKey:
         )
         assert encrypt_spy.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_no_nested_pool_acquire_during_rotate(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Codex R5 [P1] deadlock fix: rotate's success-audit must use
+        write_audit_row_on_conn(conn=cred_conn) so it does NOT acquire a
+        second pool connection while cred_conn is still held in a txn.
+
+        rotate acquires TWO conns total: one for the identity lookup, one
+        for the UPDATE+audit transaction. They never overlap (the lookup
+        conn is released before the cred_conn is acquired)."""
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {"provider": "granola"}
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = {"tenant_id": tenant_id}
+        _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
+
+        await user_credentials.rotate_credential_key(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            credential_id=credential_id,
+            new_api_key="grn_new",
+            caller_module=_ALLOWED_CALLER,
+            pool=fake_pool,
+        )
+        # Exactly TWO pool.acquire calls (lookup + cred_conn). If this were
+        # 3, the third would nest inside cred_conn's transaction = deadlock.
+        assert fake_pool.acquire.call_count == 2, (
+            "rotate_credential_key must not nest pool.acquire (Codex R5 P1)"
+        )
+        audit_kw = audit_spy.await_args.kwargs
+        assert "conn" in audit_kw and "pool" not in audit_kw, (
+            "rotate success-audit must use write_audit_row_on_conn(conn=...) "
+            "to avoid nested pool acquires"
+        )
+
 
 class TestReactivateCredential:
     """Codex round 2 P1: reconnect-after-disconnect needs a working primitive."""
@@ -1032,6 +1071,72 @@ class TestReactivateCredential:
         assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
         tx = cred_conn._transactions[0]
         assert tx.rolled_back is True
+
+    @pytest.mark.asyncio
+    async def test_no_nested_pool_acquire_during_reactivate(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Codex R5 [P1] deadlock fix: reactivate's success-audit must use
+        write_audit_row_on_conn(conn=cred_conn) so it does NOT acquire a
+        second pool connection while cred_conn is still held in a txn.
+
+        reactivate acquires TWO conns total: one for the identity lookup,
+        one for the UPDATE+audit transaction. They never overlap."""
+        existing_id = uuid.uuid4()
+        archived_at = MagicMock()
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {"id": existing_id, "archived_at": archived_at}
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = {"tenant_id": uuid.uuid4()}
+        _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
+
+        await user_credentials.reactivate_credential(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            provider="granola",
+            new_api_key="grn_new",
+            new_config={"folder_id": "fol_new"},
+            caller_module=_ALLOWED_CALLER,
+            pool=fake_pool,
+        )
+        assert fake_pool.acquire.call_count == 2, (
+            "reactivate_credential must not nest pool.acquire (Codex R5 P1)"
+        )
+        audit_kw = audit_spy.await_args.kwargs
+        assert "conn" in audit_kw and "pool" not in audit_kw, (
+            "reactivate success-audit must use write_audit_row_on_conn(conn=...) "
+            "to avoid nested pool acquires"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reactivate_resets_last_polled_at_cursor(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Codex R5 [P2] fix: reconnect with new folder_id must clear the
+        old polled cursor; otherwise next poll skips notes in new folder
+        older than the cursor."""
+        existing_id = uuid.uuid4()
+        archived_at = MagicMock()
+        lookup_conn = _make_fake_conn()
+        lookup_conn.fetchrow.return_value = {"id": existing_id, "archived_at": archived_at}
+        cred_conn = _make_fake_conn()
+        cred_conn.fetchrow.return_value = {"tenant_id": uuid.uuid4()}
+        _configure_pool_to_yield(fake_pool, [lookup_conn, cred_conn])
+
+        await user_credentials.reactivate_credential(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            provider="granola",
+            new_api_key="grn_new",
+            new_config={"folder_id": "fol_new"},
+            caller_module=_ALLOWED_CALLER,
+            pool=fake_pool,
+        )
+        sql = cred_conn.fetchrow.await_args.args[0]
+        assert "last_polled_at = NULL" in sql, (
+            "reactivate must clear last_polled_at so the polled cursor "
+            "doesn't skip notes in the new folder (Codex R5 P2)"
+        )
 
 
 class TestGetFiltersByStatus:

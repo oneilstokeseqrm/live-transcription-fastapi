@@ -200,6 +200,7 @@ SET encrypted_api_key = $1,
     archived_at = NULL,
     last_error = NULL,
     consecutive_failures = 0,
+    last_polled_at = NULL,
     updated_at = CURRENT_TIMESTAMP
 WHERE id = $5
   AND archived_at IS NOT NULL
@@ -771,8 +772,10 @@ async def rotate_credential_key(
                         VaultErrorCode.VAULT_DB_NOT_FOUND,
                         f"credential id={credential_id} archived between lookup and rotate",
                     )
-                await audit.write_audit_row(
-                    pool=pool,
+                # Same-transaction audit using cred_conn — no nested pool
+                # acquire (Codex R5 fix; same as store_credential since R4).
+                await audit.write_audit_row_on_conn(
+                    conn=cred_conn,
                     credential_id=credential_id,
                     tenant_id=tenant_id,
                     user_id=user_id,
@@ -835,7 +838,11 @@ async def reactivate_credential(
     credential UUID can still decrypt after a reactivate). The encrypted
     key material AND config are replaced; ``status`` is reset to ``active``,
     ``archived_at`` is cleared, ``last_error`` and ``consecutive_failures``
-    are reset.
+    are reset. ``last_polled_at`` is ALSO cleared (Codex R5 [P2] fix):
+    reactivate can land on a different ``folder_id``, and reusing the old
+    polled cursor against the new folder would silently skip notes older
+    than the cursor. Clearing the cursor on reactivate forces the next
+    poll to cover the full window of the new folder.
 
     Raises ``VAULT_DB_NOT_FOUND`` if no row exists for the given
     ``(tenant_id, user_id, provider)``. Raises ``VAULT_DB_INSERT_FAILED``
@@ -967,8 +974,10 @@ async def reactivate_credential(
                         f"credential id={credential_id} reactivated by another caller "
                         f"between lookup and update",
                     )
-                await audit.write_audit_row(
-                    pool=pool,
+                # Same-transaction audit using cred_conn — no nested pool
+                # acquire (Codex R5 fix; same as store_credential since R4).
+                await audit.write_audit_row_on_conn(
+                    conn=cred_conn,
                     credential_id=credential_id,
                     tenant_id=tenant_id,
                     user_id=user_id,
