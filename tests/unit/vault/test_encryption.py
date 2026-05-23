@@ -212,16 +212,22 @@ class TestFreshDekAndNonce:
 class TestKmsErrorMapping:
     """LOCKED-40 enforcement via KMS error responses."""
 
-    def test_kms_access_denied_on_encrypt_maps_to_context_mismatch(self):
+    def test_kms_access_denied_on_encrypt_maps_to_encrypt_failed(self):
+        """AccessDeniedException can be IAM denial, key disable, or policy
+        rotation — NOT specifically a context mismatch. Map to encrypt_failed
+        so operators investigate the IAM/key state, not the credential row."""
         kms = _make_kms_client()
         kms.generate_data_key.side_effect = _client_error("AccessDeniedException")
         with pytest.raises(VaultError) as exc_info:
             encryption.encrypt_credential(
                 plaintext="grn_test", encryption_context=_VALID_CONTEXT, kms_client=kms
             )
-        assert exc_info.value.code == VaultErrorCode.VAULT_KMS_CONTEXT_MISMATCH
+        assert exc_info.value.code == VaultErrorCode.VAULT_KMS_ENCRYPT_FAILED
+        assert "AccessDeniedException" in str(exc_info.value)
 
-    def test_kms_access_denied_on_decrypt_maps_to_context_mismatch(self):
+    def test_kms_access_denied_on_decrypt_maps_to_decrypt_failed(self):
+        """Same rationale as encrypt path — AccessDenied is too broad to
+        attribute to a context-binding violation."""
         kms = _make_kms_client()
         kms.decrypt.side_effect = _client_error("AccessDeniedException")
         with pytest.raises(VaultError) as exc_info:
@@ -232,7 +238,8 @@ class TestKmsErrorMapping:
                 encryption_context=_VALID_CONTEXT,
                 kms_client=kms,
             )
-        assert exc_info.value.code == VaultErrorCode.VAULT_KMS_CONTEXT_MISMATCH
+        assert exc_info.value.code == VaultErrorCode.VAULT_KMS_DECRYPT_FAILED
+        assert "AccessDeniedException" in str(exc_info.value)
 
     def test_invalid_ciphertext_maps_to_context_mismatch(self):
         kms = _make_kms_client()

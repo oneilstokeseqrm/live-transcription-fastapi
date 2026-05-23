@@ -33,12 +33,52 @@ _ALLOWED_CALLER = "services.granola_ingestion.adapter"
 _BLOCKED_CALLER = "not.in.allowlist"
 
 
+class _FakeTransaction:
+    """Mimics asyncpg's Transaction async context manager.
+
+    asyncpg's ``Connection.transaction()`` returns a Transaction object that
+    is itself an async context manager. ``__aenter__`` BEGINs (or opens a
+    savepoint) and ``__aexit__`` commits if no exception, rolls back if there
+    was one. Returning False from ``__aexit__`` propagates the exception so
+    the surrounding ``try`` sees it — that matches asyncpg's real behavior.
+    """
+
+    def __init__(self) -> None:
+        self.entered = False
+        self.exited = False
+        self.rolled_back = False
+
+    async def __aenter__(self) -> "_FakeTransaction":
+        self.entered = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        self.exited = True
+        if exc_type is not None:
+            self.rolled_back = True
+        return False  # propagate exceptions
+
+
 @pytest.fixture
 def fake_conn() -> AsyncMock:
-    """asyncpg ``Connection`` mock with overridable fetchrow + execute."""
+    """asyncpg ``Connection`` mock with overridable fetchrow + execute.
+
+    ``conn.transaction()`` returns a fresh ``_FakeTransaction`` per call so
+    tests can introspect rollback behavior.
+    """
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="INSERT 0 1")
     conn.fetchrow = AsyncMock(return_value=None)
+    transactions: list[_FakeTransaction] = []
+
+    def _new_txn() -> _FakeTransaction:
+        tx = _FakeTransaction()
+        transactions.append(tx)
+        return tx
+
+    conn.transaction = MagicMock(side_effect=_new_txn)
+    # Expose the per-test list for assertions:
+    conn._transactions = transactions  # type: ignore[attr-defined]
     return conn
 
 
@@ -547,3 +587,216 @@ class TestAllowlistDefaults:
     def test_allowlist_is_frozen(self):
         # frozenset has no .add method — guards against in-process mutation
         assert not hasattr(user_credentials.ALLOWLIST, "add")
+
+
+class TestStoreAtomicity:
+    """Per Codex round 1 P1: INSERT + success-audit are atomic.
+
+    asyncpg.Connection.execute autocommits per statement by default, so we
+    must wrap the credential write + success-audit in an explicit
+    ``conn.transaction()``. Without this, a failed audit-write would leave
+    the credential row committed with no forensic record — violating the
+    README/API guarantee that "failure to log = failure to access."
+    """
+
+    @pytest.mark.asyncio
+    async def test_happy_path_uses_explicit_transaction(
+        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        await user_credentials.store_credential(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            provider="granola",
+            api_key="grn_test",
+            config={"folder_id": "fol_x"},
+            caller_module=_ALLOWED_CALLER,
+            conn=fake_conn,
+        )
+        assert fake_conn.transaction.call_count == 1
+        # The transaction entered + exited cleanly (no rollback)
+        tx = fake_conn._transactions[0]
+        assert tx.entered is True
+        assert tx.exited is True
+        assert tx.rolled_back is False
+
+    @pytest.mark.asyncio
+    async def test_audit_success_failure_inside_txn_triggers_rollback(
+        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """If the success-audit fails INSIDE the transaction, the credential
+        INSERT must be rolled back AND a failure-audit attempted outside."""
+        from services.vault.errors import VaultError as _VE
+        from services.vault.errors import VaultErrorCode as _VEC
+
+        # First audit call (the success one, inside txn) fails.
+        # Second audit call (the failure one, outside txn) succeeds.
+        audit_spy.side_effect = [
+            _VE(_VEC.VAULT_AUDIT_LOG_WRITE_FAILED, "txn-side audit failed"),
+            uuid.uuid4(),  # outside-txn failure audit
+        ]
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.store_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                api_key="grn_test",
+                config={"folder_id": "fol_x"},
+                caller_module=_ALLOWED_CALLER,
+                conn=fake_conn,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED
+
+        # Transaction rolled back (the success-audit failure propagated):
+        tx = fake_conn._transactions[0]
+        assert tx.entered is True
+        assert tx.rolled_back is True
+
+        # Two audit calls total: the success attempt (failed) + the failure-audit
+        assert audit_spy.await_count == 2
+        # First call was the success attempt
+        first_kw = audit_spy.await_args_list[0].kwargs
+        assert first_kw["success"] is True
+        # Second call was the best-effort failure-audit
+        second_kw = audit_spy.await_args_list[1].kwargs
+        assert second_kw["success"] is False
+        assert second_kw["error_code"] == VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_double_fault_does_not_mask_original_error(
+        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """If the failure-audit ALSO fails, the caller sees the original
+        VaultError, not the secondary audit failure."""
+        from services.vault.errors import VaultError as _VE
+        from services.vault.errors import VaultErrorCode as _VEC
+
+        # First audit (success inside txn) fails with VAULT_AUDIT_LOG_WRITE_FAILED.
+        # Second audit (failure outside txn) also fails; should be swallowed.
+        audit_spy.side_effect = [
+            _VE(_VEC.VAULT_AUDIT_LOG_WRITE_FAILED, "primary failure"),
+            _VE(_VEC.VAULT_AUDIT_LOG_WRITE_FAILED, "secondary failure"),
+        ]
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.store_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                provider="granola",
+                api_key="grn_test",
+                config={"folder_id": "fol_x"},
+                caller_module=_ALLOWED_CALLER,
+                conn=fake_conn,
+            )
+        # Caller sees the ORIGINAL error, not the swallowed double-fault
+        assert "primary failure" in str(exc_info.value)
+        assert audit_spy.await_count == 2
+
+
+class TestRotateAtomicity:
+    """Same atomicity contract for rotate (Codex round 1 P1)."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_uses_explicit_transaction(
+        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        fake_conn.fetchrow.side_effect = [
+            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
+            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
+        ]
+
+        await user_credentials.rotate_credential_key(
+            credential_id=credential_id,
+            new_api_key="grn_new",
+            caller_module=_ALLOWED_CALLER,
+            conn=fake_conn,
+        )
+        assert fake_conn.transaction.call_count == 1
+        tx = fake_conn._transactions[0]
+        assert tx.entered is True
+        assert tx.rolled_back is False
+
+    @pytest.mark.asyncio
+    async def test_audit_failure_inside_txn_triggers_rollback(
+        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        from services.vault.errors import VaultError as _VE
+        from services.vault.errors import VaultErrorCode as _VEC
+
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        fake_conn.fetchrow.side_effect = [
+            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
+            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
+        ]
+        audit_spy.side_effect = [
+            _VE(_VEC.VAULT_AUDIT_LOG_WRITE_FAILED, "txn-side audit failed"),
+            uuid.uuid4(),
+        ]
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.rotate_credential_key(
+                credential_id=credential_id,
+                new_api_key="grn_new",
+                caller_module=_ALLOWED_CALLER,
+                conn=fake_conn,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED
+        tx = fake_conn._transactions[0]
+        assert tx.rolled_back is True
+        assert audit_spy.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_not_found_inside_txn_audits_outside_txn(
+        self, fake_conn: AsyncMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
+    ):
+        """Race scenario: identity lookup succeeded, UPDATE RETURNING none
+        (concurrent archive). Inside-txn raise → rollback → outside-txn audit."""
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        # Identity lookup (outside txn) succeeds; UPDATE RETURNING (inside txn) returns None
+        fake_conn.fetchrow.side_effect = [
+            {"tenant_id": tenant_id, "user_id": user_id, "provider": "granola"},
+            None,
+        ]
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.rotate_credential_key(
+                credential_id=credential_id,
+                new_api_key="grn_new",
+                caller_module=_ALLOWED_CALLER,
+                conn=fake_conn,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
+        # Transaction was entered and rolled back
+        assert len(fake_conn._transactions) == 1
+        tx = fake_conn._transactions[0]
+        assert tx.entered is True
+        assert tx.rolled_back is True
+        # Failure-audit happened OUTSIDE the rolled-back transaction
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["success"] is False
+        assert audit_spy.await_args.kwargs["error_code"] == VaultErrorCode.VAULT_DB_NOT_FOUND.value
+
+
+class TestGetDoesNotUseTransaction:
+    """Reads don't need atomicity — failure to log + exception = no API access.
+    Confirms the txn refactor didn't accidentally wrap the read path."""
+
+    @pytest.mark.asyncio
+    async def test_get_does_not_open_transaction(
+        self, fake_conn: AsyncMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+    ):
+        fake_conn.fetchrow.return_value = None
+        await user_credentials.get_granola_credential_for_user(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            caller_module=_ALLOWED_CALLER,
+            conn=fake_conn,
+        )
+        fake_conn.transaction.assert_not_called()

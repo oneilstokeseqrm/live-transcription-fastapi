@@ -36,14 +36,23 @@ from .errors import VaultError, VaultErrorCode
 
 logger = logging.getLogger(__name__)
 
-# AWS KMS access-denied error codes that surface as a 4-field EncryptionContext
-# binding violation. KMS maps both context mismatches and policy denials to
-# AccessDeniedException; we treat any AccessDenied on Decrypt/GenerateDataKey
-# as VAULT_KMS_CONTEXT_MISMATCH because under our deployed policy, the policy
-# layer is satisfied by IAM credentials before the call reaches KMS.
-_CONTEXT_MISMATCH_ERROR_CODES = frozenset(
-    {"AccessDeniedException", "InvalidCiphertextException"}
-)
+# AWS KMS error codes that specifically signal an EncryptionContext mismatch
+# or ciphertext-context corruption. Per AWS docs, InvalidCiphertextException
+# is returned when "the specified ciphertext, or additional authenticated
+# data incorporated into the ciphertext, such as the encryption context, is
+# corrupted, missing, or otherwise invalid" — that IS our LOCKED-40 binding
+# violation surface.
+#
+# AccessDeniedException is INTENTIONALLY NOT in this set. KMS returns it for
+# a much broader set of conditions: IAM principal denial, key-policy denial,
+# disabled keys, pending-deletion keys, mid-flight policy rotation. Mapping
+# all of those to "context mismatch" would send operators chasing a
+# ciphertext-corruption red herring when the actual cause is IAM/key-state
+# drift. We let AccessDeniedException fall through to the generic
+# VAULT_KMS_ENCRYPT_FAILED / VAULT_KMS_DECRYPT_FAILED code (which carries
+# the original boto3 error code in the message) so operators see the real
+# signal.
+_CONTEXT_MISMATCH_ERROR_CODES = frozenset({"InvalidCiphertextException"})
 
 _REQUIRED_CONTEXT_KEYS = frozenset({"tenant_id", "user_id", "provider", "credential_id"})
 
