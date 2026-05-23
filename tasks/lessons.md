@@ -1817,3 +1817,185 @@ Quality initiative's 5 services (live-transcription-fastapi,
 eq-email-pipeline, eq-agent-action-core, action-item-graph,
 eq-structured-graph-core).
 
+
+## Always verify branch before commits in shared checkout directories (2026-05-23)
+
+### Lesson
+
+`git branch --show-current` IMMEDIATELY before any `git commit` in a
+checkout directory shared with other agents. Don't trust the branch
+you THINK you're on; verify each time.
+
+### Why
+
+2026-05-23 Phase 2a session: created feature branch
+`phase-2/granola-vault-schema` in `/Users/peteroneil/eq-frontend` and
+committed Phase 1 cleanup. Did ~30 min of schema work (edits, validate,
+format, migration file generation). Committed Phase 2a Prisma changes —
+the commit reported `[main 74871fa]`, NOT the feature branch. Local
+main had silently switched between the feature-branch creation and
+the Phase 2a commit. Recovery required cherry-pick to the feature
+branch + user-authorized `git reset --hard origin/main` to clean up.
+
+Likely cause: another active agent (one of two visible in
+`/Users/peteroneil/.claude/projects/-Users-peteroneil-eq-frontend/`
+within the prior hour) ran `git checkout main` in the same checkout
+directory while we were working. Multiple agents sharing a single
+git checkout = exactly the disaster the Conductor worktree pattern
+exists to prevent.
+
+### How to apply
+
+1. **Before EVERY `git commit`** in a shared checkout, run:
+   ```bash
+   git branch --show-current
+   ```
+   Confirm the output matches the branch you expect.
+
+2. **For long-running work in a shared repo**: prefer a dedicated
+   Conductor worktree under `/Users/peteroneil/conductor/workspaces/<repo>/<name>/`
+   rather than working in the main checkout directory. Worktrees
+   isolate HEAD state per worktree.
+
+3. **Before `git add`**, also recheck. The window between `git add`
+   and `git commit` is also vulnerable to branch switches caused by
+   other agents.
+
+4. **If a commit lands on the wrong branch**: the recovery pattern is
+   (a) `git checkout <correct-branch>`, (b) `git cherry-pick <bad-sha>`,
+   (c) `git checkout <bad-branch>`, (d) `git reset --hard <correct-upstream>`.
+   Step (d) is destructive and requires explicit user authorization
+   per the standing rules.
+
+### Related
+
+[[feedback_shared_infrastructure_collision]] (the parent rule for
+detecting concurrent agents on shared infrastructure).
+
+## Prisma migrate diff against drifted production — NEVER auto-apply the generated migration (2026-05-23)
+
+### Lesson
+
+When generating a Prisma migration in a project where the database
+has drifted from `schema.prisma`, `prisma migrate dev` (or
+`prisma migrate diff --from-url`) will produce a diff that includes
+ALL the drift cleanup as side-effects. Applying that migration
+without hand-curation risks dropping production tables, dropping
+constraints on existing data, altering enums in ways downstream
+consumers don't expect, etc.
+
+The correct workflow when drift exists:
+
+1. Generate the diff with `prisma migrate diff --from-url <prod>
+   --to-schema-datamodel prisma/schema.prisma --script`
+2. **Read the entire diff** — flag every DROP, RENAME, ALTER on
+   existing tables as suspect
+3. Hand-write the migration file with ONLY the additive statements
+   relevant to your work
+4. Track the discovered drift in a dedicated issue (Linear, etc.)
+   for separate investigation
+
+### Why
+
+2026-05-23 Phase 2a session: ran `prisma migrate diff` to generate
+the Granola vault schema migration. The diff was 52KB / 375 SQL
+statements, including 63 DROP TABLEs, 88 DropForeignKeys, 48
+RenameIndexes, an AlterEnum on BriefingSignalType, etc. — all
+pre-existing drift between schema.prisma and the production Neon
+DB, unrelated to the Granola work. Hand-wrote the migration with
+just the additive statements (CREATE SCHEMA, 3 CREATE TABLE, 8
+indexes, 8 FKs); tracked the drift at Linear EQ-11 for separate
+investigation.
+
+The drift is itself a SYSTEMIC issue in the repo's Prisma setup
+(`db push` used in places where `migrate dev` should have been,
+tables deleted from schema.prisma without migrations, etc.). The
+fix is NOT to ship one mega-cleanup migration; it's to investigate
+root cause + adopt cutting-edge prevention (Atlas, Squawk, CI
+gates, drift detection in PR pipelines) + remediate in small
+scoped PRs each with their own review.
+
+### How to apply
+
+1. **Before EVERY new Prisma migration** in this repo, run
+   `prisma migrate diff --from-url <prod> --to-schema-datamodel
+   prisma/schema.prisma --script` and inspect output size.
+2. **If output > ~50 lines or contains any DROP TABLE**: STOP.
+   Hand-write the migration with only your intended additions.
+   Document the drift discovery + reference Linear EQ-11.
+3. **Never use `prisma migrate dev` against drifted production**
+   without first auditing the diff. The `--create-only` flag still
+   uses the auto-generated diff which inherits the drift.
+4. **Track drift investigation as a separate issue** — do NOT
+   bundle drift cleanup into feature PRs.
+
+### Related
+
+Linear EQ-11 — "Investigate Prisma schema drift in eq-frontend +
+design cutting-edge prevention approach". Two-phase scope: audit
++ cutting-edge prevention design.
+
+## Cutting-edge security posture is platform-relative (2026-05-23)
+
+### Lesson
+
+"Cutting-edge" architecture is not absolute — it's relative to what
+the deployment platform supports. The same security pattern can be
+cutting-edge on platform X (because X supports it natively) and
+inappropriate on platform Y (because Y doesn't, and the workaround
+introduces more complexity than the original problem).
+
+For storing third-party API credentials in 2026, the platform-aware
+trade-offs are:
+
+| If platform supports... | Cutting-edge pattern |
+|---|---|
+| OIDC federated identity (AWS Lambda, EKS-IRSA, Vercel) | Federated identity → short-lived STS credentials; no long-lived keys ever |
+| Only static env vars (Railway, Heroku, etc.) | Long-lived AWS keys + minimum-privilege IAM + EncryptionContext binding + audit log + 90-day rotation cadence |
+
+The second pattern looks like "industry anti-pattern" on the surface
+("long-lived keys! bad!") but is actually the correct cutting-edge
+MVP move ON THAT PLATFORM. Pursuing federated identity on Railway
+requires workarounds (IAM Roles Anywhere with X.509 certs, sidecar
+brokers, STS chains) that add significantly more complexity than the
+problem they solve at MVP scale.
+
+### Why
+
+2026-05-23 Phase 2a session: initially considered federated identity
+as a "fix it now" hardening step. Verified via WebFetch that Railway
+does NOT support OIDC federation to AWS (no docs, no community
+discussions of it as a Railway feature). Workarounds were all
+significantly more complex than the half-day estimate. The
+pragmatic move is: keep long-lived keys + the existing hardening
+(minimum-privilege policy + EncryptionContext binding + KMS auto-
+rotation + new audit log + 90-day rotation cadence). Documented
+the platform constraint in services/vault/README.md Phase 2.1
+section #3 so a future engineer doesn't try to "fix" something
+that's actually correct-for-the-platform.
+
+### How to apply
+
+1. **Don't blindly apply security patterns from "best practice" guides
+   without checking platform support.** "Use IAM Roles, not access keys"
+   is universally correct advice — but only achievable if your platform
+   supports federated identity. Verify before committing to architecture
+   that depends on it.
+2. **Document the platform constraint explicitly** in your security
+   docs. A future engineer reading "Phase 2.1 candidate: federated
+   identity" should see WHY it's deferred, not just THAT it is.
+3. **Revisit when the platform evolves.** If Railway adds OIDC
+   support, federated identity becomes the right move. Tie the
+   Phase 2.1 candidate to "if/when platform supports it" not "in
+   N weeks from now."
+4. **Match the threat model to the trust model.** Cutting-edge
+   isn't "more security layers always" — it's "the right security
+   layers for the threats you actually face on the platform you
+   actually deploy to."
+
+### Related
+
+[[feedback_codex_pre_merge_gate]] (Codex consult helped surface this
+trade-off during the prior session's discussion). The user's
+"are we cutting-edge?" question is a useful periodic check — answer
+honestly with platform context, not aspirationally.
