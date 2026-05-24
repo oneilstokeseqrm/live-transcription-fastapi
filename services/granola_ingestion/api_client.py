@@ -62,14 +62,22 @@ _DEFAULT_RETRY_BASE_DELAY_S = 1.0
 # hang the poll cycle indefinitely. Reset to zero on any non-429 response.
 _DEFAULT_MAX_CONSECUTIVE_429S = 3
 
-# Defensive ceiling on pagination loops. The realistic 5-min poll window
-# generates 0-2 pages (filtered by ``created_after``), but an initial
-# backfill against a newly-connected credential (``last_polled_at=NULL``)
-# can legitimately match thousands of notes — Phase 2c's docstring on
-# list_notes calls this out. 500 pages × ~100 entries = ~50,000 notes
-# accommodates any realistic backfill; the load-bearing runaway guard is
-# the per-page cursor non-advancement check, not this ceiling.
-_DEFAULT_MAX_PAGES = 500
+# Per-endpoint pagination ceilings. The load-bearing runaway guard is the
+# per-page cursor non-advancement check (in :meth:`_get_paginated`); these
+# ceilings are belt-and-suspenders defense against a server that always
+# advances the cursor but never sets ``hasMore=false``.
+#
+# ``_DEFAULT_MAX_PAGES_NOTES`` = 500: an initial-backfill scenario
+# (``last_polled_at=NULL``) can legitimately match thousands of notes;
+# 500 × ~100 entries = ~50,000 notes accommodates any realistic backfill.
+#
+# ``_MAX_PAGES_FOLDERS`` = 20: folders are organizational primitives —
+# no realistic Granola account has thousands of folders; a stuck cursor
+# on ``/folders`` should fail orders-of-magnitude faster than on
+# ``/notes``. Hardcoded (not a constructor knob) because folder counts
+# don't vary with account size the way note counts do.
+_DEFAULT_MAX_PAGES_NOTES = 500
+_MAX_PAGES_FOLDERS = 20
 
 # Cap how long we'll honor a server-suggested Retry-After. Granola's docs
 # advertise 5 req/sec sustained + 300/min — well above what the adapter
@@ -171,7 +179,7 @@ class GranolaAPIClient:
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_base_delay_s: float = _DEFAULT_RETRY_BASE_DELAY_S,
         max_consecutive_429s: int = _DEFAULT_MAX_CONSECUTIVE_429S,
-        max_pages: int = _DEFAULT_MAX_PAGES,
+        max_pages: int = _DEFAULT_MAX_PAGES_NOTES,
     ) -> None:
         if not api_key:
             # Fail loud at construction so the empty/missing-key case
@@ -230,6 +238,7 @@ class GranolaAPIClient:
             base_params={},
             field_name="folders",
             model_cls=GranolaFolder,
+            max_pages_override=_MAX_PAGES_FOLDERS,
         )
 
     async def list_notes(
@@ -307,6 +316,7 @@ class GranolaAPIClient:
         base_params: dict[str, Any],
         field_name: str,
         model_cls: type[BaseModel],
+        max_pages_override: int | None = None,
     ) -> list[Any]:
         """Walk Granola's ``{<field>, hasMore, cursor}`` wrapper across pages.
 
@@ -315,10 +325,16 @@ class GranolaAPIClient:
         from silently truncating while the other paginates correctly.
         Defensively accepts a bare list (no wrapper) for forward
         compatibility with possible future endpoint shapes.
+
+        ``max_pages_override`` lets callers tighten the page ceiling for
+        endpoints whose realistic scale is smaller than ``self._max_pages``
+        (which is sized for the worst-case ``/notes`` backfill). When
+        ``None``, the constructor default applies.
         """
+        page_limit = max_pages_override if max_pages_override is not None else self._max_pages
         collected: list[Any] = []
         cursor: str | None = None
-        for _ in range(self._max_pages):
+        for _ in range(page_limit):
             params = dict(base_params)
             if cursor:
                 params["cursor"] = cursor
@@ -367,7 +383,7 @@ class GranolaAPIClient:
         # catch. Surface as parse error so the adapter can bound it.
         raise GranolaError(
             GranolaErrorCode.GRANOLA_PARSE_ERROR,
-            f"Granola {path} pagination exceeded {self._max_pages} pages",
+            f"Granola {path} pagination exceeded {page_limit} pages",
         )
 
     async def _request_json(

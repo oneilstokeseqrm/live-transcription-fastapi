@@ -1076,3 +1076,45 @@ async def test_list_notes_pagination_accommodates_large_backfill(sleep_calls):
 
     assert counter["n"] == TOTAL_PAGES
     assert len(notes) == TOTAL_PAGES
+
+
+# ---------------------------------------------------------------------------
+# Codex R4 fix: per-endpoint pagination ceilings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_folders_pagination_ceiling_is_tight(sleep_calls):
+    """Codex R4 P2: /folders uses a hardcoded tight ceiling (20 pages)
+    independent of the constructor max_pages. Folders are organizational
+    primitives — a stuck cursor here should fail in <20 requests, not
+    after 500. Verified by constructing with a large max_pages (which
+    would mask the tight folder ceiling if it leaked through to the
+    shared helper)."""
+
+    counter = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter["n"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "folders": [{"id": f"fol_{counter['n']}", "name": "x"}],
+                "hasMore": True,
+                "cursor": f"cur_{counter['n']}",
+            },
+        )
+
+    # Constructor max_pages=500 (the default for /notes). If the tight
+    # /folders ceiling leaks, this test would make 500 HTTP requests.
+    client = _client_with_handler(handler, max_pages=500)
+    try:
+        with pytest.raises(GranolaError) as exc_info:
+            await client.list_folders()
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.code is GranolaErrorCode.GRANOLA_PARSE_ERROR
+    assert "exceeded" in exc_info.value.message.lower()
+    # Tight ceiling = 20; should fire well before 500.
+    assert counter["n"] == 20
