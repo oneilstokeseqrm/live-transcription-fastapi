@@ -123,6 +123,28 @@ def test_to_direct_neon_url_noop_when_already_direct():
     assert asyncpg_pool._to_direct_neon_url(src) == src
 
 
+def test_to_direct_neon_url_leaves_non_neon_pooler_intact():
+    """Codex PR-#28 R6 P2: a non-Neon custom pooler whose name contains
+    '-pooler.' must NOT be rewritten (rewriting pg-pooler.internal →
+    pg.internal would point at a non-existent host)."""
+    src = "postgresql://u:p@pg-pooler.internal:6432/db"
+    assert asyncpg_pool._to_direct_neon_url(src) == src
+
+
+def test_resolve_dsn_non_neon_pooler_database_url_kept_and_warned(monkeypatch, caplog):
+    """A non-Neon -pooler DATABASE_URL is left intact (not mangled) AND
+    triggers the pooler warning so operators set GRANOLA_DB_DIRECT_URL."""
+    import logging
+
+    monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@pg-pooler.internal:6432/db")
+    with caplog.at_level(logging.WARNING):
+        dsn, _ = asyncpg_pool._resolve_dsn_and_kwargs()
+    # Host preserved (not rewritten to pg.internal).
+    assert "pg-pooler.internal" in dsn
+    assert any("POOLER host" in r.message for r in caplog.records)
+
+
 def test_resolve_dsn_explicit_granola_direct_url_wins(monkeypatch):
     """GRANOLA_DB_DIRECT_URL overrides the DATABASE_URL derivation."""
     monkeypatch.setenv(

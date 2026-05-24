@@ -103,12 +103,21 @@ def _to_direct_neon_url(url: str) -> str:
     endpoint is ``<ep>.<rest>`` — same database, different connection
     route. Stripping ``-pooler`` keeps us on the SAME application
     database (Codex PR-#28 R5 P1) while giving us the direct connection
-    the advisory lock needs (R4 P1). If the host has no ``-pooler``
-    segment (already direct, or a non-Neon host), the URL is returned
-    unchanged.
+    the advisory lock needs (R4 P1).
+
+    The rewrite is gated on a verified Neon hostname (``.neon.tech``
+    suffix) — Codex PR-#28 R6 P2. A non-Neon custom pooler whose name
+    merely contains ``-pooler.`` (e.g. ``pg-pooler.internal``) is left
+    intact: rewriting it to ``pg.internal`` would point at a
+    non-existent host. Those deployments instead hit the pooler warning
+    in :func:`_resolve_dsn_and_kwargs` and should set
+    ``GRANOLA_DB_DIRECT_URL`` explicitly. A host that's already direct
+    (no ``-pooler.``) is also returned unchanged.
     """
     parsed = urlparse(url)
     host = parsed.hostname or ""
+    if not host.endswith(".neon.tech"):
+        return url
     if "-pooler." not in host:
         return url
     direct_host = host.replace("-pooler.", ".", 1)
@@ -212,8 +221,10 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
             "scheduler's pg_try_advisory_lock is session-scoped and is "
             "NOT reliable under PgBouncer transaction pooling — "
             "overlapping cycles could double-publish. Set "
-            "GRANOLA_DB_DIRECT_URL or DBOS_SYSTEM_DATABASE_URL to a "
-            "DIRECT (non-pooler) Neon endpoint.",
+            "GRANOLA_DB_DIRECT_URL to a DIRECT (non-pooler) connection "
+            "to the application database. (A Neon DATABASE_URL is "
+            "auto-rewritten to its direct endpoint; a non-Neon pooler "
+            "needs the explicit GRANOLA_DB_DIRECT_URL.)",
             host,
         )
 
