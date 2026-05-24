@@ -12,13 +12,39 @@ import-time has no DB cost and tests don't need to set up Neon to
 import the module. :func:`close_asyncpg_pool` is wired into the FastAPI
 lifespan so connections drain on graceful shutdown.
 
-DSN handling: the SQLAlchemy engine in :mod:`services.database` uses
-``DATABASE_URL`` with a ``postgresql+asyncpg`` driver prefix and accepts
-SQLAlchemy-style query params (``sslmode``, ``channel_binding``,
-``options``). asyncpg's native ``create_pool`` doesn't recognize the
-driver prefix or those params, so we strip them here and promote
-``sslmode=require`` to an explicit SSL context — mirroring the
-SQLAlchemy engine's setup in :func:`services.database.get_database_url`.
+Direct connection required (Codex PR-#28 R4 P1): the
+:func:`services.granola_ingestion.scheduler.run_cycle_step` advisory
+lock (``pg_try_advisory_lock``) is SESSION-scoped, and Neon's default
+``DATABASE_URL`` is the PgBouncer ``-pooler`` endpoint running in
+TRANSACTION pooling mode. Under transaction pooling, session state
+(including advisory locks) is NOT preserved across statements — the
+lock can land on a different backend than the queries that follow, so
+the per-credential serialization silently provides no protection and
+overlapping cycles can still double-publish. asyncpg's prepared-
+statement cache is also unsafe through PgBouncer. So this pool resolves
+a DIRECT (non-pooler) connection, preferring (in order):
+
+1. ``GRANOLA_DB_DIRECT_URL`` — explicit override if an operator wants a
+   dedicated connection string.
+2. ``DBOS_SYSTEM_DATABASE_URL`` — already REQUIRED to be a direct
+   connection (:mod:`services.dbos_runtime`) and points at the same
+   ``neondb``, so reusing it needs no new Railway env var.
+3. ``DATABASE_URL`` — last-resort fallback. If this is a ``-pooler``
+   host we log a loud warning that advisory-lock serialization will be
+   unreliable.
+
+``statement_cache_size=0`` is set unconditionally — it's the asyncpg
+setting required for PgBouncer compatibility and costs almost nothing
+for the scheduler's low query volume, so it removes the prepared-
+statement footgun on any connection.
+
+DSN handling: the resolved URL may carry a ``postgresql+asyncpg``
+driver prefix and SQLAlchemy-style query params (``sslmode``,
+``channel_binding``, ``options``). asyncpg's native ``create_pool``
+doesn't recognize the driver prefix or those params, so we strip them
+here and promote ``sslmode=require`` to an explicit SSL context —
+mirroring the SQLAlchemy engine's setup in
+:func:`services.database.get_database_url`.
 
 Sizing: the pool defaults to ``min_size=1, max_size=10``. Phase 2e's
 peak load is one workflow per active credential per 5 min, capped by
@@ -74,12 +100,22 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
        ``verify_mode=CERT_NONE`` matches the existing SQLAlchemy
        engine's setup (services/database.py).
     """
-    url = os.environ.get("DATABASE_URL")
+    # Prefer a DIRECT (non-pooler) connection — see module docstring
+    # (Codex PR-#28 R4 P1). The advisory lock that serializes Granola
+    # cycles is session-scoped and is silently defeated by PgBouncer
+    # transaction pooling.
+    url = (
+        os.environ.get("GRANOLA_DB_DIRECT_URL")
+        or os.environ.get("DBOS_SYSTEM_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+    )
     if not url:
         raise RuntimeError(
-            "DATABASE_URL is required for the asyncpg pool but is unset. "
-            "Phase 2e's scheduler + vault accessors need this set in "
-            "Railway env config."
+            "No database URL for the asyncpg pool. Set one of "
+            "GRANOLA_DB_DIRECT_URL, DBOS_SYSTEM_DATABASE_URL, or "
+            "DATABASE_URL in Railway env config. Prefer a DIRECT "
+            "(non-pooler) Neon endpoint so the scheduler's advisory "
+            "lock works."
         )
     parsed = urlparse(url)
     scheme = parsed.scheme
@@ -89,8 +125,8 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
         # Defensive: any other scheme prefix is a misconfiguration we
         # surface immediately rather than letting asyncpg fail mid-cycle.
         raise RuntimeError(
-            f"DATABASE_URL has unexpected scheme {parsed.scheme!r}; expected "
-            f"'postgresql' or 'postgresql+asyncpg'"
+            f"resolved database URL has unexpected scheme {parsed.scheme!r}; "
+            f"expected 'postgresql' or 'postgresql+asyncpg'"
         )
 
     query_params = parse_qs(parsed.query)
@@ -108,12 +144,34 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
         (scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
     )
 
-    kwargs: dict = {}
+    # statement_cache_size=0 is required for PgBouncer compatibility and
+    # harmless on a direct connection at the scheduler's low query
+    # volume — set unconditionally to remove the prepared-statement
+    # footgun (Codex PR-#28 R4 P1).
+    kwargs: dict = {"statement_cache_size": 0}
     if ssl_required:
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
         kwargs["ssl"] = ssl_ctx
+
+    # Loud warning if we ended up on a pooler host: the advisory lock in
+    # run_cycle_step is session-scoped and unreliable under PgBouncer
+    # transaction pooling, so overlapping cycles could still
+    # double-publish. statement_cache_size=0 covers the prepared-
+    # statement issue but NOT the lock — only a direct endpoint fixes
+    # that.
+    host = parsed.hostname or ""
+    if "-pooler." in host:
+        logger.warning(
+            "asyncpg_pool: resolved a POOLER host (%s). The Granola "
+            "scheduler's pg_try_advisory_lock is session-scoped and is "
+            "NOT reliable under PgBouncer transaction pooling — "
+            "overlapping cycles could double-publish. Set "
+            "GRANOLA_DB_DIRECT_URL or DBOS_SYSTEM_DATABASE_URL to a "
+            "DIRECT (non-pooler) Neon endpoint.",
+            host,
+        )
 
     return dsn, kwargs
 

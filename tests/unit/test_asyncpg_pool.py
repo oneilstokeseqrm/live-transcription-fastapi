@@ -16,9 +16,19 @@ from services import asyncpg_pool
 
 
 @pytest.fixture(autouse=True)
-def _reset_pool_state():
-    """Each test starts with a fresh lazy-singleton state."""
+def _reset_pool_state(monkeypatch):
+    """Each test starts with a fresh lazy-singleton state AND a clean
+    URL env.
+
+    The resolver prefers GRANOLA_DB_DIRECT_URL → DBOS_SYSTEM_DATABASE_URL
+    → DATABASE_URL. The test harness sets DBOS_SYSTEM_DATABASE_URL on the
+    command line, which would otherwise shadow tests that only set
+    DATABASE_URL. Clear all three so each test controls exactly which
+    var it exercises."""
     asyncpg_pool._reset_for_tests()
+    monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
+    monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     yield
     asyncpg_pool._reset_for_tests()
 
@@ -72,10 +82,64 @@ def test_resolve_dsn_without_sslmode_omits_ssl_kwarg(monkeypatch):
     assert "ssl" not in kwargs
 
 
-def test_resolve_dsn_raises_when_database_url_unset(monkeypatch):
+def test_resolve_dsn_raises_when_no_url_env_set(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    with pytest.raises(RuntimeError, match="DATABASE_URL is required"):
+    monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
+    monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
+    with pytest.raises(RuntimeError, match="No database URL"):
         asyncpg_pool._resolve_dsn_and_kwargs()
+
+
+def test_resolve_dsn_prefers_direct_url_over_pooler_database_url(monkeypatch):
+    """Codex PR-#28 R4 P1: the advisory lock needs a DIRECT connection.
+    DBOS_SYSTEM_DATABASE_URL (guaranteed direct) is preferred over the
+    pooler DATABASE_URL."""
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://u:p@ep-x-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
+    )
+    monkeypatch.setenv(
+        "DBOS_SYSTEM_DATABASE_URL",
+        "postgresql://u:p@ep-x.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
+    )
+    monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
+    dsn, _ = asyncpg_pool._resolve_dsn_and_kwargs()
+    # Direct host (no -pooler), not the pooler DATABASE_URL.
+    assert "-pooler." not in dsn
+    assert "ep-x.c-2" in dsn
+
+
+def test_resolve_dsn_explicit_granola_direct_url_wins(monkeypatch):
+    """GRANOLA_DB_DIRECT_URL overrides everything."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@pooler-pooler.neon.tech/db")
+    monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", "postgresql://u:p@dbos.neon.tech/db")
+    monkeypatch.setenv("GRANOLA_DB_DIRECT_URL", "postgresql://u:p@explicit.neon.tech/db")
+    dsn, _ = asyncpg_pool._resolve_dsn_and_kwargs()
+    assert "explicit.neon.tech" in dsn
+
+
+def test_resolve_dsn_always_disables_statement_cache(monkeypatch):
+    """statement_cache_size=0 set unconditionally for PgBouncer safety."""
+    monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", "postgresql://u:p@direct.neon.tech/db")
+    monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
+    _, kwargs = asyncpg_pool._resolve_dsn_and_kwargs()
+    assert kwargs["statement_cache_size"] == 0
+
+
+def test_resolve_dsn_warns_when_falling_back_to_pooler(monkeypatch, caplog):
+    """If only a -pooler DATABASE_URL is available, warn loudly that the
+    advisory lock will be unreliable."""
+    import logging
+
+    monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
+    monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://u:p@ep-x-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
+    )
+    with caplog.at_level(logging.WARNING):
+        asyncpg_pool._resolve_dsn_and_kwargs()
+    assert any("POOLER host" in r.message for r in caplog.records)
 
 
 def test_resolve_dsn_rejects_unexpected_scheme(monkeypatch):

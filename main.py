@@ -113,18 +113,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     is the cheapest mitigation that meaningfully reduces the silent-loss
     surface area.
     """
-    async with dbos_lifespan(app):
-        logger.info("Running startup tasks...")
-        await reap_stuck_jobs()
-        logger.info("Startup tasks completed")
-        try:
-            yield
-        finally:
-            await _drain_text_clean_background_tasks()
-            # Close the shared asyncpg pool used by the Granola
-            # scheduler + vault accessors. Idempotent — no-op if the
-            # pool was never lazily initialized.
-            await close_asyncpg_pool()
+    try:
+        async with dbos_lifespan(app):
+            logger.info("Running startup tasks...")
+            await reap_stuck_jobs()
+            logger.info("Startup tasks completed")
+            try:
+                yield
+            finally:
+                await _drain_text_clean_background_tasks()
+    finally:
+        # Close the shared asyncpg pool AFTER dbos_lifespan.__aexit__ has
+        # run DBOS.destroy() (Codex PR-#28 R4 P2). Closing it earlier —
+        # inside the dbos_lifespan block — would mark the pool as
+        # closing while the DBOS executor is still alive, so a Granola
+        # workflow still mid-cycle during shutdown would fail its next
+        # pool.acquire() and abort instead of finishing (or being
+        # resumed by DBOS on the next boot). Idempotent — no-op if the
+        # pool was never lazily initialized.
+        await close_asyncpg_pool()
 
 
 async def _drain_text_clean_background_tasks(timeout_s: float = 25.0) -> None:
