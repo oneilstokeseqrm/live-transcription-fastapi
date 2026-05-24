@@ -32,7 +32,9 @@ from routers import batch
 from routers import text
 from routers import upload
 from routers import queue_actions
+from routers import granola_cron
 from routers.upload import reap_stuck_jobs
+from services.asyncpg_pool import close_asyncpg_pool
 
 load_dotenv()
 
@@ -119,6 +121,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             yield
         finally:
             await _drain_text_clean_background_tasks()
+            # Close the shared asyncpg pool used by the Granola
+            # scheduler + vault accessors. Idempotent — no-op if the
+            # pool was never lazily initialized.
+            await close_asyncpg_pool()
 
 
 async def _drain_text_clean_background_tasks(timeout_s: float = 25.0) -> None:
@@ -179,6 +185,7 @@ app.include_router(batch.router)
 app.include_router(text.router, prefix="/text", tags=["text"])
 app.include_router(upload.router)
 app.include_router(queue_actions.router)
+app.include_router(granola_cron.router)
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
 event_publisher = EventPublisher()
