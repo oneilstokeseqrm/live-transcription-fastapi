@@ -218,13 +218,18 @@ class GranolaAPIClient:
 
         Per Phase 0 empirical verification, the live response is
         ``{folders: [...], hasMore: bool, cursor: str}``. We unwrap
-        ``folders`` and validate each entry against
-        :class:`GranolaFolder`. Pagination via ``cursor`` is deferred
-        to Phase 2.1 (current scale: ~tens of folders per user).
+        ``folders``, follow the cursor across pages, and validate each
+        entry against :class:`GranolaFolder`. Without pagination,
+        accounts with many folders would silently lose folders past
+        page 1 — and validation/folder-pick UIs built on this would
+        miss valid folders for those accounts.
         """
-        body = await self._request_json("GET", "/folders", endpoint_kind="folder")
-        items = body.get("folders") if isinstance(body, dict) else body
-        return self._parse_list(items, GranolaFolder, field_name="folders")
+        return await self._get_paginated(
+            path="/folders",
+            base_params={},
+            field_name="folders",
+            model_cls=GranolaFolder,
+        )
 
     async def list_notes(
         self,
@@ -266,63 +271,11 @@ class GranolaAPIClient:
         if created_after is not None:
             base_params["created_after"] = _format_created_after(created_after)
 
-        collected: list[GranolaNoteSummary] = []
-        cursor: str | None = None
-        for page_index in range(self._max_pages):
-            params = dict(base_params)
-            if cursor:
-                params["cursor"] = cursor
-
-            body = await self._request_json(
-                "GET", "/notes", params=params, endpoint_kind="folder"
-            )
-
-            # Defensive: accept either {notes, hasMore, cursor} wrapper
-            # OR a bare list (in case a future endpoint version drops
-            # the wrapper).
-            if isinstance(body, dict):
-                items = body.get("notes")
-                has_more = bool(body.get("hasMore"))
-                next_cursor = body.get("cursor") or None
-            else:
-                items = body
-                has_more = False
-                next_cursor = None
-
-            collected.extend(
-                self._parse_list(items, GranolaNoteSummary, field_name="notes")
-            )
-
-            if not has_more:
-                return collected
-
-            # ``hasMore`` is true; we need a cursor to advance. If the
-            # server claims more pages but doesn't give us one, that's
-            # a malformed pagination response — fail loud rather than
-            # truncate.
-            if not next_cursor:
-                raise GranolaError(
-                    GranolaErrorCode.GRANOLA_PARSE_ERROR,
-                    "Granola /notes response set hasMore=true but omitted cursor",
-                )
-
-            # Cursor must advance between pages; if it doesn't we'd
-            # spin forever. This shouldn't happen on a well-behaved
-            # server but the check is cheap.
-            if next_cursor == cursor:
-                raise GranolaError(
-                    GranolaErrorCode.GRANOLA_PARSE_ERROR,
-                    "Granola /notes cursor did not advance between pages",
-                )
-            cursor = next_cursor
-
-        # Exhausted page budget. Either the user has >2000 new notes in
-        # one cycle (operationally implausible at our cadence) or the
-        # cursor is misbehaving in a way the per-page guard didn't
-        # catch. Surface as parse error so the adapter can bound it.
-        raise GranolaError(
-            GranolaErrorCode.GRANOLA_PARSE_ERROR,
-            f"Granola /notes pagination exceeded {self._max_pages} pages",
+        return await self._get_paginated(
+            path="/notes",
+            base_params=base_params,
+            field_name="notes",
+            model_cls=GranolaNoteSummary,
         )
 
     async def get_note_detail(self, note_id: str) -> GranolaNoteDetail:
@@ -345,6 +298,76 @@ class GranolaAPIClient:
     # ------------------------------------------------------------------
     # Internal HTTP + parsing
     # ------------------------------------------------------------------
+
+    async def _get_paginated(
+        self,
+        *,
+        path: str,
+        base_params: dict[str, Any],
+        field_name: str,
+        model_cls: type[BaseModel],
+    ) -> list[Any]:
+        """Walk Granola's ``{<field>, hasMore, cursor}`` wrapper across pages.
+
+        Used by both :meth:`list_folders` and :meth:`list_notes` — keeps
+        their pagination behavior identical and prevents one endpoint
+        from silently truncating while the other paginates correctly.
+        Defensively accepts a bare list (no wrapper) for forward
+        compatibility with possible future endpoint shapes.
+        """
+        collected: list[Any] = []
+        cursor: str | None = None
+        for _ in range(self._max_pages):
+            params = dict(base_params)
+            if cursor:
+                params["cursor"] = cursor
+
+            body = await self._request_json(
+                "GET", path, params=params, endpoint_kind="folder"
+            )
+
+            if isinstance(body, dict):
+                items = body.get(field_name)
+                has_more = bool(body.get("hasMore"))
+                next_cursor = body.get("cursor") or None
+            else:
+                items = body
+                has_more = False
+                next_cursor = None
+
+            collected.extend(self._parse_list(items, model_cls, field_name=field_name))
+
+            if not has_more:
+                return collected
+
+            # ``hasMore`` is true; we need a cursor to advance. If the
+            # server claims more pages but doesn't give us one, that's
+            # a malformed pagination response — fail loud rather than
+            # truncate.
+            if not next_cursor:
+                raise GranolaError(
+                    GranolaErrorCode.GRANOLA_PARSE_ERROR,
+                    f"Granola {path} response set hasMore=true but omitted cursor",
+                )
+
+            # Cursor must advance between pages; if it doesn't we'd
+            # spin forever. This shouldn't happen on a well-behaved
+            # server but the check is cheap.
+            if next_cursor == cursor:
+                raise GranolaError(
+                    GranolaErrorCode.GRANOLA_PARSE_ERROR,
+                    f"Granola {path} cursor did not advance between pages",
+                )
+            cursor = next_cursor
+
+        # Exhausted page budget. Either the response has more entries
+        # than our ceiling (operationally implausible at MVP scale) or
+        # the cursor is misbehaving in a way the per-page guard didn't
+        # catch. Surface as parse error so the adapter can bound it.
+        raise GranolaError(
+            GranolaErrorCode.GRANOLA_PARSE_ERROR,
+            f"Granola {path} pagination exceeded {self._max_pages} pages",
+        )
 
     async def _request_json(
         self,
@@ -462,8 +485,13 @@ class GranolaAPIClient:
                         f"Granola returned 429 on {consecutive_429s} consecutive attempts",
                         http_status=status,
                     )
+                # Fallback grows with consecutive 429s (not retry_attempt,
+                # which is never incremented on this branch). Without this
+                # the headerless-429 fallback would sleep the same base
+                # delay on every consecutive 429 and exhaust the budget
+                # well before the intended 1s/2s/4s ramp.
                 fallback = _build_jittered_delay(
-                    self._retry_base_delay_s, retry_attempt
+                    self._retry_base_delay_s, consecutive_429s - 1
                 )
                 retry_after = _parse_retry_after(
                     response.headers.get("Retry-After"),

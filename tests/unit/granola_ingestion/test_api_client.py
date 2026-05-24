@@ -895,3 +895,84 @@ async def test_list_notes_pagination_max_pages_exceeded_raises_parse_error(
     assert exc_info.value.code is GranolaErrorCode.GRANOLA_PARSE_ERROR
     assert "exceeded" in exc_info.value.message.lower()
     assert counter["n"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 fixes: /folders pagination + 429 fallback grows with consecutive_429s
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_folders_paginates_with_cursor(sleep_calls):
+    """Codex R2 P2: /folders uses the same {folders, hasMore, cursor}
+    wrapper as /notes; an account with enough folders to set hasMore=true
+    must NOT have later pages silently dropped."""
+
+    page_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page_count["n"] += 1
+        cursor_param = request.url.params.get("cursor")
+        if page_count["n"] == 1:
+            assert cursor_param is None
+            return httpx.Response(
+                200,
+                json={
+                    "folders": [
+                        {"id": "fol_1", "name": "EQ"},
+                        {"id": "fol_2", "name": "Archive"},
+                    ],
+                    "hasMore": True,
+                    "cursor": "cur_p2",
+                },
+            )
+        assert cursor_param == "cur_p2"
+        return httpx.Response(
+            200,
+            json={
+                "folders": [{"id": "fol_3", "name": "Misc"}],
+                "hasMore": False,
+                "cursor": None,
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        folders = await client.list_folders()
+    finally:
+        await client.aclose()
+
+    assert page_count["n"] == 2
+    assert [f.id for f in folders] == ["fol_1", "fol_2", "fol_3"]
+
+
+@pytest.mark.asyncio
+async def test_429_fallback_backoff_grows_with_consecutive_429s(sleep_calls):
+    """Codex R2 P2: when Retry-After is missing, the fallback delay must
+    grow across consecutive 429s. Otherwise every retry sleeps the same
+    base interval and the consecutive-429 budget fires far earlier than
+    the intended 1s → 2s → 4s ramp."""
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] <= 3:
+            # 429 with NO Retry-After header — forces the fallback path.
+            return httpx.Response(429, json={"error": "throttled"})
+        return httpx.Response(200, json={"folders": []})
+
+    # max_consecutive_429s=5 (room to observe the ramp) and base 1ms
+    # delay so the jittered range stays observable.
+    client = _client_with_handler(handler, max_consecutive_429s=5)
+    try:
+        await client.list_folders()
+    finally:
+        await client.aclose()
+
+    assert call_count["n"] == 4  # 3 × 429 then 1 × 200
+    assert len(sleep_calls) == 3
+    # Attempt 0 → [1ms, 1.5ms); attempt 1 → [2ms, 3ms); attempt 2 → [4ms, 6ms).
+    assert 0.001 <= sleep_calls[0] < 0.0015
+    assert 0.002 <= sleep_calls[1] < 0.003
+    assert 0.004 <= sleep_calls[2] < 0.006
