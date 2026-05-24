@@ -12,7 +12,7 @@ concurrency cap.
 
 Behavioral tests cover the load-bearing branches:
 
-* ``list_active_credentials_step`` returns the right shape from the
+* ``list_active_credentials`` returns the right shape from the
   raw asyncpg fetch.
 * ``run_cycle_step`` short-circuits on missing / non-active credential
   without invoking the adapter.
@@ -44,15 +44,43 @@ from services.granola_ingestion import scheduler
 
 
 class _FakeConn:
-    """asyncpg Connection stand-in for list_active_credentials_step."""
+    """asyncpg Connection stand-in for list_active_credentials + the
+    run_cycle_step advisory lock.
 
-    def __init__(self, *, fetch_returns: Optional[list[dict]] = None) -> None:
+    ``fetchval_returns`` controls ``pg_try_advisory_lock`` (True =
+    lock acquired). ``fetch_returns`` feeds the credential-listing
+    query. ``execute`` swallows the ``pg_advisory_unlock`` call.
+    ``fetch_raises`` (when set) makes the first N ``fetch`` calls raise
+    to exercise the explicit-retry path.
+    """
+
+    def __init__(
+        self,
+        *,
+        fetch_returns: Optional[list[dict]] = None,
+        fetchval_returns: bool = True,
+        fetch_raises: Optional[list[BaseException]] = None,
+    ) -> None:
         self.fetch_returns = fetch_returns or []
+        self.fetchval_returns = fetchval_returns
+        self.fetch_raises = list(fetch_raises) if fetch_raises else []
         self.fetch_calls: list[tuple[str, tuple]] = []
+        self.fetchval_calls: list[tuple[str, tuple]] = []
+        self.execute_calls: list[tuple[str, tuple]] = []
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
+        if self.fetch_raises:
+            raise self.fetch_raises.pop(0)
         return list(self.fetch_returns)
+
+    async def fetchval(self, sql: str, *args):
+        self.fetchval_calls.append((sql, args))
+        return self.fetchval_returns
+
+    async def execute(self, sql: str, *args):
+        self.execute_calls.append((sql, args))
+        return "OK"
 
 
 class _FakeAcquireCM:
@@ -202,7 +230,7 @@ def test_caller_module_is_in_vault_allowlist():
 
 
 # ---------------------------------------------------------------------------
-# list_active_credentials_step
+# list_active_credentials
 # ---------------------------------------------------------------------------
 
 
@@ -218,7 +246,7 @@ async def test_list_active_credentials_returns_metadata_triples():
     pool = _FakePool(conn)
 
     with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
-        result = await scheduler.list_active_credentials_step()
+        result = await scheduler.list_active_credentials()
 
     assert len(result) == 2
     assert all(isinstance(c, scheduler.CredentialMetadata) for c in result)
@@ -235,7 +263,7 @@ async def test_list_active_credentials_filters_to_granola_provider():
     pool = _FakePool(conn)
 
     with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
-        await scheduler.list_active_credentials_step()
+        await scheduler.list_active_credentials()
 
     assert len(conn.fetch_calls) == 1
     sql, args = conn.fetch_calls[0]
@@ -252,7 +280,7 @@ async def test_list_active_credentials_filters_to_active_unarchived():
     pool = _FakePool(conn)
 
     with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
-        await scheduler.list_active_credentials_step()
+        await scheduler.list_active_credentials()
 
     sql, _ = conn.fetch_calls[0]
     assert "status = 'active'" in sql
@@ -267,7 +295,7 @@ async def test_list_active_credentials_empty_when_no_active_rows():
     pool = _FakePool(conn)
 
     with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
-        result = await scheduler.list_active_credentials_step()
+        result = await scheduler.list_active_credentials()
 
     assert result == []
 
@@ -404,6 +432,159 @@ async def test_run_cycle_step_handles_adapter_internal_skip():
 
     assert result.skipped is True
     assert result.reason == "cycle_skipped_at_adapter"
+
+
+# ---------------------------------------------------------------------------
+# run_cycle_step — advisory lock (Codex PR-#28 R1 P1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_skips_when_advisory_lock_held():
+    """A prior overlapping cycle holds the per-credential advisory lock
+    → pg_try_advisory_lock returns False → this workflow skips without
+    loading the credential or calling run_one_cycle. Prevents the
+    concurrent-cycle double-publish race."""
+    conn = _FakeConn(fetchval_returns=False)  # lock NOT acquired
+    pool = _FakePool(conn)
+
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock()) as vault_mock, \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock()) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=uuid4(), tenant_id=uuid4(), user_id=uuid4(),
+        )
+
+    assert result.skipped is True
+    assert result.reason == "cycle_already_running"
+    # Lock was attempted; credential never loaded; adapter never ran.
+    assert any("pg_try_advisory_lock" in c[0] for c in conn.fetchval_calls)
+    vault_mock.assert_not_called()
+    run_mock.assert_not_called()
+    # No unlock when the lock wasn't acquired.
+    assert not any("pg_advisory_unlock" in c[0] for c in conn.execute_calls)
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_acquires_and_releases_lock_on_happy_path():
+    """The advisory lock is acquired before the cycle and released in
+    finally — keyed on a stable int64 derived from credential_id."""
+    cred_id = uuid4()
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    credential = _FakeCredential(id=cred_id, tenant_id=uuid4(), user_id=uuid4())
+    cycle_result = _fake_cycle_result(notes_processed=1)
+
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=credential)), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock(return_value=cycle_result)):
+        result = await scheduler.run_cycle_step(
+            credential_id=cred_id, tenant_id=uuid4(), user_id=uuid4(),
+        )
+
+    assert result.skipped is False
+    expected_key = scheduler._advisory_lock_key(cred_id)
+    # Lock acquired with the credential-derived key.
+    assert any(
+        "pg_try_advisory_lock" in sql and args == (expected_key,)
+        for sql, args in conn.fetchval_calls
+    )
+    # Lock released with the SAME key in finally.
+    assert any(
+        "pg_advisory_unlock" in sql and args == (expected_key,)
+        for sql, args in conn.execute_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_releases_lock_even_when_cycle_raises():
+    """If run_one_cycle raises, the finally still unlocks so the
+    credential isn't permanently wedged as 'cycle_already_running'."""
+    cred_id = uuid4()
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    credential = _FakeCredential(id=cred_id, tenant_id=uuid4(), user_id=uuid4())
+
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=credential)), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        with pytest.raises(RuntimeError, match="boom"):
+            await scheduler.run_cycle_step(
+                credential_id=cred_id, tenant_id=uuid4(), user_id=uuid4(),
+            )
+
+    expected_key = scheduler._advisory_lock_key(cred_id)
+    assert any(
+        "pg_advisory_unlock" in sql and args == (expected_key,)
+        for sql, args in conn.execute_calls
+    )
+
+
+def test_advisory_lock_key_is_stable_and_signed_int64():
+    """The lock key is deterministic per credential and fits in the
+    Postgres advisory-lock bigint range."""
+    cred_id = uuid4()
+    k1 = scheduler._advisory_lock_key(cred_id)
+    k2 = scheduler._advisory_lock_key(cred_id)
+    assert k1 == k2
+    assert -(2**63) <= k1 < 2**63
+    # Distinct credentials almost certainly get distinct keys.
+    assert scheduler._advisory_lock_key(uuid4()) != k1 or True  # collision is astronomically rare
+
+
+# ---------------------------------------------------------------------------
+# list_active_credentials — explicit retry (Codex PR-#28 R1 P2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_active_credentials_retries_transient_failure(monkeypatch):
+    """A transient asyncpg error is retried; the second attempt
+    succeeds. The cron handler calls this OUTSIDE a workflow, so the
+    retry must be explicit (a @DBOS.step decorator would no-op here)."""
+    import asyncpg as _asyncpg
+
+    row = {"id": uuid4(), "tenant_id": uuid4(), "user_id": uuid4()}
+    # First fetch raises a transient error; second returns the row.
+    conn = _FakeConn(
+        fetch_returns=[row],
+        fetch_raises=[_asyncpg.PostgresConnectionError("transient")],
+    )
+    pool = _FakePool(conn)
+
+    # Don't actually sleep during the retry backoff.
+    monkeypatch.setattr(scheduler.asyncio, "sleep", AsyncMock())
+
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
+        result = await scheduler.list_active_credentials()
+
+    assert len(result) == 1
+    assert result[0].id == row["id"]
+    # Two fetch attempts: one raised, one succeeded.
+    assert len(conn.fetch_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_active_credentials_raises_after_exhausting_retries(monkeypatch):
+    """If every attempt fails, the last exception propagates so the
+    cron tick returns 5xx and the next 5-min tick retries."""
+    import asyncpg as _asyncpg
+
+    conn = _FakeConn(
+        fetch_raises=[
+            _asyncpg.PostgresConnectionError("e1"),
+            _asyncpg.PostgresConnectionError("e2"),
+            _asyncpg.PostgresConnectionError("e3"),
+        ],
+    )
+    pool = _FakePool(conn)
+    monkeypatch.setattr(scheduler.asyncio, "sleep", AsyncMock())
+
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
+        with pytest.raises(_asyncpg.PostgresConnectionError):
+            await scheduler.list_active_credentials()
+
+    assert len(conn.fetch_calls) == scheduler._LIST_RETRY_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------

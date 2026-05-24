@@ -20,14 +20,20 @@ driver prefix or those params, so we strip them here and promote
 ``sslmode=require`` to an explicit SSL context — mirroring the
 SQLAlchemy engine's setup in :func:`services.database.get_database_url`.
 
-Sizing: the pool defaults to ``min_size=1, max_size=5``. Phase 2e's
+Sizing: the pool defaults to ``min_size=1, max_size=10``. Phase 2e's
 peak load is one workflow per active credential per 5 min, capped by
 the DBOS Queue at 5 concurrent workflows (per LOCKED-39 +
 :data:`services.granola_ingestion.scheduler.GRANOLA_POLL_QUEUE`'s
-``concurrency=5``). Each workflow acquires at most a few connections
-sequentially (vault decrypt → adapter cycle → per-note SQL). 5 keeps
-us well under Neon's per-database connection limit while still
-admitting parallelism. Future tuning via env var if observed traffic
+``concurrency=5``). Each concurrent cycle holds ONE connection for its
+whole duration — the per-credential advisory lock that serializes
+overlapping cycles (Codex PR-#28 R1 P1) — PLUS up to one transient
+connection at a time for the ``external_integration_runs`` / credential
+SQL (the adapter's other DB access goes through the separate SQLAlchemy
+engine, not this pool). Peak is therefore ``2 × concurrency`` = 10. The
+invariant ``max_size >= 2 × GRANOLA_POLL_QUEUE.concurrency`` MUST hold or
+the held lock connections can starve the transient acquires and
+deadlock the cron tick. 10 stays well under Neon's per-database
+connection limit. Future tuning via env var if observed traffic
 demands it.
 """
 
@@ -48,7 +54,10 @@ _pool: Optional[asyncpg.Pool] = None
 _lock: asyncio.Lock = asyncio.Lock()
 
 _DEFAULT_MIN_SIZE = 1
-_DEFAULT_MAX_SIZE = 5
+# Invariant: must be >= 2 × GRANOLA_POLL_QUEUE.concurrency (see module
+# docstring) — each concurrent cycle holds 1 advisory-lock connection
+# for its whole duration plus up to 1 transient connection for SQL.
+_DEFAULT_MAX_SIZE = 10
 
 
 def _resolve_dsn_and_kwargs() -> tuple[str, dict]:

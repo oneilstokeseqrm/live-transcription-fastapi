@@ -24,9 +24,8 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -103,7 +102,7 @@ def test_cron_tick_constant_time_compare_handles_length_mismatch(client, monkeyp
 
 
 def _patch_dispatch(*, credentials: list[CredentialMetadata]):
-    """Patch list_active_credentials_step + GRANOLA_POLL_QUEUE.enqueue_async.
+    """Patch list_active_credentials + GRANOLA_POLL_QUEUE.enqueue_async.
 
     Returns a tuple (list_mock, enqueue_mock, captured_workflow_ids).
     The SetWorkflowID context manager is wrapped to capture the
@@ -129,6 +128,40 @@ def _patch_dispatch(*, credentials: list[CredentialMetadata]):
     return list_mock, enqueue_mock, set_id_mock, captured_ids
 
 
+def test_cron_tick_computes_cycle_window_before_listing_credentials(client, monkeypatch):
+    """Codex PR-#28 R1 P2: cycle_window MUST be captured BEFORE the
+    list_active_credentials await, else a tick near a :00/:05 boundary
+    could stamp workflow_ids with the next window and the following
+    real tick would dedup them away — silently dropping a 5-min poll
+    interval.
+
+    We assert call ordering: _current_cycle_window fires before
+    list_active_credentials."""
+    monkeypatch.setenv("INTERNAL_CRON_SECRET", _VALID_SECRET)
+    order: list[str] = []
+
+    def _window():
+        order.append("window")
+        return 999
+
+    async def _list():
+        order.append("list")
+        return []
+
+    with patch.object(granola_cron, "_current_cycle_window", side_effect=_window), \
+         patch.object(granola_cron, "list_active_credentials", new=_list):
+        resp = client.post(
+            "/internal/granola/cron-tick",
+            headers={"X-Internal-Cron-Secret": _VALID_SECRET},
+        )
+
+    assert resp.status_code == 202
+    assert resp.json()["cycle_window"] == 999
+    assert order == ["window", "list"], (
+        "cycle_window must be computed before the credential-listing await"
+    )
+
+
 def test_cron_tick_with_zero_credentials_returns_enqueued_zero(client, monkeypatch):
     """Pre-Phase-2f happy path: no active credentials → 202 with
     ``enqueued=0``. The scheduler runs every 5 min and exits cleanly
@@ -136,7 +169,7 @@ def test_cron_tick_with_zero_credentials_returns_enqueued_zero(client, monkeypat
     monkeypatch.setenv("INTERNAL_CRON_SECRET", _VALID_SECRET)
     list_mock, enqueue_mock, set_id_mock, _captured = _patch_dispatch(credentials=[])
 
-    with patch.object(granola_cron, "list_active_credentials_step", new=list_mock), \
+    with patch.object(granola_cron, "list_active_credentials", new=list_mock), \
          patch.object(granola_cron.GRANOLA_POLL_QUEUE, "enqueue_async", new=enqueue_mock), \
          patch.object(granola_cron, "SetWorkflowID", new=set_id_mock):
         resp = client.post(
@@ -162,7 +195,7 @@ def test_cron_tick_dispatches_one_workflow_per_credential(client, monkeypatch):
     ]
     list_mock, enqueue_mock, set_id_mock, captured_ids = _patch_dispatch(credentials=creds)
 
-    with patch.object(granola_cron, "list_active_credentials_step", new=list_mock), \
+    with patch.object(granola_cron, "list_active_credentials", new=list_mock), \
          patch.object(granola_cron.GRANOLA_POLL_QUEUE, "enqueue_async", new=enqueue_mock), \
          patch.object(granola_cron, "SetWorkflowID", new=set_id_mock):
         resp = client.post(
@@ -204,7 +237,7 @@ def test_cron_tick_same_credential_same_window_produces_same_workflow_id(client,
     fixed_window = 12345
     list_mock, enqueue_mock, set_id_mock, captured_ids = _patch_dispatch(credentials=[cred])
 
-    with patch.object(granola_cron, "list_active_credentials_step", new=list_mock), \
+    with patch.object(granola_cron, "list_active_credentials", new=list_mock), \
          patch.object(granola_cron.GRANOLA_POLL_QUEUE, "enqueue_async", new=enqueue_mock), \
          patch.object(granola_cron, "SetWorkflowID", new=set_id_mock), \
          patch.object(granola_cron, "_current_cycle_window", return_value=fixed_window):
@@ -236,7 +269,7 @@ def test_cron_tick_same_credential_different_window_produces_distinct_ids(client
     cred = CredentialMetadata(id=uuid4(), tenant_id=uuid4(), user_id=uuid4())
     list_mock, enqueue_mock, set_id_mock, captured_ids = _patch_dispatch(credentials=[cred])
 
-    with patch.object(granola_cron, "list_active_credentials_step", new=list_mock), \
+    with patch.object(granola_cron, "list_active_credentials", new=list_mock), \
          patch.object(granola_cron.GRANOLA_POLL_QUEUE, "enqueue_async", new=enqueue_mock), \
          patch.object(granola_cron, "SetWorkflowID", new=set_id_mock), \
          patch.object(granola_cron, "_current_cycle_window", side_effect=[100, 101]):

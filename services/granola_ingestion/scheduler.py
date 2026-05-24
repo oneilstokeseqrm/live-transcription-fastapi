@@ -8,7 +8,7 @@ LOCKED-39.
 
 * Railway cron POSTs every 5 min to ``/internal/granola/cron-tick``
   (:mod:`routers.granola_cron`).
-* The cron handler calls :func:`list_active_credentials_step` to find
+* The cron handler calls :func:`list_active_credentials` to find
   all active credentials, then for each row enqueues
   :func:`granola_poll_one_credential` via
   :data:`GRANOLA_POLL_QUEUE` + ``SetWorkflowID(f"granola_poll_{credential_id}_{cycle_window}")``.
@@ -52,18 +52,20 @@ it fall out of scope on return. The step returns only
 :class:`PollResult` (no secrets).
 
 **Until Phase 2f adds ``/connect``:** ``vault.user_credentials`` is
-empty; ``list_active_credentials_step`` returns ``[]``; no workflows
+empty; ``list_active_credentials`` returns ``[]``; no workflows
 run. The scheduler ships dormant but proves the dispatch path works
 end-to-end the day Phase 2f deploys.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional
 from uuid import UUID
 
+import asyncpg
 from dbos import DBOS, Queue
 
 from services.asyncpg_pool import get_asyncpg_pool
@@ -88,10 +90,16 @@ _CALLER_MODULE = "services.granola_ingestion.scheduler"
 
 _PROVIDER = "granola"
 
+# Explicit retry budget for list_active_credentials (Codex PR-#28 R1 P2).
+# The cron handler calls it OUTSIDE a workflow context, so a @DBOS.step
+# decorator's retry semantics would not fire — retries must be explicit.
+_LIST_RETRY_ATTEMPTS = 3
+_LIST_RETRY_BASE_DELAY_S = 0.5
+
 
 @dataclass(frozen=True)
 class CredentialMetadata:
-    """Identity triple returned by :func:`list_active_credentials_step`.
+    """Identity triple returned by :func:`list_active_credentials`.
 
     Carries only ``(id, tenant_id, user_id)`` — no encrypted key
     material, no folder config. The workflow uses this triple as
@@ -128,7 +136,7 @@ class PollResult:
 
 
 # ---------------------------------------------------------------------------
-# DBOS steps (I/O)
+# Credential listing (plain async helper — called from the cron handler)
 # ---------------------------------------------------------------------------
 
 
@@ -142,9 +150,22 @@ ORDER BY id ASC
 """
 
 
-@DBOS.step(retries_allowed=True, max_attempts=3)
-async def list_active_credentials_step() -> list[CredentialMetadata]:
+async def list_active_credentials() -> list[CredentialMetadata]:
     """List all active Granola credentials across all tenants.
+
+    Plain async helper — NOT a ``@DBOS.step``. The cron handler
+    (:mod:`routers.granola_cron`) calls this directly, OUTSIDE any
+    workflow context, where a ``@DBOS.step`` decorator's retry
+    semantics would not fire (the decorator degrades to a passthrough
+    coroutine off-workflow, so a transient ``asyncpg`` failure would
+    abort the whole tick on the first exception). Codex PR-#28 R1 P2.
+
+    Retries are therefore explicit: a transient ``asyncpg`` /
+    connection error is retried up to :data:`_LIST_RETRY_ATTEMPTS`
+    times with linear backoff so a connection blip doesn't skip an
+    entire 5-min poll interval. If every attempt fails, the exception
+    propagates → the cron tick returns 5xx → the next tick (5 min)
+    retries naturally.
 
     The single cross-tenant query in the scheduler — necessary because
     the cron handler must enumerate every active credential to
@@ -155,25 +176,57 @@ async def list_active_credentials_step() -> list[CredentialMetadata]:
 
     Returns :class:`CredentialMetadata` triples; encrypted key material
     is NOT loaded here. :func:`run_cycle_step` decrypts on demand
-    inside its own step scope so the cleartext never crosses a step
-    return boundary.
-
-    ``retries_allowed=True`` with ``max_attempts=3`` covers transient
-    asyncpg failures (connection drop). A persistent DB failure
-    surfaces as a workflow failure and the cron handler logs it; the
-    next 5-min tick retries naturally.
+    inside its own step scope so the cleartext never crosses a DBOS
+    step return boundary.
     """
     pool = await get_asyncpg_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(_LIST_ACTIVE_CREDENTIALS_SQL, _PROVIDER)
-    return [
-        CredentialMetadata(
-            id=row["id"],
-            tenant_id=row["tenant_id"],
-            user_id=row["user_id"],
-        )
-        for row in rows
-    ]
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, _LIST_RETRY_ATTEMPTS + 1):
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(_LIST_ACTIVE_CREDENTIALS_SQL, _PROVIDER)
+            return [
+                CredentialMetadata(
+                    id=row["id"],
+                    tenant_id=row["tenant_id"],
+                    user_id=row["user_id"],
+                )
+                for row in rows
+            ]
+        except (asyncpg.PostgresError, OSError) as exc:
+            last_exc = exc
+            if attempt < _LIST_RETRY_ATTEMPTS:
+                logger.warning(
+                    "list_active_credentials attempt %d/%d failed: %r; retrying",
+                    attempt, _LIST_RETRY_ATTEMPTS, exc,
+                )
+                await asyncio.sleep(_LIST_RETRY_BASE_DELAY_S * attempt)
+    assert last_exc is not None  # loop only exits via return or exhausted attempts
+    logger.error(
+        "list_active_credentials exhausted %d attempts; cron tick aborts, "
+        "next 5-min tick retries. Last error: %r",
+        _LIST_RETRY_ATTEMPTS, last_exc,
+    )
+    raise last_exc
+
+
+# ---------------------------------------------------------------------------
+# Per-credential cycle step (DBOS step — called from inside the workflow)
+# ---------------------------------------------------------------------------
+
+
+def _advisory_lock_key(credential_id: UUID) -> int:
+    """Derive a stable signed int64 lock key for ``pg_try_advisory_lock``.
+
+    Postgres advisory locks key on a ``bigint``. We take the UUID's
+    first 8 bytes as a signed big-endian int — deterministic per
+    credential, with negligible collision probability across the
+    credential population (a 64-bit space drawn from a v4 UUID's random
+    bits). Two credentials colliding would merely serialize their
+    cycles against each other — a throughput nit, never a correctness
+    bug.
+    """
+    return int.from_bytes(credential_id.bytes[:8], "big", signed=True)
 
 
 @DBOS.step(retries_allowed=False)
@@ -185,11 +238,34 @@ async def run_cycle_step(
 ) -> PollResult:
     """Load credential via vault and drive one adapter cycle.
 
-    Single step body keeps the decrypted ``api_key`` confined to
-    the local scope — it never appears in a step return value, so it
-    can't be persisted to ``dbos.operation_outputs`` via DBOS's pickle
-    replay machinery (which would defeat encryption-at-rest by
-    co-locating ciphertext + cleartext in the same Postgres).
+    **Per-credential serialization (Codex PR-#28 R1 P1).** The
+    dispatch ``workflow_id`` is ``granola_poll_{credential_id}_{cycle_window}``
+    — it dedups duplicate dispatches WITHIN a 5-min window but NOT
+    across windows. A cycle that overruns 5 min would otherwise let the
+    next cron tick (a new ``cycle_window`` → a new ``workflow_id`` →
+    no DBOS dedup) start a SECOND concurrent cycle for the same
+    credential. Two overlapping cycles race in
+    :func:`adapter.process_note`: both can read "no
+    ``external_integration_runs`` row" for the same new note BEFORE
+    either writes the ``in_progress`` anchor, mint different
+    ``eq_interaction_id`` values, and double-publish to Lane 1 / Lane 2
+    — and downstream consumers do NOT dedup because the ids differ.
+    The adapter's idempotency anchor only protects SEQUENTIAL retries
+    (crash + replay), not CONCURRENT cycles.
+
+    A session-scoped Postgres advisory lock keyed on ``credential_id``
+    serializes cycles: if a prior cycle still holds the lock, this
+    workflow exits as ``skipped`` and the next cron tick retries. The
+    lock is held on a dedicated pooled connection for the whole cycle
+    and released in ``finally`` (a process crash ends the session and
+    auto-releases it).
+
+    **Secret confinement.** The single step body keeps the decrypted
+    ``api_key`` confined to local scope — it never appears in a step
+    return value, so it can't be persisted to
+    ``dbos.operation_outputs`` via DBOS's pickle replay machinery
+    (which would defeat encryption-at-rest by co-locating ciphertext +
+    cleartext in the same Postgres).
 
     ``retries_allowed=False``: the adapter has its own per-note retry
     budget (5 attempts → ``FAILED_PERMANENT``) and its own
@@ -199,55 +275,91 @@ async def run_cycle_step(
     process crash still happens (DBOS resumes from the workflow's last
     completed step); just no per-step exception retries.
 
-    ``credential_id`` is unused at the SQL level (the vault accessor
-    keys on ``(tenant_id, user_id, provider, status=active)``) but is
-    kept as an explicit workflow input so the dispatch ``workflow_id``
-    construction (which uses the credential UUID) and the workflow's
-    log lines line up cleanly with what the cron handler dispatched.
+    ``credential_id`` is unused at the vault-SQL level (the accessor
+    keys on ``(tenant_id, user_id, provider, status=active)``) but it
+    IS the advisory-lock key + the dispatch ``workflow_id`` component,
+    and it anchors the log lines to what the cron handler dispatched.
     """
     pool = await get_asyncpg_pool()
+    lock_key = _advisory_lock_key(credential_id)
 
-    credential = await get_granola_credential_for_user(
-        tenant_id=tenant_id,
-        user_id=user_id,
-        caller_module=_CALLER_MODULE,
-        pool=pool,
-    )
-    if credential is None:
-        # No active credential row. Happens if /disconnect (Phase 2f
-        # soft-delete) ran between the cron-tick's
-        # list_active_credentials_step and this workflow's actual
-        # execution. Not an error; the next cron tick will simply not
-        # dispatch this credential_id.
-        logger.info(
-            "run_cycle_step: no active credential for tenant=%s user=%s "
-            "(dispatched credential_id=%s); short-circuiting",
-            tenant_id, user_id, credential_id,
+    async with pool.acquire() as lock_conn:
+        got_lock = await lock_conn.fetchval(
+            "SELECT pg_try_advisory_lock($1)", lock_key
         )
-        return PollResult(
-            skipped=True, reason="credential_not_active_or_archived"
-        )
+        if not got_lock:
+            logger.info(
+                "run_cycle_step: credential_id=%s cycle already running "
+                "(advisory lock held by a prior overlapping cycle); "
+                "skipping this window — next tick retries",
+                credential_id,
+            )
+            return PollResult(skipped=True, reason="cycle_already_running")
 
-    # The vault accessor's WHERE clause already filters status='active'
-    # AND archived_at IS NULL, but a future relaxation of that filter
-    # would let this guard kick in. Defensive but correct now.
-    if credential.status != "active":
-        return PollResult(skipped=True, reason=f"credential_status={credential.status!r}")
+        try:
+            credential = await get_granola_credential_for_user(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                caller_module=_CALLER_MODULE,
+                pool=pool,
+            )
+            if credential is None:
+                # No active credential row. Happens if /disconnect
+                # (Phase 2f soft-delete) ran between the cron-tick's
+                # list_active_credentials and this workflow's actual
+                # execution. Not an error; the next cron tick will
+                # simply not dispatch this credential_id.
+                logger.info(
+                    "run_cycle_step: no active credential for tenant=%s "
+                    "user=%s (dispatched credential_id=%s); short-circuiting",
+                    tenant_id, user_id, credential_id,
+                )
+                return PollResult(
+                    skipped=True, reason="credential_not_active_or_archived"
+                )
 
-    cycle_result = await run_one_cycle(credential=credential, pool=pool)
+            # The vault accessor's WHERE clause already filters
+            # status='active' AND archived_at IS NULL, but a future
+            # relaxation of that filter would let this guard kick in.
+            # Defensive but correct now.
+            if credential.status != "active":
+                return PollResult(
+                    skipped=True, reason=f"credential_status={credential.status!r}"
+                )
 
-    if cycle_result.credential_skipped:
-        # The adapter's own early-out (status check inside run_one_cycle).
-        # In practice this branch is dead-coded by the status check
-        # above, but the adapter is the source of truth for cycle
-        # state — surface its decision.
-        return PollResult(skipped=True, reason="cycle_skipped_at_adapter")
+            cycle_result = await run_one_cycle(credential=credential, pool=pool)
 
-    return PollResult(
-        notes_processed=cycle_result.notes_processed,
-        deferred_reprocessed=cycle_result.deferred_reprocessed,
-        credential_error_code=cycle_result.credential_error_code,
-    )
+            if cycle_result.credential_skipped:
+                # The adapter's own early-out (status check inside
+                # run_one_cycle). In practice dead-coded by the status
+                # check above, but the adapter is the source of truth
+                # for cycle state — surface its decision.
+                return PollResult(skipped=True, reason="cycle_skipped_at_adapter")
+
+            return PollResult(
+                notes_processed=cycle_result.notes_processed,
+                deferred_reprocessed=cycle_result.deferred_reprocessed,
+                credential_error_code=cycle_result.credential_error_code,
+            )
+        finally:
+            # Release the advisory lock BEFORE the connection returns to
+            # the pool. Session-scoped advisory locks persist on the
+            # physical connection across pool checkout/checkin, so an
+            # explicit unlock is required — without it the lock would
+            # leak on a pooled connection and block this credential's
+            # future cycles until that connection is recycled. A unlock
+            # failure (rare) is logged loudly; a process crash ends the
+            # session and auto-releases the lock.
+            try:
+                await lock_conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
+            except Exception:  # noqa: BLE001 — unlock must not mask the cycle result
+                logger.exception(
+                    "run_cycle_step: pg_advisory_unlock failed for "
+                    "credential_id=%s (lock_key=%d). Lock may leak on this "
+                    "pooled connection until recycled; next cycle for this "
+                    "credential could skip as 'cycle_already_running'.",
+                    credential_id, lock_key,
+                )
 
 
 # ---------------------------------------------------------------------------

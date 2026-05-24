@@ -8,10 +8,11 @@ authenticated by the ``X-Internal-Cron-Secret`` header. The handler:
 
 1. Validates the cron secret (constant-time compare via
    :func:`secrets.compare_digest`).
-2. Computes the current cycle_window (= unix_minute // 5) so the
-   dispatched ``workflow_id`` values dedup across overlapping cycles.
+2. Computes the current cycle_window (= unix_minute // 5) BEFORE the DB
+   query so the dispatched ``workflow_id`` values dedup across
+   overlapping cycles without a clock-boundary slip.
 3. Calls
-   :func:`services.granola_ingestion.scheduler.list_active_credentials_step`
+   :func:`services.granola_ingestion.scheduler.list_active_credentials`
    to discover active credentials.
 4. For each credential, dispatches
    :func:`~services.granola_ingestion.scheduler.granola_poll_one_credential`
@@ -54,7 +55,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from services.granola_ingestion.scheduler import (
     GRANOLA_POLL_QUEUE,
     granola_poll_one_credential,
-    list_active_credentials_step,
+    list_active_credentials,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,9 +152,16 @@ async def granola_cron_tick(
     duplicate tick within the same 5-min window produces the same
     workflow_ids and DBOS dedups (the second
     ``enqueue_async`` returns the existing handle).
+
+    ``cycle_window`` is captured BEFORE listing credentials (Codex
+    PR-#28 R1 P2): computing it after the DB ``await`` could let a
+    tick that starts just before a ``:00/:05`` boundary list
+    credentials in one window but stamp their workflow_ids with the
+    NEXT window — the following real tick would then dedup against
+    those ids and silently drop an entire 5-min poll interval.
     """
-    credentials = await list_active_credentials_step()
     cycle_window = _current_cycle_window()
+    credentials = await list_active_credentials()
     enqueued = 0
 
     for credential in credentials:
