@@ -215,31 +215,38 @@ async def clean_text(body: TextCleanRequest, request: Request):
         # await followed by ``asyncio.create_task(_lane2_intelligence())``.
         # The Granola ingestion adapter (PR-X2) calls this same helper to
         # avoid duplicating the publish + dispatch + safety-net logic.
+        #
+        # ``process()`` owns the slot lifecycle from the moment we call it:
+        # on success it consumes the slot via Lane 2 dispatch (released by
+        # ``_on_done`` when the background task completes); on Lane1PublishError
+        # OR any other exception (e.g. ``asyncio.create_task`` failing during
+        # shutdown), ``process()``'s own ``finally`` releases the slot. The
+        # router MUST mark the slot as no-longer-held in BOTH paths, otherwise
+        # the outer ``finally`` double-decrements the counter and breaks
+        # backpressure for subsequent requests (Codex PR-X1 R1 P2 finding).
         try:
-            result = await text_clean_service.process(
-                envelope=envelope,
-                lane2_extras=text_clean_service.Lane2Extras(
-                    cleaned_transcript=cleaned_text,
-                    contact_ids=enrichment.contact_ids or None,
-                    calendar_event_id=enrichment.calendar_event_id,
-                    enrichment_confidence=enrichment.match_confidence,
-                    enrichment_match_method=enrichment.match_method,
-                ),
-            )
+            try:
+                result = await text_clean_service.process(
+                    envelope=envelope,
+                    lane2_extras=text_clean_service.Lane2Extras(
+                        cleaned_transcript=cleaned_text,
+                        contact_ids=enrichment.contact_ids or None,
+                        calendar_event_id=enrichment.calendar_event_id,
+                        enrichment_confidence=enrichment.match_confidence,
+                        enrichment_match_method=enrichment.match_method,
+                    ),
+                )
+            finally:
+                # Transfer slot ownership unconditionally: process() now owns
+                # it on every exit path (return, Lane1PublishError, or any
+                # other raise). See block comment above for the double-
+                # decrement bug this prevents.
+                slot_held = False
         except text_clean_service.Lane1PublishError:
-            # ``process()`` already released the slot via its own finally
-            # block before raising — mark slot as no-longer-held so our
-            # outer finally is a no-op.
-            slot_held = False
             raise HTTPException(
                 status_code=502,
                 detail="Could not publish interaction envelope downstream",
             )
-
-        # ``process()`` consumed the slot by handing it off to a Lane 2
-        # background task; ``_on_done`` releases it when that task
-        # completes. The outer ``finally`` must leave the counter alone.
-        slot_held = False
 
         logger.info(
             f"Text cleaning response dispatched (Lane 2 running in background): "

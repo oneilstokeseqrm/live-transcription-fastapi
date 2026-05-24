@@ -370,6 +370,52 @@ async def test_process_releases_slot_on_lane1_failure():
 
 
 @pytest.mark.asyncio
+async def test_process_releases_slot_on_non_lane1_failure():
+    """A non-Lane1 raise from process() (e.g. asyncio.create_task fails during
+    shutdown) MUST release the slot exactly once via process()'s own finally.
+
+    Codex PR-X1 R1 P2 caught a double-decrement bug: pre-fix, the router's
+    outer finally only cleared ``slot_held`` for ``Lane1PublishError``, so any
+    other raise from process() (after the Lane 1 publish completes but before
+    Lane 2 is dispatched) decremented the counter twice — once in process()'s
+    finally, once in the router's. With the fix, process() always owns the
+    slot and the router stays at exactly one decrement per failure.
+    """
+    assert try_reserve_lane2_slot()
+    assert text_clean_service.get_lane2_in_flight() == 1
+
+    publisher_instance = MagicMock()
+    publisher_instance.publish_envelope = AsyncMock(
+        return_value={"kinesis_sequence": "seq-1", "eventbridge_id": "evt-1"}
+    )
+    pub_patch = patch(
+        "services.text_clean_service.AWSEventPublisher",
+        return_value=publisher_instance,
+    )
+
+    # Trigger a non-Lane1 failure in the post-publish path: replace
+    # _BACKGROUND_TASKS with a mock whose ``add`` raises. This simulates
+    # the realistic class of failure (asyncio.create_task / task tracking
+    # blowing up during shutdown, OOM, or a future refactor adding code
+    # in the gap between Lane 1 publish and slot_handed_off=True).
+    fake_tasks = MagicMock()
+    fake_tasks.add.side_effect = RuntimeError("simulated post-publish failure")
+
+    int_patch, intelligence_instance = _patch_intelligence_service()
+
+    with pub_patch, int_patch, \
+         patch.object(text_clean_service, "_BACKGROUND_TASKS", fake_tasks):
+        with pytest.raises(RuntimeError, match="simulated post-publish failure"):
+            await process(envelope=_build_envelope(), lane2_extras=None)
+
+    # Lane 1 ran (publish succeeded before the failure).
+    publisher_instance.publish_envelope.assert_awaited_once()
+    # The slot was released exactly ONCE by process()'s finally — counter
+    # back to 0, not -1.
+    assert text_clean_service.get_lane2_in_flight() == 0
+
+
+@pytest.mark.asyncio
 async def test_lane1_publish_error_preserves_underlying_cause():
     """Lane1PublishError chains the original exception via __cause__."""
     assert try_reserve_lane2_slot()
