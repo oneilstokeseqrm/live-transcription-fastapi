@@ -2318,3 +2318,274 @@ lesson updates it with the "extending past 4 rounds is justified when
 each round finds real bugs at new surfaces" amendment.
 
 
+## Prisma 5.22 DMMF omits `model.schema` for generators (2026-05-24)
+
+### Lesson
+
+Prisma 5.22's DMMF (sent via JSON-RPC to all third-party generators)
+does NOT include a `schema` field on `Model` objects, even for models
+with `@@schema()` annotations under multiSchema. The only schema info
+in the DMMF is `datasources[0].schemas: ["public", "vault", ...]` —
+the LIST of declared schemas, but not the per-model mapping.
+
+Third-party generators that read `model.schema` (declared as
+`string | null` on Model in `@prisma/dmmf` 7.x TypeScript types)
+always read `undefined` under 5.22. Such generators emit unqualified
+SQL like `COMMENT ON TABLE "foo"` instead of `"schema"."foo"`. For
+public-schema tables this still works (Postgres `search_path`
+includes `public`); for non-default schemas it fails with relation-
+not-found.
+
+### Why
+
+2026-05-24 comments-generator bug investigation: empirically verified
+via a probe generator. The DMMF received by generators from
+Prisma 5.22 CLI contains 140 models with keys `[name, dbName, fields,
+primaryKey, uniqueFields, uniqueIndexes, isGenerated, documentation]`
+— no `schema` anywhere. The 2.3M-line full DMMF JSON contained zero
+`"vault"` references outside the `datasources` block and free-form
+documentation comments.
+
+This means generators written against 6.x/7.x DMMF types (where
+`model.schema` is declared) silently fail when run on 5.x. They
+"work" for single-schema setups (everything resolves to `public` via
+`search_path`) but break the moment you introduce a second schema.
+
+### How to apply
+
+1. **For projects on Prisma 5.x with third-party generators that
+   touch multiSchema models:** assume the generator can't read
+   `model.schema`. Either:
+   - Configure the generator to skip non-default-schema tables
+     (e.g., the comments-generator's `ignorePattern`)
+   - Hand-write static SQL for the non-default-schema parts
+   - Upgrade Prisma to 7.x (major migration; out of scope as a quick
+     fix; tracked under Linear EQ-11 family for eq-frontend)
+
+2. **Before introducing multiSchema to ANY Prisma 5.x project**,
+   audit every `generator X { provider = "..." }` block in
+   `schema.prisma`. Run a local `prisma generate` and inspect the
+   output for unqualified references to the new-schema tables.
+
+3. **The "generator IS multiSchema-aware" signal can mislead.** Even
+   if the generator's source code uses `model.schema` correctly, the
+   DMMF it receives in your Prisma version may not populate that
+   field. The generator's TypeScript type assertion is forward-
+   looking; the actual JSON-RPC payload from your CLI version is
+   what matters.
+
+### Related
+
+[[feedback_envelope_contract_immutable]] — same family: don't trust
+that an upstream contract gives you the field you expect; verify
+empirically with a probe.
+
+
+## P3009 leftover failed-migration record blocks all subsequent migrations (2026-05-24)
+
+### Lesson
+
+When `prisma migrate deploy` applies a migration that fails, Prisma
+inserts a row into `_prisma_migrations` with `finished_at = NULL`,
+`applied_steps_count = 0`, `rolled_back_at = NULL`, and `logs`
+containing the failure detail. **Every subsequent `prisma migrate
+deploy` call refuses to apply any migrations until that row is
+explicitly resolved**, raising P3009:
+
+```
+migrate found failed migrations in the target database, new migrations
+will not be applied. Read more about how to resolve migration issues
+in a production database: https://pris.ly/d/migrate-resolve
+```
+
+This means: even after you fix the root cause of the original
+migration failure and push a corrected migration, your build will
+KEEP FAILING with P3009 until you mark the original failed migration
+as either `rolled-back` (most common — Prisma migrations are
+transaction-atomic, so a failed migration rolls back fully with no
+partial state) or `applied` (use only if you've manually applied
+the migration's contents some other way).
+
+### Why
+
+2026-05-24: PR #418's first Vercel build failed at the
+`update_comments` migration step. Subsequent build (with the fix)
+still failed — same error pattern but new diagnostic: P3009. The
+build never even got to the corrected migration; Prisma was refusing
+to do anything because the OLD failed migration row was still in
+`_prisma_migrations` blocking the queue. Fix took ~10 seconds (one
+SQL UPDATE) once we knew the right tool.
+
+The cognitive trap: it looked like the original fix didn't work
+because the build still failed. In reality the fix worked perfectly —
+a different problem (leftover failure record) was now in the way.
+
+### How to apply
+
+1. **When a Prisma migration fails in production, the FIRST recovery
+   step after fixing the root cause is to resolve the failed row.**
+   Two options:
+   ```bash
+   # Official command (requires production DATABASE_URL access)
+   prisma migrate resolve --rolled-back <migration_name>
+
+   # OR direct SQL (via Neon MCP / Postgres client)
+   UPDATE _prisma_migrations
+   SET rolled_back_at = NOW()
+   WHERE migration_name = '<migration_name>'
+     AND finished_at IS NULL
+     AND rolled_back_at IS NULL;
+   ```
+
+2. **`--rolled-back` is correct when the failed migration didn't
+   apply any statements.** Prisma migrations run in a single
+   transaction by default — atomic failure = full rollback = no
+   partial state. Check `applied_steps_count`; if 0, `--rolled-back`
+   is safe.
+
+3. **`--applied` is correct only if you manually applied the
+   migration's contents outside Prisma's tracking.** Rarely needed.
+
+4. **The error message points at the right doc:** `pris.ly/d/migrate-
+   resolve`. Read it before guessing.
+
+5. **Watch for the "two-failure cascade" pattern:**
+   - Build 1 fails because of the actual bug
+   - You fix the bug, push, Build 2 still fails — but now with P3009
+   - The fix didn't fail; the OLD failure record blocks the queue
+
+### Related
+
+[[feedback_envelope_contract_immutable]] — same family of "database
+state survives across builds in ways that affect later builds."
+
+
+## pnpm + tools with wide major-version ranges may resolve different majors than your project (2026-05-24)
+
+### Lesson
+
+When a transitive dependency declares a peer range like
+`@prisma/generator-helper: ^5 || ^6 || ^7`, pnpm will resolve it to
+the NEWEST compatible major (often newer than your project's main
+Prisma version). The result: your project says `"prisma": "^5.22.0"`
+in package.json but `node_modules/@prisma/generator-helper/package.json`
+shows `"version": "7.5.0"`. The CLI runs at 5.22; the generator-helper
+the CLI invokes runs at 7.x. They communicate via JSON-RPC, so the
+JSON wire format is determined by the CLI; the helper just parses
+whatever JSON it receives.
+
+This split usually works (the JSON format is stable enough across
+majors). It breaks when the helper's TypeScript types declare fields
+that the CLI's JSON doesn't actually emit. Generators written against
+the helper's types then read `undefined` for those fields.
+
+### Why
+
+2026-05-24: comments-generator bug investigation. The bug looked like
+"generator doesn't handle multiSchema." But the generator's source
+code DID handle multiSchema (`model.schema ?? void 0`, joinNames
+helper). The real issue: the generator-helper at 7.5.0 declared
+`schema: string | null` on Model, so the generator's TypeScript
+checked out. But the Prisma 5.22 CLI doesn't emit that field in its
+DMMF JSON. The generator-helper "type lies" because it's a forward
+declaration of what 7.x CLIs will emit, not what 5.x CLIs do emit.
+
+### How to apply
+
+1. **When debugging a third-party generator that "should work" but
+   doesn't, check ALL the related Prisma packages' resolved
+   versions** — not just `prisma` and `@prisma/client`. Specifically
+   check `@prisma/generator-helper`, `@prisma/internals`,
+   `@prisma/dmmf` (added in 7.x). Run:
+   ```bash
+   ls node_modules/.pnpm | grep '@prisma+'
+   ```
+   to see all installed Prisma sub-packages and their versions.
+
+2. **A multi-major peer range is a smell.** Tools that declare
+   `^5 || ^6 || ^7` are usually written for a NEWER major and pnpm
+   will resolve to the newest one. If your project is on the OLDEST
+   of those majors, the tool may use APIs your CLI doesn't support.
+
+3. **Pin generator-related Prisma packages via pnpm overrides** if
+   you need to force them to match your CLI:
+   ```json
+   "pnpm": {
+     "overrides": {
+       "@prisma/generator-helper": "^5.22.0",
+       "@prisma/internals": "^5.22.0"
+     }
+   }
+   ```
+   But verify the generator actually still works after pinning —
+   it may not.
+
+4. **The TypeScript type signal is forward-looking, the JSON wire
+   format is backward-compatible-only.** Don't trust the type; verify
+   the actual JSON.
+
+### Related
+
+[[feedback_envelope_contract_immutable]] — same family: contracts
+declared in types can lie about runtime reality; verify via probe.
+
+
+## Vercel preview builds can run against the same production database
+(this setup, 2026-05-24)
+
+### Lesson
+
+In eq-frontend's current Vercel + Neon configuration, **preview
+builds connect to and apply migrations against the SAME production
+Neon database** as production deploys. There is no separate preview/
+staging database. Confirmed empirically: a preview build of PR #418
+applied the granola_vault_schema migration to the production Neon DB
+BEFORE the PR was merged.
+
+This changes the blast-radius math for Vercel preview builds. They
+are not "isolated sandboxes" — they are read+write against the live
+production DB.
+
+### Why
+
+2026-05-24: when investigating the comments-generator bug, queried
+Neon's `_prisma_migrations` table on the production branch and found
+`20260523100441_granola_vault_schema` had `finished_at` set — meaning
+the migration ran successfully despite the PR being unmerged. The
+build log confirmed: `Datasource "db": PostgreSQL database "neondb"`
+pointing at the same `ep-silent-waterfall-adtinpn1` endpoint as
+production. Vercel env vars apparently point all build environments
+(preview + production) at the same Neon production branch.
+
+### How to apply
+
+1. **Treat Vercel preview builds with the same caution as production
+   deploys for anything that touches the database.** Schema
+   migrations, data backfills, destructive operations — they all run
+   against production state during the preview build.
+
+2. **When a Vercel preview applies a migration, it IS applied to
+   production.** Subsequent attempts to "merge cleanly" don't get to
+   re-apply that migration; production already has it. This can be
+   helpful (failed migrations don't have to wait for merge to be
+   diagnosed) but is also dangerous (a buggy preview migration
+   corrupts production before review).
+
+3. **For projects where this matters more (production with real
+   users), consider isolating preview to a Neon branch.** Neon
+   supports per-PR branches; Vercel can be configured to use them
+   via per-environment DATABASE_URL settings. Phase 2.1 hardening
+   for eq-frontend (if it grows beyond design partners).
+
+4. **The implication for our handoff discipline:** when reasoning
+   about "what's in production state", check the Neon production
+   branch directly — don't assume the PR being unmerged means its
+   DB-state changes are also unmerged. They may already be applied.
+
+### Related
+
+[[shared-infrastructure-collision]] — same family: shared production
+state can be modified by unmerged work; the merge gate is not the
+state gate.
+
+
