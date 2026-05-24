@@ -125,8 +125,8 @@ def test_text_clean_returns_before_lane_2_completes(client, valid_headers):
     cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
 
     with patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
-         patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
-         patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+         patch("services.text_clean_service.IntelligenceService", return_value=intelligence_instance), \
+         patch("services.text_clean_service.AWSEventPublisher", return_value=publisher_instance), \
          patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
          patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
 
@@ -184,8 +184,8 @@ def test_text_clean_lane2_still_completes_after_response(client, valid_headers):
     cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
 
     with patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
-         patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
-         patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+         patch("services.text_clean_service.IntelligenceService", return_value=intelligence_instance), \
+         patch("services.text_clean_service.AWSEventPublisher", return_value=publisher_instance), \
          patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
          patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
 
@@ -236,10 +236,10 @@ def test_text_clean_lane2_exception_is_logged_not_silenced(
     cleaner_instance = MagicMock()
     cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
 
-    with caplog.at_level(logging.ERROR, logger="routers.text"), \
+    with caplog.at_level(logging.ERROR, logger="services.text_clean_service"), \
          patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
-         patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
-         patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+         patch("services.text_clean_service.IntelligenceService", return_value=intelligence_instance), \
+         patch("services.text_clean_service.AWSEventPublisher", return_value=publisher_instance), \
          patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
          patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
 
@@ -271,6 +271,13 @@ def test_text_clean_lane2_exception_is_logged_not_silenced(
     ), "No ERROR log carries the actual Lane 2 exception."
 
 
+# Lane 2 backpressure + Lane 1 publish + Lane 2 dispatch state moved to
+# services.text_clean_service in PR-X1 of the Granola integration. Tests
+# that poke at the in-flight counter / background task set point at the
+# new module here. The /text/clean endpoint still owns the 503 translation
+# + WARNING log, so the backpressure test's caplog stays on "routers.text".
+
+
 def test_text_clean_backpressure_returns_503_when_at_capacity(
     client, valid_headers, caplog, monkeypatch
 ):
@@ -285,13 +292,13 @@ def test_text_clean_backpressure_returns_503_when_at_capacity(
     original fix — the v2 uses an atomic counter incremented BEFORE any
     await, so concurrent bursts cannot all observe the same stale count.
     """
-    import routers.text as text_module
+    import services.text_clean_service as text_clean_module
 
     # _max_background_tasks() reads the env var on each call so .env
     # changes take effect. Force the cap to 1 for this test.
     monkeypatch.setenv("TEXT_CLEAN_MAX_BG_TASKS", "1")
     # Pre-fill the in-flight counter to trip the check.
-    text_module._INFLIGHT_LANE2[0] = 1
+    text_clean_module._INFLIGHT_LANE2[0] = 1
     try:
         intelligence_instance = MagicMock()
         intelligence_instance.process_transcript = AsyncMock(return_value=MagicMock())
@@ -304,10 +311,13 @@ def test_text_clean_backpressure_returns_503_when_at_capacity(
         cleaner_instance = MagicMock()
         cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
 
+        # Backpressure WARNING log stays in routers.text (the endpoint owns the
+        # 503 translation + log); IntelligenceService + AWSEventPublisher
+        # patches point at services.text_clean_service (where they now live).
         with caplog.at_level(logging.WARNING, logger="routers.text"), \
              patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
-             patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
-             patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+             patch("services.text_clean_service.IntelligenceService", return_value=intelligence_instance), \
+             patch("services.text_clean_service.AWSEventPublisher", return_value=publisher_instance), \
              patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
              patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
 
@@ -317,7 +327,7 @@ def test_text_clean_backpressure_returns_503_when_at_capacity(
             }
             response = client.post("/text/clean", json=body, headers=valid_headers)
     finally:
-        text_module._INFLIGHT_LANE2[0] = 0
+        text_clean_module._INFLIGHT_LANE2[0] = 0
 
     assert response.status_code == 503
     assert response.headers.get("retry-after") == "60"
@@ -364,8 +374,8 @@ def test_text_clean_allows_null_publish_when_aws_disabled(
     cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
 
     with patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
-         patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
-         patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+         patch("services.text_clean_service.IntelligenceService", return_value=intelligence_instance), \
+         patch("services.text_clean_service.AWSEventPublisher", return_value=publisher_instance), \
          patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
          patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
 
@@ -406,10 +416,13 @@ def test_text_clean_lane1_failure_produces_5xx(client, valid_headers, caplog):
     cleaner_instance = MagicMock()
     cleaner_instance.clean_transcript = AsyncMock(return_value="Cleaned text content")
 
-    with caplog.at_level(logging.ERROR, logger="routers.text"), \
+    # Lane 1 ERROR log was emitted from routers.text pre-extraction; after
+    # PR-X1 it's emitted from services.text_clean_service where the
+    # publish call lives. Same message text ("Lane 1 (publishing) raised").
+    with caplog.at_level(logging.ERROR, logger="services.text_clean_service"), \
          patch("routers.text.BatchCleanerService", return_value=cleaner_instance), \
-         patch("routers.text.IntelligenceService", return_value=intelligence_instance), \
-         patch("routers.text.AWSEventPublisher", return_value=publisher_instance), \
+         patch("services.text_clean_service.IntelligenceService", return_value=intelligence_instance), \
+         patch("services.text_clean_service.AWSEventPublisher", return_value=publisher_instance), \
          patch("routers.text.TranscriptEnrichmentService", return_value=_build_enrichment_mock()), \
          patch("routers.text.get_tenant_internal_domains", new=AsyncMock(return_value=[])):
 
@@ -422,7 +435,7 @@ def test_text_clean_lane1_failure_produces_5xx(client, valid_headers, caplog):
     assert response.status_code == 502, (
         f"Lane 1 failure must surface as 502, got {response.status_code}: {response.text}. "
         "If this fails, Lane 1 publish has been silently moved back into the "
-        "background task — see routers/text.py and Codex P2 review notes."
+        "background task — see services/text_clean_service.py and Codex P2 review notes."
     )
     # Lane 2 must NOT have run: the response path is gated on Lane 1.
     intelligence_instance.process_transcript.assert_not_called()
@@ -444,7 +457,7 @@ def test_on_done_callback_logs_unhandled_wrapper_exception(caplog):
     Tests the callback directly with a Task that raises, bypassing the
     handler-level wiring. This is the unit-level safety contract.
     """
-    import routers.text as text_module
+    import services.text_clean_service as text_clean_module
 
     async def _raises() -> None:
         raise RuntimeError("wrapper-level crash outside the gather")
@@ -454,18 +467,18 @@ def test_on_done_callback_logs_unhandled_wrapper_exception(caplog):
         # the handler uses: create_task → set.add → add_done_callback.
         # The closure normally captures interaction_id_str; we test the
         # behavior without that closure by inspecting task.exception()
-        # via a minimal callback that mirrors routers.text's contract.
+        # via a minimal callback that mirrors text_clean_service's contract.
         task = asyncio.create_task(_raises())
-        text_module._BACKGROUND_TASKS.add(task)
+        text_clean_module._BACKGROUND_TASKS.add(task)
         log_call_count = {"n": 0}
 
         def _callback(t: asyncio.Task) -> None:
-            text_module._BACKGROUND_TASKS.discard(t)
+            text_clean_module._BACKGROUND_TASKS.discard(t)
             if t.cancelled():
                 return
             exc = t.exception()
             if exc is not None:
-                text_module.logger.error(
+                text_clean_module.logger.error(
                     f"Text cleaning background task crashed (unhandled): "
                     f"error={type(exc).__name__}: {str(exc)}",
                     exc_info=exc,
@@ -473,7 +486,7 @@ def test_on_done_callback_logs_unhandled_wrapper_exception(caplog):
                 log_call_count["n"] += 1
 
         task.add_done_callback(_callback)
-        with caplog.at_level(logging.ERROR, logger="routers.text"):
+        with caplog.at_level(logging.ERROR, logger="services.text_clean_service"):
             try:
                 await task
             except RuntimeError:
@@ -510,9 +523,9 @@ def test_lifespan_drain_awaits_in_flight_background_tasks(caplog):
     nearing completion at shutdown.
     """
     import main as main_module
-    import routers.text as text_module
+    import services.text_clean_service as text_clean_module
 
-    text_module._BACKGROUND_TASKS.clear()
+    text_clean_module._BACKGROUND_TASKS.clear()
 
     completed = []
 
@@ -522,8 +535,8 @@ def test_lifespan_drain_awaits_in_flight_background_tasks(caplog):
 
     async def _drive() -> None:
         task = asyncio.create_task(_short_task())
-        text_module._BACKGROUND_TASKS.add(task)
-        task.add_done_callback(text_module._BACKGROUND_TASKS.discard)
+        text_clean_module._BACKGROUND_TASKS.add(task)
+        task.add_done_callback(text_clean_module._BACKGROUND_TASKS.discard)
 
         with caplog.at_level(logging.INFO, logger="main"):
             await main_module._drain_text_clean_background_tasks(timeout_s=1.0)
@@ -550,9 +563,9 @@ def test_lifespan_drain_logs_warning_on_timeout(caplog):
     audit how often work was lost.
     """
     import main as main_module
-    import routers.text as text_module
+    import services.text_clean_service as text_clean_module
 
-    text_module._BACKGROUND_TASKS.clear()
+    text_clean_module._BACKGROUND_TASKS.clear()
 
     async def _slow_task() -> None:
         try:
@@ -562,8 +575,8 @@ def test_lifespan_drain_logs_warning_on_timeout(caplog):
 
     async def _drive() -> None:
         task = asyncio.create_task(_slow_task())
-        text_module._BACKGROUND_TASKS.add(task)
-        task.add_done_callback(text_module._BACKGROUND_TASKS.discard)
+        text_clean_module._BACKGROUND_TASKS.add(task)
+        task.add_done_callback(text_clean_module._BACKGROUND_TASKS.discard)
 
         with caplog.at_level(logging.WARNING, logger="main"):
             await main_module._drain_text_clean_background_tasks(timeout_s=0.1)

@@ -130,7 +130,11 @@ async def _drain_text_clean_background_tasks(timeout_s: float = 25.0) -> None:
     "Task exception was never retrieved" warning per dropped task, which
     is the intended observability signal (visible in Railway logs).
     """
-    from routers.text import _BACKGROUND_TASKS as _TEXT_BG_TASKS
+    # _BACKGROUND_TASKS moved to services.text_clean_service in PR-X1 of
+    # the Granola integration (phase 2d prep); the drain target is shared
+    # with the Granola ingestion adapter so a graceful shutdown awaits
+    # in-flight Lane 2 work from EITHER caller.
+    from services.text_clean_service import _BACKGROUND_TASKS as _TEXT_BG_TASKS
 
     in_flight = list(_TEXT_BG_TASKS)
     if not in_flight:
