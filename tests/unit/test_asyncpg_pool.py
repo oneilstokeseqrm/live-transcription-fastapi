@@ -132,31 +132,32 @@ def test_to_direct_neon_url_leaves_non_neon_pooler_intact():
     assert asyncpg_pool._to_direct_neon_url(src) == src
 
 
-def test_resolve_dsn_non_neon_pooler_fails_closed_by_default(monkeypatch):
-    """Codex PR-#28 R7/R9: a non-Neon -pooler host can't prove its mode,
-    so the resolver FAILS CLOSED by default (transaction pooling would
-    silently double-publish). The host is NOT mangled (R6 P2) — it's
-    rejected with a clear error."""
+def test_resolve_dsn_non_neon_pooler_from_database_url_fails_closed(monkeypatch):
+    """Codex PR-#28 R7/R9: a non-Neon -pooler host DERIVED from
+    DATABASE_URL can't prove its mode, so the resolver FAILS CLOSED
+    (transaction pooling would silently double-publish). The host is NOT
+    mangled (R6 P2) — it's rejected with a clear error pointing at
+    GRANOLA_DB_DIRECT_URL."""
     monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
-    monkeypatch.delenv("GRANOLA_DB_ALLOW_POOLER", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@pg-pooler.internal:6432/db")
-    with pytest.raises(RuntimeError, match="non-Neon pooler"):
+    with pytest.raises(RuntimeError, match="non-Neon pooler-looking host"):
         asyncpg_pool._resolve_dsn_and_kwargs()
 
 
-def test_resolve_dsn_non_neon_pooler_opt_in_proceeds_with_warning(monkeypatch, caplog):
-    """Codex PR-#28 R8: an operator who verified the endpoint is
-    SESSION-mode pooling can opt in via GRANOLA_DB_ALLOW_POOLER=true.
-    The resolver then proceeds (host kept intact) + warns."""
+def test_resolve_dsn_explicit_non_neon_pooler_label_trusted(monkeypatch, caplog):
+    """Codex PR-#28 R10 P2: an explicit GRANOLA_DB_DIRECT_URL whose host
+    happens to contain '-pooler.' (e.g. a genuinely-direct
+    db-pooler.internal) is TRUSTED — the operator designated it the
+    direct URL. Proceeds (host intact) + warns. This is what makes the
+    fail-closed path's remediation ('set GRANOLA_DB_DIRECT_URL') work."""
     import logging
 
-    monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
-    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@pg-pooler.internal:6432/db")
-    monkeypatch.setenv("GRANOLA_DB_ALLOW_POOLER", "true")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("GRANOLA_DB_DIRECT_URL", "postgresql://u:p@db-pooler.internal:6432/appdb")
     with caplog.at_level(logging.WARNING):
         dsn, _ = asyncpg_pool._resolve_dsn_and_kwargs()
-    assert "pg-pooler.internal" in dsn  # kept intact, not mangled
-    assert any("GRANOLA_DB_ALLOW_POOLER is set" in r.message for r in caplog.records)
+    assert "db-pooler.internal" in dsn  # trusted, not rejected, not mangled
+    assert any("explicit direct assertion" in r.message for r in caplog.records)
 
 
 def test_resolve_dsn_explicit_granola_direct_url_wins(monkeypatch):

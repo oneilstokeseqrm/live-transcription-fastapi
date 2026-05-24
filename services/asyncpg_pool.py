@@ -45,14 +45,18 @@ Pooler handling after derivation depends on whether the host is Neon
   Neon pooler — a ``DATABASE_URL`` would have been auto-rewritten):
   RAISE. Neon's ``-pooler`` IS transaction pooling, which is unsafe for
   the session-scoped advisory lock.
-* A non-Neon host whose DNS name contains ``-pooler.``: FAIL CLOSED by
-  default (the hostname can't prove the pooling mode; transaction-mode
-  pooling silently breaks the lock → double-publish). An operator who
-  has verified the endpoint is SESSION-mode pooling can opt in with
-  ``GRANOLA_DB_ALLOW_POOLER=true`` to proceed (logged as a warning).
-  This converges the R7/R8/R9 disagreement: safe default + explicit
-  override for the one case (session pooling) where the default is too
-  strict.
+* A non-Neon host whose DNS name contains ``-pooler.`` is handled by URL
+  PROVENANCE (Codex PR-#28 R7/R8/R9/R10):
+
+  - Derived from ``DATABASE_URL``: FAIL CLOSED. ``DATABASE_URL`` is the
+    app-DB contract, not a direct assertion, and the hostname can't
+    prove the pooling mode — a loud startup error beats silent
+    double-publish. Remediation: set ``GRANOLA_DB_DIRECT_URL``.
+  - Supplied via ``GRANOLA_DB_DIRECT_URL`` (explicit): TRUST it (warn).
+    The operator named it the direct URL; a ``-pooler.`` DNS label may
+    be incidental (a genuinely-direct ``db-pooler.internal``). This is
+    the single override, and it makes the fail-closed path's remediation
+    actually work.
 
 ``statement_cache_size=0`` is set unconditionally — it's the asyncpg
 setting required for PgBouncer compatibility and costs almost nothing
@@ -172,8 +176,10 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
     database_url = os.environ.get("DATABASE_URL")
     if explicit:
         url = explicit
+        from_explicit = True
     elif database_url:
         url = _to_direct_neon_url(database_url)
+        from_explicit = False
     else:
         raise RuntimeError(
             "No database URL for the asyncpg pool. Set DATABASE_URL "
@@ -230,13 +236,13 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
     host = parsed.hostname or ""
     if "-pooler." in host:
         if host.endswith(".neon.tech"):
-            # A Neon pooler endpoint reached the pool unrewritten. For a
-            # DATABASE_URL this can't happen (the derivation above strips
-            # -pooler); it means an explicit GRANOLA_DB_DIRECT_URL was
-            # pointed at a Neon POOLER endpoint. That's a clear
-            # misconfiguration of a known-transaction-pooling endpoint —
-            # fail fast (Codex PR-#28 R7 P1) rather than run with an
-            # unreliable lock.
+            # A Neon pooler endpoint reached the pool. For a DATABASE_URL
+            # this can't happen (the derivation above strips -pooler); it
+            # means an explicit GRANOLA_DB_DIRECT_URL was pointed at a
+            # Neon POOLER endpoint. Neon's -pooler is DEFINITIVELY
+            # transaction pooling, so even an explicit "direct" URL here
+            # is a clear misconfiguration — fail fast (Codex PR-#28 R7
+            # P1) rather than run with an unreliable lock.
             raise RuntimeError(
                 f"asyncpg_pool resolved a Neon POOLER host ({host}). "
                 f"Neon's -pooler endpoint uses transaction pooling, which "
@@ -247,37 +253,47 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
                 f"just set DATABASE_URL — its -pooler host is "
                 f"auto-rewritten to the direct endpoint."
             )
-        # Non-Neon host whose name contains '-pooler.'. The hostname
-        # CANNOT prove the pooling MODE (Codex PR-#28 R8 vs R9, which
-        # argued opposite sides): session-mode pooling preserves the
-        # advisory lock, transaction-mode pooling silently breaks it
-        # (overlapping cycles double-publish). Since we can't tell, we
-        # FAIL CLOSED by default — a loud startup error beats silent
-        # data corruption — with an explicit operator opt-in for a
-        # verified session-mode pooler. Only the operator knows their
-        # PgBouncer mode, so the override is theirs to set.
-        allow_pooler = os.environ.get("GRANOLA_DB_ALLOW_POOLER", "").lower() in (
-            "1", "true", "yes",
-        )
-        if not allow_pooler:
-            raise RuntimeError(
-                f"asyncpg_pool resolved a non-Neon pooler-looking host "
-                f"({host}). The scheduler's pg_try_advisory_lock is unsafe "
-                f"under TRANSACTION-mode pooling (overlapping cycles could "
-                f"double-publish) and the hostname can't prove the mode. "
-                f"Point GRANOLA_DB_DIRECT_URL at a DIRECT connection to the "
-                f"application database, or — if this endpoint is verified "
-                f"SESSION-mode pooling — set GRANOLA_DB_ALLOW_POOLER=true to "
-                f"proceed."
+        # Non-Neon host whose DNS name contains '-pooler.'. The hostname
+        # CANNOT prove the pooling MODE for non-Neon endpoints (Codex
+        # PR-#28 R8 vs R9 argued opposite sides) — session-mode pooling
+        # preserves the advisory lock, transaction-mode pooling silently
+        # breaks it. We disambiguate by URL PROVENANCE:
+        if from_explicit:
+            # The operator explicitly designated this the DIRECT URL. A
+            # '-pooler.' DNS label may be incidental (a genuinely-direct
+            # endpoint named e.g. db-pooler.internal). Trust the explicit
+            # assertion (Codex PR-#28 R10 P2) — rejecting it would be a
+            # false positive whose only remediation (set
+            # GRANOLA_DB_DIRECT_URL) is what they already did. Warn so a
+            # transaction-mode mistake stays diagnosable.
+            logger.warning(
+                "asyncpg_pool: GRANOLA_DB_DIRECT_URL host %s contains "
+                "'-pooler.'. Trusting the explicit direct assertion; if "
+                "this is actually a TRANSACTION-mode pooler the advisory "
+                "lock will be unreliable and overlapping cycles could "
+                "double-publish.",
+                host,
             )
-        logger.warning(
-            "asyncpg_pool: proceeding on pooler-looking host %s because "
-            "GRANOLA_DB_ALLOW_POOLER is set. The scheduler's advisory lock "
-            "is only reliable if this is a SESSION-mode pooler; a "
-            "TRANSACTION-mode pooler will let overlapping cycles "
-            "double-publish.",
-            host,
-        )
+        else:
+            # Derived from a non-Neon pooler DATABASE_URL. DATABASE_URL is
+            # the app-DB contract, not a direct assertion, and we can't
+            # prove it's session-mode — so FAIL CLOSED (Codex PR-#28
+            # R7/R9): a loud startup error beats silent double-publish.
+            # The operator fixes it by setting GRANOLA_DB_DIRECT_URL to a
+            # direct (or verified session-mode) connection — which then
+            # takes the trusted explicit path above (Codex R10 P2: the
+            # remediation actually works).
+            raise RuntimeError(
+                f"asyncpg_pool derived a non-Neon pooler-looking host "
+                f"({host}) from DATABASE_URL. The scheduler's "
+                f"pg_try_advisory_lock is unsafe under TRANSACTION-mode "
+                f"pooling (overlapping cycles could double-publish) and a "
+                f"DATABASE_URL host can't prove the mode. Set "
+                f"GRANOLA_DB_DIRECT_URL to a DIRECT connection to the "
+                f"application database (or, for a verified SESSION-mode "
+                f"pooler, point GRANOLA_DB_DIRECT_URL at that endpoint — "
+                f"explicit URLs are trusted)."
+            )
 
     return dsn, kwargs
 
