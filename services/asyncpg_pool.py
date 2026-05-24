@@ -45,11 +45,14 @@ Pooler handling after derivation depends on whether the host is Neon
   Neon pooler — a ``DATABASE_URL`` would have been auto-rewritten):
   RAISE. Neon's ``-pooler`` IS transaction pooling, which is unsafe for
   the session-scoped advisory lock.
-* A non-Neon host whose DNS name merely contains ``-pooler.``: trust
-  the operator and proceed with an info-level breadcrumb. The hostname
-  tells us nothing about the pooler MODE for non-Neon endpoints —
-  session pooling preserves advisory locks; only transaction pooling
-  breaks them, and only the operator knows which they run.
+* A non-Neon host whose DNS name contains ``-pooler.``: FAIL CLOSED by
+  default (the hostname can't prove the pooling mode; transaction-mode
+  pooling silently breaks the lock → double-publish). An operator who
+  has verified the endpoint is SESSION-mode pooling can opt in with
+  ``GRANOLA_DB_ALLOW_POOLER=true`` to proceed (logged as a warning).
+  This converges the R7/R8/R9 disagreement: safe default + explicit
+  override for the one case (session pooling) where the default is too
+  strict.
 
 ``statement_cache_size=0`` is set unconditionally — it's the asyncpg
 setting required for PgBouncer compatibility and costs almost nothing
@@ -244,16 +247,35 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
                 f"just set DATABASE_URL — its -pooler host is "
                 f"auto-rewritten to the direct endpoint."
             )
-        # Non-Neon host whose name merely contains '-pooler.'. We can't
-        # infer the pooler MODE from the hostname, so we trust the
-        # operator's URL and proceed — but leave a breadcrumb so a
-        # transaction-mode misconfiguration is diagnosable in logs.
-        logger.info(
-            "asyncpg_pool: using non-Neon pooler-looking host %s as-is. "
-            "The scheduler's pg_try_advisory_lock needs a DIRECT or "
-            "SESSION-mode connection; if this endpoint is a "
-            "TRANSACTION-mode pooler, set GRANOLA_DB_DIRECT_URL to a "
-            "direct connection.",
+        # Non-Neon host whose name contains '-pooler.'. The hostname
+        # CANNOT prove the pooling MODE (Codex PR-#28 R8 vs R9, which
+        # argued opposite sides): session-mode pooling preserves the
+        # advisory lock, transaction-mode pooling silently breaks it
+        # (overlapping cycles double-publish). Since we can't tell, we
+        # FAIL CLOSED by default — a loud startup error beats silent
+        # data corruption — with an explicit operator opt-in for a
+        # verified session-mode pooler. Only the operator knows their
+        # PgBouncer mode, so the override is theirs to set.
+        allow_pooler = os.environ.get("GRANOLA_DB_ALLOW_POOLER", "").lower() in (
+            "1", "true", "yes",
+        )
+        if not allow_pooler:
+            raise RuntimeError(
+                f"asyncpg_pool resolved a non-Neon pooler-looking host "
+                f"({host}). The scheduler's pg_try_advisory_lock is unsafe "
+                f"under TRANSACTION-mode pooling (overlapping cycles could "
+                f"double-publish) and the hostname can't prove the mode. "
+                f"Point GRANOLA_DB_DIRECT_URL at a DIRECT connection to the "
+                f"application database, or — if this endpoint is verified "
+                f"SESSION-mode pooling — set GRANOLA_DB_ALLOW_POOLER=true to "
+                f"proceed."
+            )
+        logger.warning(
+            "asyncpg_pool: proceeding on pooler-looking host %s because "
+            "GRANOLA_DB_ALLOW_POOLER is set. The scheduler's advisory lock "
+            "is only reliable if this is a SESSION-mode pooler; a "
+            "TRANSACTION-mode pooler will let overlapping cycles "
+            "double-publish.",
             host,
         )
 
