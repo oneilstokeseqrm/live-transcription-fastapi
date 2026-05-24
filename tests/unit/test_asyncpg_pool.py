@@ -131,16 +131,20 @@ def test_to_direct_neon_url_leaves_non_neon_pooler_intact():
     assert asyncpg_pool._to_direct_neon_url(src) == src
 
 
-def test_resolve_dsn_non_neon_pooler_database_url_fails_fast(monkeypatch):
-    """Codex PR-#28 R7 P1: a non-Neon -pooler DATABASE_URL can't be
-    auto-rewritten to a direct endpoint, and the advisory lock is unsafe
-    through PgBouncer — so the resolver RAISES (fail fast) rather than
-    silently running with an unreliable lock. _to_direct_neon_url leaves
-    the host intact (R6 P2); the resolver then refuses it (R7 P1)."""
+def test_resolve_dsn_non_neon_pooler_database_url_trusted_with_info_log(monkeypatch, caplog):
+    """Codex PR-#28 R8 P2: a non-Neon -pooler host name does NOT imply
+    transaction pooling (session pooling preserves advisory locks), so
+    the resolver trusts the operator's URL as-is and only info-logs a
+    breadcrumb — it does NOT mangle it (R6 P2) and does NOT raise (R8)."""
+    import logging
+
     monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@pg-pooler.internal:6432/db")
-    with pytest.raises(RuntimeError, match="POOLER host"):
-        asyncpg_pool._resolve_dsn_and_kwargs()
+    with caplog.at_level(logging.INFO):
+        dsn, _ = asyncpg_pool._resolve_dsn_and_kwargs()
+    # Host preserved (not rewritten, not rejected).
+    assert "pg-pooler.internal" in dsn
+    assert any("non-Neon pooler" in r.message for r in caplog.records)
 
 
 def test_resolve_dsn_explicit_granola_direct_url_wins(monkeypatch):
@@ -163,18 +167,18 @@ def test_resolve_dsn_always_disables_statement_cache(monkeypatch):
     assert kwargs["statement_cache_size"] == 0
 
 
-def test_resolve_dsn_raises_when_explicit_url_is_still_pooler(monkeypatch):
-    """If an explicit GRANOLA_DB_DIRECT_URL still points at a -pooler
-    host (operator misconfiguration), the resolver RAISES (Codex PR-#28
-    R7 P1) — the explicit override is taken as-is (no derivation), so a
-    pooler there is a hard error rather than a silent unreliable-lock
-    run."""
+def test_resolve_dsn_raises_when_explicit_url_is_neon_pooler(monkeypatch):
+    """If an explicit GRANOLA_DB_DIRECT_URL points at a NEON -pooler
+    host (operator misconfiguration of a known-transaction-pooling
+    endpoint), the resolver RAISES (Codex PR-#28 R7 P1). Explicit URLs
+    are taken as-is (no derivation), so a Neon pooler there is a hard
+    error rather than a silent unreliable-lock run."""
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv(
         "GRANOLA_DB_DIRECT_URL",
         "postgresql://u:p@ep-x-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
     )
-    with pytest.raises(RuntimeError, match="POOLER host"):
+    with pytest.raises(RuntimeError, match="Neon POOLER host"):
         asyncpg_pool._resolve_dsn_and_kwargs()
 
 

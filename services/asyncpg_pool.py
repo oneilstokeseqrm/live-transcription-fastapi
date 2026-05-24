@@ -37,12 +37,19 @@ a DIRECT (non-pooler) connection, preferring (in order):
    query the wrong database for ``vault.user_credentials`` (Codex
    PR-#28 R5 P1). Deriving from ``DATABASE_URL`` guarantees same-DB.
 
-If the resolved host is STILL a ``-pooler`` host after derivation (an
-explicit ``GRANOLA_DB_DIRECT_URL`` that points at a pooler, or a
-non-Neon pooler whose host we can't rewrite), we RAISE (Codex PR-#28
-R7 P1) — the advisory lock is genuinely unsafe through PgBouncer, so
-the scheduler must not silently run there. The cron tick 5xxs until an
-operator supplies a real direct ``GRANOLA_DB_DIRECT_URL``.
+Pooler handling after derivation depends on whether the host is Neon
+(Codex PR-#28 R7 + R8):
+
+* A ``.neon.tech`` ``-pooler`` host that reaches the pool unrewritten
+  (only possible via an explicit ``GRANOLA_DB_DIRECT_URL`` pointed at a
+  Neon pooler — a ``DATABASE_URL`` would have been auto-rewritten):
+  RAISE. Neon's ``-pooler`` IS transaction pooling, which is unsafe for
+  the session-scoped advisory lock.
+* A non-Neon host whose DNS name merely contains ``-pooler.``: trust
+  the operator and proceed with an info-level breadcrumb. The hostname
+  tells us nothing about the pooler MODE for non-Neon endpoints —
+  session pooling preserves advisory locks; only transaction pooling
+  breaks them, and only the operator knows which they run.
 
 ``statement_cache_size=0`` is set unconditionally — it's the asyncpg
 setting required for PgBouncer compatibility and costs almost nothing
@@ -210,29 +217,44 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
         ssl_ctx.verify_mode = ssl.CERT_NONE
         kwargs["ssl"] = ssl_ctx
 
-    # Fail fast if we ended up on a pooler host (Codex PR-#28 R7 P1).
-    # The advisory lock in run_cycle_step is session-scoped and is
-    # silently defeated by PgBouncer transaction pooling — the lock can
-    # be lost between statements and overlapping cycles double-publish.
-    # statement_cache_size=0 covers the prepared-statement issue but NOT
-    # the lock, so a pooler connection is genuinely unsafe for the
-    # scheduler. Refusing here makes the cron tick 5xx loudly rather
-    # than running in the unsupported mode the module docs warn against.
-    # A Neon DATABASE_URL was already auto-rewritten to its direct
-    # endpoint above, so this only triggers for a non-Neon pooler (or an
-    # explicit GRANOLA_DB_DIRECT_URL mistakenly pointed at a pooler) —
-    # both of which require the operator to supply a real direct URL.
+    # A hostname is only a reliable pooling-MODE signal for Neon
+    # (Codex PR-#28 R8 P2). Neon's `-pooler.` endpoint is documented
+    # transaction pooling, which silently defeats the session-scoped
+    # pg_try_advisory_lock in run_cycle_step (the lock can be lost
+    # between statements → overlapping cycles double-publish). For a
+    # non-Neon host, `-pooler.` in the DNS name tells us nothing about
+    # the mode — session pooling preserves advisory locks just fine.
     host = parsed.hostname or ""
     if "-pooler." in host:
-        raise RuntimeError(
-            f"asyncpg_pool resolved a POOLER host ({host}), which cannot "
-            f"safely run the Granola scheduler: pg_try_advisory_lock is "
-            f"session-scoped and unreliable under PgBouncer transaction "
-            f"pooling (overlapping cycles could double-publish). Set "
-            f"GRANOLA_DB_DIRECT_URL to a DIRECT (non-pooler) connection "
-            f"to the application database. (A Neon DATABASE_URL is "
-            f"auto-rewritten to its direct endpoint; a non-Neon pooler "
-            f"needs the explicit GRANOLA_DB_DIRECT_URL.)"
+        if host.endswith(".neon.tech"):
+            # A Neon pooler endpoint reached the pool unrewritten. For a
+            # DATABASE_URL this can't happen (the derivation above strips
+            # -pooler); it means an explicit GRANOLA_DB_DIRECT_URL was
+            # pointed at a Neon POOLER endpoint. That's a clear
+            # misconfiguration of a known-transaction-pooling endpoint —
+            # fail fast (Codex PR-#28 R7 P1) rather than run with an
+            # unreliable lock.
+            raise RuntimeError(
+                f"asyncpg_pool resolved a Neon POOLER host ({host}). "
+                f"Neon's -pooler endpoint uses transaction pooling, which "
+                f"breaks the scheduler's session-scoped "
+                f"pg_try_advisory_lock (overlapping cycles could "
+                f"double-publish). Point GRANOLA_DB_DIRECT_URL at the "
+                f"DIRECT Neon endpoint (same host without '-pooler'), or "
+                f"just set DATABASE_URL — its -pooler host is "
+                f"auto-rewritten to the direct endpoint."
+            )
+        # Non-Neon host whose name merely contains '-pooler.'. We can't
+        # infer the pooler MODE from the hostname, so we trust the
+        # operator's URL and proceed — but leave a breadcrumb so a
+        # transaction-mode misconfiguration is diagnosable in logs.
+        logger.info(
+            "asyncpg_pool: using non-Neon pooler-looking host %s as-is. "
+            "The scheduler's pg_try_advisory_lock needs a DIRECT or "
+            "SESSION-mode connection; if this endpoint is a "
+            "TRANSACTION-mode pooler, set GRANOLA_DB_DIRECT_URL to a "
+            "direct connection.",
+            host,
         )
 
     return dsn, kwargs
