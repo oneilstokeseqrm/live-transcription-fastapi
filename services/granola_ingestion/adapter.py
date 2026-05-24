@@ -107,6 +107,17 @@ _CONSECUTIVE_FAILURE_THRESHOLD = 3
 # re-queue via Phase 2f admin endpoints.
 _PER_NOTE_RETRY_LIMIT = 5
 
+# Intermediate status used to record the "publish dispatched, success
+# not yet recorded" state — written BEFORE :func:`text_clean_service.process`
+# so a crash between Lane 1 publish and the success UPSERT can't lose
+# our idempotency anchor (Codex PR-X2 R1 P2 finding). NOT exposed in
+# :class:`IngestionOutcome` because it's never a terminal outcome of
+# :func:`process_note`; the row transitions to 'success' or 'failed' on
+# the same call. Persisted as a string in
+# ``external_integration_runs.status`` (no DB-level CHECK constraint
+# restricts the column to the IngestionOutcome enum).
+_STATUS_IN_PROGRESS = "in_progress"
+
 
 @dataclass(frozen=True)
 class CycleResult:
@@ -177,6 +188,16 @@ async def run_one_cycle(
     notes_processed = 0
     deferred_reprocessed = 0
 
+    # Capture cycle-start timestamp BEFORE list_notes (Codex PR-X2 R1 P1
+    # finding). Using CURRENT_TIMESTAMP at cycle-end would create a gap:
+    # a note created between list_notes() and the end-of-cycle UPDATE
+    # would not be in the T0 result set but next cycle's
+    # ``created_after=cycle_end_timestamp`` would skip it forever.
+    # Snapshotting at start means next cycle's filter is
+    # ``created_after=this_cycle_start``, so notes created during the
+    # cycle window are picked up on the next poll.
+    cycle_start_at = datetime.now(timezone.utc)
+
     owned_client = api_client is None
     client = api_client or GranolaAPIClient(api_key=credential.api_key)
     try:
@@ -215,14 +236,22 @@ async def run_one_cycle(
             outcomes[outcome.value] = outcomes.get(outcome.value, 0) + 1
             notes_processed += 1
 
-        deferred_reprocessed = await reprocess_deferred_notes(
+        # Reprocess BOTH deferred and failed rows from prior cycles
+        # (Codex PR-X2 R1 P1 finding). A note-level transient failure
+        # (5xx on detail fetch, lane2_backpressure, etc) used to be
+        # stranded forever once last_polled_at advanced past it; this
+        # cycle-end pass gives those rows a retry against the SAME
+        # external_id without needing them to reappear in list_notes.
+        deferred_reprocessed = await reprocess_pending_notes(
             credential=credential,
             client=client,
             pool=pool,
             internal_domains=internal_domains,
         )
 
-        await _mark_credential_polled_success(credential=credential, pool=pool)
+        await _mark_credential_polled_success(
+            credential=credential, pool=pool, last_polled_at=cycle_start_at
+        )
     finally:
         if owned_client:
             await client.aclose()
@@ -271,6 +300,20 @@ async def process_note(
         # but a manual re-trigger could land here. Don't re-attempt.
         return IngestionOutcome.FAILED_PERMANENT
 
+    # Preserve the eq_interaction_id from any prior 'in_progress'
+    # or 'failed' row so a retry re-publishes under the SAME interaction
+    # id (downstream consumers dedup on it). Codex PR-X2 R1 P2 fix.
+    existing_interaction_id: Optional[UUID] = None
+    if existing is not None:
+        raw = existing.get("eq_interaction_id")
+        if isinstance(raw, UUID):
+            existing_interaction_id = raw
+        elif isinstance(raw, str) and raw:
+            try:
+                existing_interaction_id = UUID(raw)
+            except ValueError:
+                existing_interaction_id = None
+
     try:
         detail = await client.get_note_detail(note_summary.id)
     except GranolaError as exc:
@@ -305,6 +348,7 @@ async def process_note(
             detail=detail,
             decision=decision,
             pool=pool,
+            existing_interaction_id=existing_interaction_id,
         )
 
     # Scenario C: 0 known accounts, >= 1 unknown business attendee.
@@ -381,6 +425,7 @@ async def _ingest_scenario_a(
     detail: GranolaNoteDetail,
     decision: PathTwoDecision,
     pool: asyncpg.Pool,
+    existing_interaction_id: Optional[UUID] = None,
 ) -> IngestionOutcome:
     """Build envelope per LOCKED-35/36 and dispatch via text_clean_service.
 
@@ -390,6 +435,11 @@ async def _ingest_scenario_a(
     pre-reserved slot — the adapter reserves via try_reserve_lane2_slot
     here). If the reserve fails, the note is recorded as transient
     failure (retry next cycle).
+
+    ``existing_interaction_id`` (when not None) is reused as
+    ``envelope.interaction_id`` so a retry of a publish-then-DB-fail
+    race republishes under the SAME interaction id (downstream consumers
+    dedup on it). Codex PR-X2 R1 P2 mitigation.
     """
     if not text_clean_service.try_reserve_lane2_slot():
         in_flight = text_clean_service.get_lane2_in_flight()
@@ -413,11 +463,29 @@ async def _ingest_scenario_a(
     assert anchor_account_id is not None, "Scenario A requires anchor_account_id"
 
     try:
+        interaction_id = existing_interaction_id or uuid4()
         envelope = _build_envelope(
             credential=credential,
             detail=detail,
             anchor_account_id=anchor_account_id,
             decision=decision,
+            interaction_id=interaction_id,
+        )
+
+        # Pre-write 'in_progress' BEFORE publish so a crash between Lane 1
+        # success and the success UPSERT can't lose our idempotency
+        # anchor (Codex PR-X2 R1 P2 fix). On next retry, the same
+        # eq_interaction_id is recovered and re-published — downstream
+        # consumers dedup on interaction_id, so duplicate Lane 1 events
+        # don't create duplicate entities downstream (small Lane 2 cost
+        # in the crash window is acknowledged).
+        await _record_in_progress(
+            pool=pool,
+            credential=credential,
+            note_id=note_summary.id,
+            account_id=anchor_account_id,
+            eq_interaction_id=interaction_id,
+            granola_updated_at=note_summary.updated_at,
         )
 
         try:
@@ -454,7 +522,7 @@ async def _ingest_scenario_a(
             credential=credential,
             note_id=note_summary.id,
             account_id=anchor_account_id,
-            eq_interaction_id=envelope.interaction_id,  # type: ignore[arg-type]
+            eq_interaction_id=interaction_id,
             granola_updated_at=note_summary.updated_at,
         )
 
@@ -465,7 +533,7 @@ async def _ingest_scenario_a(
             pool=pool,
             credential=credential,
             decision=decision,
-            interaction_id=envelope.interaction_id,  # type: ignore[arg-type]
+            interaction_id=interaction_id,
         )
 
         return IngestionOutcome.SUCCESS
@@ -538,26 +606,34 @@ async def _defer_pending_account(
 # ---------------------------------------------------------------------------
 
 
-async def reprocess_deferred_notes(
+async def reprocess_pending_notes(
     *,
     credential: GranolaCredential,
     client: GranolaAPIClient,
     pool: asyncpg.Pool,
     internal_domains: set[str],
 ) -> int:
-    """For each deferred-pending-account row, re-run Path 2.
+    """For each deferred + failed row, attempt re-processing.
 
-    If the once-unknown domain is now known (user approved via Pending
-    Approvals), Scenario A runs against the cached snapshot OR a fresh
-    detail fetch. If the note has been deleted on Granola since defer,
-    we fall back to the snapshot (LOCKED-44 recoverability). If the
-    domain still isn't known, the row stays deferred — next cycle tries
-    again.
+    Codex PR-X2 R1 P1 fix — handles BOTH 'deferred_pending_account' and
+    'failed' statuses (previously only deferred). A failed row that
+    drops out of next cycle's ``list_notes(created_after=...)`` window
+    would otherwise be stranded forever.
 
-    Returns the count of deferred rows that were re-processed (regardless
-    of outcome — the count is observability, not load-bearing).
+    Per-row branching:
+      * 'deferred_pending_account' with snapshot → try fresh fetch; on
+        ``NOTE_NOT_FOUND`` fall back to the snapshot (LOCKED-44).
+        Re-classify; promote to Scenario A if the domain is now known.
+      * 'failed' → re-fetch detail (no snapshot for these rows since
+        defer wasn't entered). On ``NOTE_NOT_FOUND`` mark as
+        skipped (note was deleted between attempts). On other errors,
+        the existing per-note retry budget applies via
+        :func:`_handle_note_level_granola_error`.
+
+    Returns the count of rows that were re-processed (observability;
+    not load-bearing).
     """
-    rows = await _get_deferred_runs(
+    rows = await _get_pending_runs(
         pool=pool,
         tenant_id=credential.tenant_id,
         user_id=credential.user_id,
@@ -567,35 +643,68 @@ async def reprocess_deferred_notes(
     for row in rows:
         reprocessed += 1
         external_id: str = row["external_id"]
+        status: str = row.get("status", "")
         snapshot: dict[str, Any] = _coerce_jsonb_dict(row.get("granola_note_snapshot"))
-        if not snapshot:
-            # Older rows without a snapshot can't be safely re-processed
-            # (LOCKED-44 prerequisite). Skip; Phase 2.1 may add a
-            # backfill job for these.
-            logger.info(
-                f"granola_adapter: deferred row external_id={external_id} has no "
-                f"snapshot; skipping re-process"
-            )
-            continue
 
-        # Try a fresh fetch first; fall back to snapshot on 404.
-        try:
-            detail = await client.get_note_detail(external_id)
-        except GranolaError as exc:
-            if exc.code is GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND:
-                detail = _rebuild_detail_from_snapshot(external_id, snapshot)
-            else:
-                # Other transient/HTTP errors leave the row deferred; will
-                # retry on the next cycle.
+        # Synthetic note_summary to feed process_note's idempotency check
+        # + outcome recording. Built once per row; details come from
+        # either snapshot or fresh fetch below.
+        if status == IngestionOutcome.DEFERRED_PENDING_ACCOUNT.value:
+            if not snapshot:
+                # Older deferred rows without a snapshot can't be safely
+                # re-processed (LOCKED-44 prerequisite). Skip; Phase 2.1
+                # may add a backfill job for these.
                 logger.info(
-                    f"granola_adapter: deferred re-poll {external_id} hit "
-                    f"{exc.code.value}; leaving deferred"
+                    f"granola_adapter: deferred row external_id={external_id} has no "
+                    f"snapshot; skipping re-process"
                 )
                 continue
 
-        # Build a synthetic note_summary just to feed process_note's
-        # idempotency check + outcome recording. The summary is only
-        # consumed for its id / created_at / updated_at fields.
+            try:
+                detail = await client.get_note_detail(external_id)
+            except GranolaError as exc:
+                if exc.code is GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND:
+                    detail = _rebuild_detail_from_snapshot(external_id, snapshot)
+                else:
+                    logger.info(
+                        f"granola_adapter: deferred re-poll {external_id} hit "
+                        f"{exc.code.value}; leaving deferred"
+                    )
+                    continue
+        else:
+            # status == 'failed' — no snapshot, must re-fetch live. If
+            # the note is gone, mark as skipped (we can't recover the
+            # content; user can see the skip record in the admin panel).
+            try:
+                detail = await client.get_note_detail(external_id)
+            except GranolaError as exc:
+                if exc.code is GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND:
+                    await _record_skipped(
+                        pool=pool,
+                        credential=credential,
+                        note_id=external_id,
+                        reason="note_deleted_before_retry_succeeded",
+                        granola_updated_at=None,
+                    )
+                    continue
+                # Other transient codes: let _handle_note_level_granola_error
+                # increment retry_count + possibly transition to permanent.
+                synth_summary = GranolaNoteSummary(
+                    id=external_id,
+                    title=None,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=None,
+                    folder_membership=[],
+                )
+                await _handle_note_level_granola_error(
+                    exc=exc,
+                    credential=credential,
+                    note_summary=synth_summary,
+                    pool=pool,
+                    existing=row,
+                )
+                continue
+
         synth_summary = GranolaNoteSummary(
             id=external_id,
             title=detail.title,
@@ -611,21 +720,53 @@ async def reprocess_deferred_notes(
         )
 
         if decision.scenario is Scenario.A_KNOWN_ANCHOR:
-            # The domain is now known. Promote: re-run scenario A.
-            # The existing row's status will be overwritten by _record_success.
+            # Reuse the prior interaction_id (if present) so a retry of
+            # a publish-then-DB-fail race re-uses the SAME id —
+            # downstream dedup catches duplicate envelopes. Codex
+            # PR-X2 R1 P2 fix.
+            prior_iid = _coerce_uuid(row.get("eq_interaction_id"))
             await _ingest_scenario_a(
                 credential=credential,
                 note_summary=synth_summary,
                 detail=detail,
                 decision=decision,
                 pool=pool,
+                existing_interaction_id=prior_iid,
             )
-        # If scenario is still C or D, leave the row deferred. (Scenario
-        # D would imply the note's attendees changed materially since
-        # defer time — unusual but Granola allows it; we keep the row in
-        # the deferred bucket and a future cycle will sort it.)
+        elif decision.scenario is Scenario.D_NO_BUSINESS:
+            await _record_skipped(
+                pool=pool,
+                credential=credential,
+                note_id=external_id,
+                reason="no_business_attendees",
+                granola_updated_at=detail.updated_at,
+            )
+        # Scenario C: leave as deferred (or transition failed → deferred
+        # if the attendee set changed). Both cases: row already exists
+        # with status='deferred_pending_account' or 'failed'; we let it
+        # carry over. A future cycle may finally see a known account.
 
     return reprocessed
+
+
+# Back-compat alias for callers that still import the old name. The
+# Phase 2e scheduler design references reprocess_deferred_notes; this
+# alias lets that land before the scheduler PR re-points it.
+reprocess_deferred_notes = reprocess_pending_notes
+
+
+def _coerce_uuid(value: Any) -> Optional[UUID]:
+    """Normalize asyncpg's UUID return (either UUID or str) to Optional[UUID]."""
+    if value is None:
+        return None
+    if isinstance(value, UUID):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return UUID(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _rebuild_detail_from_snapshot(
@@ -679,6 +820,7 @@ def _build_envelope(
     detail: GranolaNoteDetail,
     anchor_account_id: str,
     decision: PathTwoDecision,
+    interaction_id: Optional[UUID] = None,
 ) -> EnvelopeV1:
     """Construct the EnvelopeV1 per LOCKED-35/36.
 
@@ -723,7 +865,7 @@ def _build_envelope(
         timestamp=detail.created_at,
         source="generic",  # LOCKED-35
         extras=extras,  # LOCKED-36
-        interaction_id=uuid4(),
+        interaction_id=interaction_id or uuid4(),
         trace_id=None,
         account_id=anchor_account_id,
         pg_user_id=str(credential.user_id),
@@ -1065,6 +1207,23 @@ WHERE tenant_id = $1
 ORDER BY created_at ASC
 """
 
+# Retryable rows = deferred (waiting for unknown-domain approval) +
+# failed (transient note-level failure, still within retry budget).
+# ``failed_permanent`` rows are excluded so retry-exhausted notes don't
+# keep getting reprocessed forever. Codex PR-X2 R1 P1 fix — previously
+# only 'deferred_pending_account' rows were reprocessed, so a 'failed'
+# note that dropped out of the list_notes ``created_after`` window was
+# permanently stranded.
+_SELECT_PENDING_INTEGRATION_RUNS_SQL = """
+SELECT id, external_id, status, granola_note_snapshot, retry_count, eq_interaction_id
+FROM public.external_integration_runs
+WHERE tenant_id = $1
+  AND user_id = $2
+  AND provider = $3
+  AND status IN ('deferred_pending_account', 'failed')
+ORDER BY created_at ASC
+"""
+
 _UPSERT_INTEGRATION_RUN_SQL = """
 INSERT INTO public.external_integration_runs (
     id, tenant_id, user_id, account_id, provider, external_id,
@@ -1094,7 +1253,7 @@ SET account_id = EXCLUDED.account_id,
 
 _UPDATE_CREDENTIAL_POLL_SUCCESS_SQL = """
 UPDATE vault.user_credentials
-SET last_polled_at = CURRENT_TIMESTAMP,
+SET last_polled_at = $4,
     consecutive_failures = 0,
     last_error = NULL,
     status = CASE WHEN status = 'active' THEN 'active' ELSE status END,
@@ -1165,6 +1324,65 @@ async def _get_deferred_runs(
             _PROVIDER,
         )
         return [dict(r) for r in rows]
+
+
+async def _get_pending_runs(
+    *,
+    pool: asyncpg.Pool,
+    tenant_id: UUID,
+    user_id: UUID,
+) -> list[dict[str, Any]]:
+    """List deferred + failed rows for re-poll consideration.
+
+    Codex PR-X2 R1 P1 fix: a 'failed' note dropping out of next cycle's
+    list_notes window (because last_polled_at advanced past its
+    created_at) would be stranded forever. This query pulls both
+    statuses so the cycle-end retry pass picks both up.
+    ``failed_permanent`` rows are excluded so retry-exhausted notes
+    don't loop.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            _SELECT_PENDING_INTEGRATION_RUNS_SQL,
+            tenant_id,
+            user_id,
+            _PROVIDER,
+        )
+        return [dict(r) for r in rows]
+
+
+async def _record_in_progress(
+    *,
+    pool: asyncpg.Pool,
+    credential: GranolaCredential,
+    note_id: str,
+    account_id: str,
+    eq_interaction_id: UUID,
+    granola_updated_at: Optional[datetime],
+) -> None:
+    """UPSERT external_integration_runs with status='in_progress'.
+
+    Codex PR-X2 R1 P2 fix: written BEFORE Lane 1 publish so a crash
+    between publish and the success UPSERT can't strand the
+    eq_interaction_id. On the next cycle, ``process_note``'s idempotency
+    check sees the in_progress row, retrieves the eq_interaction_id, and
+    re-uses it on the retry — downstream consumers dedup on interaction
+    id, so duplicate Lane 1 events do not produce duplicate entities.
+
+    The 'in_progress' string is NOT in :class:`IngestionOutcome` since
+    it's never a terminal outcome of :func:`process_note`; the next
+    UPSERT (success / failed) overwrites it.
+    """
+    await _upsert_integration_run(
+        pool=pool,
+        credential=credential,
+        note_id=note_id,
+        account_id=account_id,
+        eq_interaction_id=eq_interaction_id,
+        granola_updated_at=granola_updated_at,
+        ingested_at=None,
+        status=_STATUS_IN_PROGRESS,
+    )
 
 
 async def _record_success(
@@ -1362,15 +1580,24 @@ async def _upsert_integration_run(
 
 
 async def _mark_credential_polled_success(
-    *, credential: GranolaCredential, pool: asyncpg.Pool
+    *, credential: GranolaCredential, pool: asyncpg.Pool, last_polled_at: datetime
 ) -> None:
-    """End-of-cycle: reset consecutive_failures, stamp last_polled_at."""
+    """End-of-cycle: reset consecutive_failures, stamp last_polled_at.
+
+    ``last_polled_at`` is supplied by the caller as the CYCLE-START
+    timestamp (not cycle-end / CURRENT_TIMESTAMP). Using cycle-start
+    prevents the "note created during cycle window" race that Codex
+    PR-X2 R1 P1 flagged: a note created between ``list_notes`` and the
+    end-of-cycle UPDATE would not be in the result set, and next
+    cycle's ``created_after=cycle_end`` filter would skip it forever.
+    """
     async with pool.acquire() as conn:
         await conn.execute(
             _UPDATE_CREDENTIAL_POLL_SUCCESS_SQL,
             credential.id,
             credential.tenant_id,
             credential.user_id,
+            last_polled_at,
         )
 
 

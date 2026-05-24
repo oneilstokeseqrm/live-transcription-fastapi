@@ -909,8 +909,10 @@ async def test_reprocess_deferred_note_recovers_from_snapshot_when_404():
     deferred_row = {
         "id": uuid4(),
         "external_id": "not_deleted",
+        "status": "deferred_pending_account",
         "granola_note_snapshot": json.dumps(snapshot),
         "retry_count": 0,
+        "eq_interaction_id": None,
     }
 
     # Sequential fetchrow responses:
@@ -992,8 +994,15 @@ async def test_run_one_cycle_skips_inactive_credential():
 
 
 @pytest.mark.asyncio
-async def test_run_one_cycle_marks_polled_success_after_clean_run():
-    """Happy path: after all notes process, last_polled_at is stamped."""
+async def test_run_one_cycle_marks_polled_success_with_cycle_start_timestamp():
+    """Codex PR-X2 R1 P1 fix: last_polled_at = cycle-START timestamp, not
+    cycle-end / CURRENT_TIMESTAMP.
+
+    Notes created during the cycle window (between list_notes and the
+    end-of-cycle UPDATE) MUST be reachable by the next cycle's
+    ``created_after=last_polled_at`` filter. Cycle-end timestamping
+    would skip them forever.
+    """
     credential = _build_credential()
     conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])  # no deferred rows
     pool = _FakePool(conn)
@@ -1002,22 +1011,249 @@ async def test_run_one_cycle_marks_polled_success_after_clean_run():
     client.list_notes = AsyncMock(return_value=[])  # no new notes
     client.aclose = AsyncMock()
 
+    before = datetime.now(timezone.utc)
     with patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())):
         result = await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
             pool=pool,  # type: ignore[arg-type]
             api_client=client,
         )
+    after = datetime.now(timezone.utc)
 
     assert result.notes_processed == 0
     assert result.credential_error_code is None
-    # _UPDATE_CREDENTIAL_POLL_SUCCESS_SQL invoked
     success_updates = [
         c for c in conn.execute_calls
-        if "last_polled_at = CURRENT_TIMESTAMP" in c[0]
+        if "last_polled_at = $4" in c[0]
         and "consecutive_failures = 0" in c[0]
     ]
     assert len(success_updates) == 1
+    # The 4th positional arg (index 3) is the cycle_start_at timestamp.
+    last_polled_at_arg = success_updates[0][1][3]
+    assert isinstance(last_polled_at_arg, datetime)
+    assert before <= last_polled_at_arg <= after, (
+        "last_polled_at must be a cycle-START timestamp, not cycle-end "
+        "(Codex PR-X2 R1 P1 fix)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codex PR-X2 R1 P1 fixes: failed-row retry + cycle-start watermark
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reprocess_pending_notes_retries_failed_rows():
+    """Codex PR-X2 R1 P1 fix: 'failed' rows are retried by the end-of-cycle
+    reprocess pass — previously only 'deferred_pending_account' rows were
+    retried, leaving 'failed' rows stranded once last_polled_at advanced
+    past their created_at."""
+    credential = _build_credential()
+    failed_row = {
+        "id": uuid4(),
+        "external_id": "not_was_5xx",
+        "status": "failed",
+        "granola_note_snapshot": None,
+        "retry_count": 2,
+        "eq_interaction_id": None,
+    }
+    conn = _FakeConn(fetchrow_seq=[None], fetch_returns=[failed_row])
+    pool = _FakePool(conn)
+
+    # Now Granola is healthy again and the note has a known business
+    # attendee (domain was approved in the meantime). The retry should
+    # promote it to success.
+    note_detail = _make_note_detail(
+        note_id="not_was_5xx",
+        attendees=[Attendee(email="dan@nowknown.com")],
+    )
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.get_note_detail = AsyncMock(return_value=note_detail)
+
+    entered = MagicMock()
+    entered.commit = AsyncMock()
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=entered)
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="44444444-aaaa-4111-8111-444444444444")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "process", new=AsyncMock(return_value=text_clean_service.ProcessResult(
+             interaction_id="00000000-0000-4000-8000-0000000000bb",
+             lane1_published=True, lane2_dispatched=True))):
+        count = await adapter.reprocess_pending_notes(
+            credential=credential,  # type: ignore[arg-type]
+            client=client,
+            pool=pool,  # type: ignore[arg-type]
+            internal_domains=set(),
+        )
+
+    assert count == 1
+    # The failed row was promoted to success (UPSERT with status='success').
+    upserts = [c for c in conn.execute_calls if "external_integration_runs" in c[0]]
+    assert any("success" in c[1] for c in upserts)
+
+
+@pytest.mark.asyncio
+async def test_reprocess_pending_notes_marks_failed_note_skipped_when_deleted():
+    """A 'failed' row whose note has since been deleted on Granola
+    transitions to 'skipped_no_business_attendees' (with reason
+    'note_deleted_before_retry_succeeded') rather than re-failing
+    forever."""
+    credential = _build_credential()
+    failed_row = {
+        "id": uuid4(),
+        "external_id": "not_gone",
+        "status": "failed",
+        "granola_note_snapshot": None,
+        "retry_count": 3,
+        "eq_interaction_id": None,
+    }
+    conn = _FakeConn(fetchrow_seq=[None], fetch_returns=[failed_row])
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.get_note_detail = AsyncMock(side_effect=GranolaError(
+        GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND, "gone"
+    ))
+
+    count = await adapter.reprocess_pending_notes(
+        credential=credential,  # type: ignore[arg-type]
+        client=client,
+        pool=pool,  # type: ignore[arg-type]
+        internal_domains=set(),
+    )
+
+    assert count == 1
+    upserts = [c for c in conn.execute_calls if "external_integration_runs" in c[0]]
+    # status='skipped_no_business_attendees', error_code='note_deleted_before_retry_succeeded'
+    assert any("skipped_no_business_attendees" in c[1] for c in upserts)
+    assert any("note_deleted_before_retry_succeeded" in c[1] for c in upserts)
+
+
+# ---------------------------------------------------------------------------
+# Codex PR-X2 R1 P2: in_progress idempotency anchor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scenario_a_writes_in_progress_row_before_publish():
+    """Pre-publish 'in_progress' UPSERT records the eq_interaction_id so a
+    crash between Lane 1 publish and the success UPSERT preserves the
+    idempotency anchor (Codex PR-X2 R1 P2)."""
+    credential = _build_credential()
+    note_summary = _make_note_summary("not_safe")
+    note_detail = _make_note_detail(
+        note_id="not_safe",
+        attendees=[Attendee(email="alice@knownco.com")],
+    )
+
+    conn = _FakeConn(fetchrow_returns=None)
+    pool = _FakePool(conn)
+    client = MagicMock(spec=GranolaAPIClient)
+    client.get_note_detail = AsyncMock(return_value=note_detail)
+
+    captured_envelopes: list = []
+
+    async def _fake_process(**kwargs):
+        captured_envelopes.append(kwargs["envelope"])
+        return text_clean_service.ProcessResult(
+            interaction_id=str(kwargs["envelope"].interaction_id),
+            lane1_published=True, lane2_dispatched=True,
+        )
+
+    entered = MagicMock()
+    entered.commit = AsyncMock()
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=entered)
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
+        outcome = await adapter.process_note(
+            credential=credential,  # type: ignore[arg-type]
+            note_summary=note_summary,
+            client=client,
+            pool=pool,  # type: ignore[arg-type]
+            internal_domains=set(),
+        )
+
+    assert outcome is IngestionOutcome.SUCCESS
+    assert len(captured_envelopes) == 1
+    envelope_interaction_id = captured_envelopes[0].interaction_id
+
+    upserts = [c for c in conn.execute_calls if "external_integration_runs" in c[0]]
+    # 'in_progress' UPSERT happens BEFORE 'success' UPSERT, and both
+    # carry the SAME eq_interaction_id (positional arg index 6).
+    in_progress = [c for c in upserts if "in_progress" in c[1]]
+    success = [c for c in upserts if "success" in c[1]]
+    assert len(in_progress) >= 1
+    assert len(success) >= 1
+    in_progress_iid = in_progress[0][1][6]
+    success_iid = success[0][1][6]
+    assert in_progress_iid == envelope_interaction_id
+    assert success_iid == envelope_interaction_id
+
+
+@pytest.mark.asyncio
+async def test_scenario_a_retry_reuses_existing_interaction_id():
+    """On retry, the prior 'in_progress' (or 'failed') row's
+    eq_interaction_id is reused as envelope.interaction_id so duplicate
+    Lane 1 events deduplicate at downstream consumers."""
+    credential = _build_credential()
+    note_summary = _make_note_summary("not_retry")
+    note_detail = _make_note_detail(
+        note_id="not_retry",
+        attendees=[Attendee(email="bob@knownco.com")],
+    )
+
+    prior_iid = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    existing_row = {
+        "id": uuid4(),
+        "account_id": "11111111-aaaa-4111-8111-111111111111",
+        "status": "failed",
+        "retry_count": 1,
+        "granola_note_snapshot": None,
+        "eq_interaction_id": prior_iid,
+    }
+    conn = _FakeConn(fetchrow_returns=existing_row)
+    pool = _FakePool(conn)
+    client = MagicMock(spec=GranolaAPIClient)
+    client.get_note_detail = AsyncMock(return_value=note_detail)
+
+    captured: list = []
+
+    async def _fake_process(**kwargs):
+        captured.append(kwargs["envelope"])
+        return text_clean_service.ProcessResult(
+            interaction_id=str(kwargs["envelope"].interaction_id),
+            lane1_published=True, lane2_dispatched=True,
+        )
+
+    entered = MagicMock()
+    entered.commit = AsyncMock()
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=entered)
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
+        await adapter.process_note(
+            credential=credential,  # type: ignore[arg-type]
+            note_summary=note_summary,
+            client=client,
+            pool=pool,  # type: ignore[arg-type]
+            internal_domains=set(),
+        )
+
+    assert len(captured) == 1
+    assert captured[0].interaction_id == prior_iid, (
+        "Retry must re-use the prior eq_interaction_id so downstream "
+        "consumers dedup the duplicate publish (Codex PR-X2 R1 P2)."
+    )
 
 
 @pytest.mark.asyncio
