@@ -342,6 +342,10 @@ async def process_note(
         return IngestionOutcome.SKIPPED_NO_BUSINESS_ATTENDEES
 
     if decision.scenario is Scenario.A_KNOWN_ANCHOR:
+        # Pre-existing retry_count flows so the budget converges to
+        # failed_permanent under sustained outages (Codex PR-X2 R2 P2
+        # fix). New row → 0.
+        existing_retry_count: int = (existing or {}).get("retry_count", 0) or 0
         return await _ingest_scenario_a(
             credential=credential,
             note_summary=note_summary,
@@ -349,6 +353,7 @@ async def process_note(
             decision=decision,
             pool=pool,
             existing_interaction_id=existing_interaction_id,
+            existing_retry_count=existing_retry_count,
         )
 
     # Scenario C: 0 known accounts, >= 1 unknown business attendee.
@@ -426,6 +431,7 @@ async def _ingest_scenario_a(
     decision: PathTwoDecision,
     pool: asyncpg.Pool,
     existing_interaction_id: Optional[UUID] = None,
+    existing_retry_count: int = 0,
 ) -> IngestionOutcome:
     """Build envelope per LOCKED-35/36 and dispatch via text_clean_service.
 
@@ -440,6 +446,12 @@ async def _ingest_scenario_a(
     ``envelope.interaction_id`` so a retry of a publish-then-DB-fail
     race republishes under the SAME interaction id (downstream consumers
     dedup on it). Codex PR-X2 R1 P2 mitigation.
+
+    ``existing_retry_count`` carries the prior row's retry_count so
+    repeated Scenario A failures converge to FAILED_PERMANENT under
+    sustained backpressure / Lane1-publish outages (Codex PR-X2 R2 P2
+    fix). New rows start at 0; on each failure path the count is
+    incremented and checked against _PER_NOTE_RETRY_LIMIT.
     """
     if not text_clean_service.try_reserve_lane2_slot():
         in_flight = text_clean_service.get_lane2_in_flight()
@@ -448,15 +460,14 @@ async def _ingest_scenario_a(
             f"granola_adapter: Lane 2 backpressure ({in_flight}/{cap}); "
             f"deferring note {note_summary.id} to next cycle"
         )
-        await _record_failed(
+        return await _record_scenario_a_failure(
             pool=pool,
             credential=credential,
-            note_id=note_summary.id,
+            note_summary=note_summary,
             error_code="lane2_backpressure",
             error_detail={"in_flight": in_flight, "cap": cap},
-            granola_updated_at=note_summary.updated_at,
+            existing_retry_count=existing_retry_count,
         )
-        return IngestionOutcome.FAILED
 
     slot_held = True
     anchor_account_id = decision.anchor_account_id
@@ -507,15 +518,14 @@ async def _ingest_scenario_a(
                 # (preserves the same pattern as routers/text.py post-PR-X1).
                 slot_held = False
         except text_clean_service.Lane1PublishError:
-            await _record_failed(
+            return await _record_scenario_a_failure(
                 pool=pool,
                 credential=credential,
-                note_id=note_summary.id,
+                note_summary=note_summary,
                 error_code="text_clean_lane1_publish_failed",
                 error_detail={"note_id": note_summary.id},
-                granola_updated_at=note_summary.updated_at,
+                existing_retry_count=existing_retry_count,
             )
-            return IngestionOutcome.FAILED
 
         await _record_success(
             pool=pool,
@@ -725,6 +735,7 @@ async def reprocess_pending_notes(
             # downstream dedup catches duplicate envelopes. Codex
             # PR-X2 R1 P2 fix.
             prior_iid = _coerce_uuid(row.get("eq_interaction_id"))
+            existing_retry_count = int(row.get("retry_count") or 0)
             await _ingest_scenario_a(
                 credential=credential,
                 note_summary=synth_summary,
@@ -732,6 +743,7 @@ async def reprocess_pending_notes(
                 decision=decision,
                 pool=pool,
                 existing_interaction_id=prior_iid,
+                existing_retry_count=existing_retry_count,
             )
         elif decision.scenario is Scenario.D_NO_BUSINESS:
             await _record_skipped(
@@ -741,10 +753,24 @@ async def reprocess_pending_notes(
                 reason="no_business_attendees",
                 granola_updated_at=detail.updated_at,
             )
-        # Scenario C: leave as deferred (or transition failed → deferred
-        # if the attendee set changed). Both cases: row already exists
-        # with status='deferred_pending_account' or 'failed'; we let it
-        # carry over. A future cycle may finally see a known account.
+        else:
+            # Scenario C — the row's attendees include unknown business
+            # domains and no known anchor. If this is a 'failed' row
+            # being replayed (Codex PR-X2 R2 P2 fix), we MUST defer so
+            # the granola_note_snapshot is captured + pending-domain
+            # signals are queued (LOCKED-44 recoverability). A 'deferred'
+            # row being replayed has a snapshot already; calling defer
+            # again is a no-op-ish UPSERT that refreshes the captured_at
+            # timestamp + ensures signal rows for any newly-discovered
+            # attendees in the recovered detail. Either way the row
+            # ends up in the approval flow.
+            await _defer_pending_account(
+                credential=credential,
+                note_summary=synth_summary,
+                detail=detail,
+                decision=decision,
+                pool=pool,
+            )
 
     return reprocessed
 
@@ -1189,7 +1215,7 @@ async def _queue_unknown_domain_signals(
 
 
 _SELECT_INTEGRATION_RUN_SQL = """
-SELECT id, account_id, status, retry_count, granola_note_snapshot
+SELECT id, account_id, status, retry_count, granola_note_snapshot, eq_interaction_id
 FROM public.external_integration_runs
 WHERE tenant_id = $1
   AND user_id = $2
@@ -1238,7 +1264,13 @@ INSERT INTO public.external_integration_runs (
 )
 ON CONFLICT (tenant_id, user_id, provider, external_id) DO UPDATE
 SET account_id = EXCLUDED.account_id,
-    eq_interaction_id = EXCLUDED.eq_interaction_id,
+    -- Preserve the dedupe key when a retry path doesn't supply one.
+    -- Without COALESCE, a backpressure/Lane1-failure UPSERT would clobber
+    -- the eq_interaction_id from the prior 'in_progress' row, and the
+    -- next successful retry would mint a NEW id → downstream dedup
+    -- breaks (Codex PR-X2 R2 P2 fix).
+    eq_interaction_id = COALESCE(EXCLUDED.eq_interaction_id,
+                                  public.external_integration_runs.eq_interaction_id),
     granola_updated_at = EXCLUDED.granola_updated_at,
     ingested_at = EXCLUDED.ingested_at,
     status = EXCLUDED.status,
@@ -1349,6 +1381,53 @@ async def _get_pending_runs(
             _PROVIDER,
         )
         return [dict(r) for r in rows]
+
+
+async def _record_scenario_a_failure(
+    *,
+    pool: asyncpg.Pool,
+    credential: GranolaCredential,
+    note_summary: GranolaNoteSummary,
+    error_code: str,
+    error_detail: dict[str, Any],
+    existing_retry_count: int,
+) -> IngestionOutcome:
+    """Record a Scenario A failure with retry-budget convergence.
+
+    Codex PR-X2 R2 P2 fix: previously each failure recorded
+    retry_count=1 regardless of history, so a 'failed' row replayed
+    through reprocess_pending_notes would never converge to
+    failed_permanent under sustained outages. This helper increments
+    the existing count and routes to _record_failed_permanent at the
+    threshold.
+
+    Returns :attr:`IngestionOutcome.FAILED` for transient retries or
+    :attr:`IngestionOutcome.FAILED_PERMANENT` when the budget is
+    exhausted.
+    """
+    new_retry_count = existing_retry_count + 1
+    detail_with_count = {**error_detail, "retry_count": new_retry_count}
+
+    if new_retry_count > _PER_NOTE_RETRY_LIMIT:
+        await _record_failed_permanent(
+            pool=pool,
+            credential=credential,
+            note_id=note_summary.id,
+            error_code=error_code,
+            error_detail=detail_with_count,
+            granola_updated_at=note_summary.updated_at,
+        )
+        return IngestionOutcome.FAILED_PERMANENT
+
+    await _record_failed(
+        pool=pool,
+        credential=credential,
+        note_id=note_summary.id,
+        error_code=error_code,
+        error_detail=detail_with_count,
+        granola_updated_at=note_summary.updated_at,
+    )
+    return IngestionOutcome.FAILED
 
 
 async def _record_in_progress(

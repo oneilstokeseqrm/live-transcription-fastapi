@@ -1257,6 +1257,118 @@ async def test_scenario_a_retry_reuses_existing_interaction_id():
 
 
 @pytest.mark.asyncio
+async def test_scenario_a_backpressure_failures_converge_to_failed_permanent():
+    """Codex PR-X2 R2 P2 fix: repeated Scenario A failures (backpressure /
+    Lane1 publish) MUST converge to FAILED_PERMANENT after
+    _PER_NOTE_RETRY_LIMIT attempts.
+
+    Pre-fix, _record_failed used default retry_count=1 regardless of the
+    row's prior retry_count, so a row replayed through
+    reprocess_pending_notes was stuck in FAILED forever under sustained
+    outages.
+    """
+    credential = _build_credential()
+    note_summary = _make_note_summary("not_stuck")
+    note_detail = _make_note_detail(
+        note_id="not_stuck",
+        attendees=[Attendee(email="alice@knownco.com")],
+    )
+
+    # Existing row at the retry limit; next attempt pushes to permanent.
+    existing_row = {
+        "id": uuid4(),
+        "account_id": "11111111-aaaa-4111-8111-111111111111",
+        "status": "failed",
+        "retry_count": adapter._PER_NOTE_RETRY_LIMIT,
+        "granola_note_snapshot": None,
+        "eq_interaction_id": None,
+    }
+    conn = _FakeConn(fetchrow_returns=existing_row)
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.get_note_detail = AsyncMock(return_value=note_detail)
+
+    entered = MagicMock()
+    entered.commit = AsyncMock()
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=entered)
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "try_reserve_lane2_slot", return_value=False):
+
+        outcome = await adapter.process_note(
+            credential=credential,  # type: ignore[arg-type]
+            note_summary=note_summary,
+            client=client,
+            pool=pool,  # type: ignore[arg-type]
+            internal_domains=set(),
+        )
+
+    assert outcome is IngestionOutcome.FAILED_PERMANENT
+    upserts = [c for c in conn.execute_calls if "external_integration_runs" in c[0]]
+    assert any("failed_permanent" in c[1] for c in upserts)
+
+
+@pytest.mark.asyncio
+async def test_reprocess_pending_failed_row_classifies_to_scenario_c_defers():
+    """Codex PR-X2 R2 P2 fix: a failed row that replays into Scenario C
+    MUST call _defer_pending_account so the granola_note_snapshot is
+    captured + pending-domain signals are queued (LOCKED-44
+    recoverability)."""
+    credential = _build_credential()
+    failed_row = {
+        "id": uuid4(),
+        "external_id": "not_reclass_c",
+        "status": "failed",
+        "granola_note_snapshot": None,
+        "retry_count": 2,
+        "eq_interaction_id": None,
+    }
+    conn = _FakeConn(fetchrow_seq=[None], fetch_returns=[failed_row])
+    pool = _FakePool(conn)
+
+    # Note has unknown-business attendees only → Scenario C on this replay.
+    note_detail = _make_note_detail(
+        note_id="not_reclass_c",
+        attendees=[Attendee(email="x@new-bidder.com", name="New Bidder")],
+    )
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.get_note_detail = AsyncMock(return_value=note_detail)
+
+    entered = MagicMock()
+    entered.commit = AsyncMock()
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=entered)
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value=None)), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "reopen_archived_entry", new=AsyncMock(return_value=None)), \
+         patch.object(adapter, "upsert_queue_entry", new=AsyncMock(return_value="11111111-bbbb-4111-8111-111111111111")), \
+         patch.object(adapter, "insert_signal", new=AsyncMock(return_value=None)):
+        count = await adapter.reprocess_pending_notes(
+            credential=credential,  # type: ignore[arg-type]
+            client=client,
+            pool=pool,  # type: ignore[arg-type]
+            internal_domains=set(),
+        )
+
+    assert count == 1
+    # Row transitioned from 'failed' → 'deferred_pending_account' with
+    # a snapshot captured.
+    upserts = [c for c in conn.execute_calls if "external_integration_runs" in c[0]]
+    deferred = [c for c in upserts if "deferred_pending_account" in c[1]]
+    assert len(deferred) >= 1, (
+        "A failed row that replays into Scenario C must call "
+        "_defer_pending_account, not stay 'failed' (Codex PR-X2 R2 P2)."
+    )
+
+
+@pytest.mark.asyncio
 async def test_scenario_a_lane2_backpressure_records_failed_not_success():
     """When try_reserve_lane2_slot returns False, the note records as
     transient failure (retry next cycle), NOT as success."""
