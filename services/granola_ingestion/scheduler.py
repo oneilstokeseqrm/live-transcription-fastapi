@@ -178,11 +178,19 @@ async def list_active_credentials() -> list[CredentialMetadata]:
     is NOT loaded here. :func:`run_cycle_step` decrypts on demand
     inside its own step scope so the cleartext never crosses a DBOS
     step return boundary.
+
+    The retry loop wraps :func:`get_asyncpg_pool` too (Codex PR-#28 R2
+    P2): the pool is created lazily on first call, so a transient
+    failure during ``asyncpg.create_pool`` on cold start — or right
+    after the DB drops all connections — is exactly the case this
+    hardening targets. Keeping pool creation inside the loop means the
+    3-attempt budget covers initial-connection failures, not just
+    query failures on an already-built pool.
     """
-    pool = await get_asyncpg_pool()
     last_exc: Optional[BaseException] = None
     for attempt in range(1, _LIST_RETRY_ATTEMPTS + 1):
         try:
+            pool = await get_asyncpg_pool()
             async with pool.acquire() as conn:
                 rows = await conn.fetch(_LIST_ACTIVE_CREDENTIALS_SQL, _PROVIDER)
             return [

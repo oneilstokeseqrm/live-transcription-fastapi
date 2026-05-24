@@ -565,6 +565,30 @@ async def test_list_active_credentials_retries_transient_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_active_credentials_retries_pool_creation_failure(monkeypatch):
+    """Codex PR-#28 R2 P2: a transient failure during lazy
+    get_asyncpg_pool() (cold-start create_pool) is also retried — the
+    pool lookup lives INSIDE the retry loop, not before it."""
+    import asyncpg as _asyncpg
+
+    row = {"id": uuid4(), "tenant_id": uuid4(), "user_id": uuid4()}
+    conn = _FakeConn(fetch_returns=[row])
+    pool = _FakePool(conn)
+
+    # First get_asyncpg_pool() raises (create_pool blip); second succeeds.
+    get_pool_mock = AsyncMock(
+        side_effect=[_asyncpg.PostgresConnectionError("cold start"), pool]
+    )
+    monkeypatch.setattr(scheduler.asyncio, "sleep", AsyncMock())
+
+    with patch.object(scheduler, "get_asyncpg_pool", new=get_pool_mock):
+        result = await scheduler.list_active_credentials()
+
+    assert len(result) == 1
+    assert get_pool_mock.await_count == 2  # retried the pool creation
+
+
+@pytest.mark.asyncio
 async def test_list_active_credentials_raises_after_exhausting_retries(monkeypatch):
     """If every attempt fails, the last exception propagates so the
     cron tick returns 5xx and the next 5-min tick retries."""
