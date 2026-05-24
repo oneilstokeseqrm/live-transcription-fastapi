@@ -2589,3 +2589,86 @@ state can be modified by unmerged work; the merge gate is not the
 state gate.
 
 
+## Codex round-N convergence: scope-creep follow-ons (2026-05-24)
+
+### Lesson
+
+When you fix a finding from Codex review round N, the fix itself can
+introduce a narrower bug that round N+1 catches. This is NORMAL and
+expected — it's not a sign that Codex is making things up or that
+you're regressing; it's the convergence trajectory.
+
+The pattern: a fix that changes a default, a shared helper, or a
+configuration knob propagates through call sites the original author
+didn't audit. Codex sees the propagation surface (which the round-N
+finding didn't even mention) and flags it in round N+1.
+
+### Why
+
+Phase 2c (Granola HTTP API client) ran 6 Codex rounds. R3 bumped
+`_DEFAULT_MAX_PAGES` from 20 to 500 to accommodate real first-poll
+backfills against /notes. R4 caught that the bumped default also
+applied to /folders (shared via `_get_paginated`) — folder counts
+don't scale with account size, so a stuck cursor on /folders would
+now make 500 requests instead of 20. R4's fix introduced an
+`endpoint_kind`-specific override; R5 caught that the override
+REPLACED the caller's `max_pages` constructor knob instead of
+tightening it, so callers who explicitly set `max_pages=3` for
+latency control got 20 anyway. R5's fix used `min(caller, endpoint)`
+semantics; R6 confirmed clean.
+
+3 rounds of scope-creep follow-ons from one R3 change. None of
+them P0 or P1. All real production behavioral bugs. None visible
+in the unit tests that initially passed at R3 (the tests only
+covered /notes pagination — /folders pagination wasn't tested
+yet, and the caller-knob override wasn't a use case anyone
+imagined until Codex named it).
+
+### How to apply
+
+1. **When applying a Codex fix that changes a default, a shared
+   helper, or a public knob, audit the BLAST RADIUS before
+   committing.** "What ELSE goes through this code path? What
+   ELSE depends on this default? What public API does this
+   change shadow?" If you can't answer those in one pass, Codex
+   will answer them for you in N+1 — and you'll spend a round
+   per blast-radius hop.
+
+2. **For shared helpers (e.g., `_get_paginated` shared across
+   endpoints): make the per-call surface explicit at the
+   call-site, not the helper.** Each caller passes a contextual
+   parameter; the helper combines them. This makes the blast
+   radius readable from the caller's body, not buried in helper
+   defaults.
+
+3. **For public-API knobs that interact with internal defaults:
+   default to `min(caller, internal_default)` semantics, not
+   "caller-only" or "internal-only".** The min always honors
+   the strictest expressed intent.
+
+4. **Don't be surprised by 5-6 round convergence on areas with
+   shared infrastructure.** The Phase 2b vault module ran 7
+   rounds. Phase 2c ran 6. Both involved shared helpers
+   (vault: audit + accessor; Phase 2c: paginated helper) where
+   each fix exposed a new surface. Soft cap is advisory; ship
+   when severity converges to P2 with single-digit findings AND
+   the next round confirms no introduced bugs (R6 here, R7 in
+   Phase 2b).
+
+5. **Use `codex review --base <prior-commit>` once cumulative
+   diff exceeds ~1500 lines.** R4-R6 of Phase 2c all hit the
+   5.5-min `_gstack_codex_timeout_wrapper` on the full diff
+   against main; scoping to the prior commit (R4: --base R2;
+   R5: --base R3; R6: --base R4) returned in under 90s each.
+   This is the documented workaround per the earlier Phase 1.5
+   lesson, confirmed again this session.
+
+### Related
+
+[[feedback-codex-pre-merge-gate]] — the parent rule (Codex review
+is a merge gate, not a follow-up). This lesson refines it with the
+"scope-creep follow-on rounds are expected, not pathological"
+amendment.
+
+
+
