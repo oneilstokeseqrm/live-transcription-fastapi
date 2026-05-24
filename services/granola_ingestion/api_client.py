@@ -55,6 +55,21 @@ _DEFAULT_TIMEOUT_SECONDS = 30.0
 _DEFAULT_MAX_RETRIES = 4
 _DEFAULT_RETRY_BASE_DELAY_S = 1.0
 
+# Separate budget for consecutive 429 responses. A 429 indicates the SERVER
+# is asking us to slow down (not a transient transport failure), so we
+# don't consume the main retry budget on it — but sustained rate-limit
+# windows still need to surface as a structured failure rather than
+# hang the poll cycle indefinitely. Reset to zero on any non-429 response.
+_DEFAULT_MAX_CONSECUTIVE_429S = 3
+
+# Defensive ceiling on pagination loops. Granola's /notes returns at most
+# ~100 entries per page in our usage and is filtered by ``created_after``
+# (typically the credential's last_polled_at), so realistic pages-per-call
+# are 0-2. 20 pages = 2000 notes per cycle is well beyond any realistic
+# 5-min window; hitting it signals a cursor that isn't advancing (a real
+# bug, not a busy folder).
+_DEFAULT_MAX_PAGES = 20
+
 # Cap how long we'll honor a server-suggested Retry-After. Granola's docs
 # advertise 5 req/sec sustained + 300/min — well above what the adapter
 # generates — so a Retry-After larger than this is almost certainly a
@@ -154,6 +169,8 @@ class GranolaAPIClient:
         http_client: httpx.AsyncClient | None = None,
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_base_delay_s: float = _DEFAULT_RETRY_BASE_DELAY_S,
+        max_consecutive_429s: int = _DEFAULT_MAX_CONSECUTIVE_429S,
+        max_pages: int = _DEFAULT_MAX_PAGES,
     ) -> None:
         if not api_key:
             # Fail loud at construction so the empty/missing-key case
@@ -163,6 +180,8 @@ class GranolaAPIClient:
         self.base_url = base_url.rstrip("/")
         self._max_retries = max_retries
         self._retry_base_delay_s = retry_base_delay_s
+        self._max_consecutive_429s = max_consecutive_429s
+        self._max_pages = max_pages
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(timeout=timeout)
 
@@ -222,25 +241,89 @@ class GranolaAPIClient:
         instant — passing the credential's ``last_polled_at`` keeps each
         poll cycle work-bounded.
 
-        Pagination is deferred to Phase 2.1; current scale (3 design
-        partners on 5-min cadence with new-note filtering) makes a
-        single page sufficient.
+        **Transparent cursor pagination.** Granola's ``/notes`` response
+        is the same ``{notes, hasMore, cursor}`` wrapper as ``/folders``;
+        when ``hasMore`` is true, we re-request with ``cursor=<value>``
+        and append until exhausted. This matters during initial-backfill
+        scenarios (a fresh credential with ``last_polled_at=NULL`` may
+        match thousands of notes); without it later pages would be
+        silently dropped and never re-fetched because the next poll
+        advances ``last_polled_at`` past them.
+
+        Phase 0 empirically verified the wrapper shape on ``/folders``;
+        the ``?cursor=<value>`` request-side parameter is the canonical
+        next-page pattern across Granola-class APIs (Stripe / Linear /
+        Notion idiom) and is the working assumption pending Phase 4
+        production verification. Capped at ``self._max_pages`` so a
+        non-advancing cursor (a real bug, not a busy folder) fails
+        loud as :attr:`GranolaErrorCode.GRANOLA_PARSE_ERROR` instead
+        of looping forever.
         """
-        params: dict[str, str | int] = {
+        base_params: dict[str, str | int] = {
             "folder_id": folder_id,
             "limit": limit,
         }
         if created_after is not None:
-            params["created_after"] = _format_created_after(created_after)
+            base_params["created_after"] = _format_created_after(created_after)
 
-        body = await self._request_json(
-            "GET", "/notes", params=params, endpoint_kind="folder"
+        collected: list[GranolaNoteSummary] = []
+        cursor: str | None = None
+        for page_index in range(self._max_pages):
+            params = dict(base_params)
+            if cursor:
+                params["cursor"] = cursor
+
+            body = await self._request_json(
+                "GET", "/notes", params=params, endpoint_kind="folder"
+            )
+
+            # Defensive: accept either {notes, hasMore, cursor} wrapper
+            # OR a bare list (in case a future endpoint version drops
+            # the wrapper).
+            if isinstance(body, dict):
+                items = body.get("notes")
+                has_more = bool(body.get("hasMore"))
+                next_cursor = body.get("cursor") or None
+            else:
+                items = body
+                has_more = False
+                next_cursor = None
+
+            collected.extend(
+                self._parse_list(items, GranolaNoteSummary, field_name="notes")
+            )
+
+            if not has_more:
+                return collected
+
+            # ``hasMore`` is true; we need a cursor to advance. If the
+            # server claims more pages but doesn't give us one, that's
+            # a malformed pagination response — fail loud rather than
+            # truncate.
+            if not next_cursor:
+                raise GranolaError(
+                    GranolaErrorCode.GRANOLA_PARSE_ERROR,
+                    "Granola /notes response set hasMore=true but omitted cursor",
+                )
+
+            # Cursor must advance between pages; if it doesn't we'd
+            # spin forever. This shouldn't happen on a well-behaved
+            # server but the check is cheap.
+            if next_cursor == cursor:
+                raise GranolaError(
+                    GranolaErrorCode.GRANOLA_PARSE_ERROR,
+                    "Granola /notes cursor did not advance between pages",
+                )
+            cursor = next_cursor
+
+        # Exhausted page budget. Either the user has >2000 new notes in
+        # one cycle (operationally implausible at our cadence) or the
+        # cursor is misbehaving in a way the per-page guard didn't
+        # catch. Surface as parse error so the adapter can bound it.
+        raise GranolaError(
+            GranolaErrorCode.GRANOLA_PARSE_ERROR,
+            f"Granola /notes pagination exceeded {self._max_pages} pages",
         )
-        # Granola is consistent with /folders and wraps lists; defensively
-        # accept a bare list too in case a future endpoint version drops
-        # the wrapper.
-        items = body.get("notes") if isinstance(body, dict) else body
-        return self._parse_list(items, GranolaNoteSummary, field_name="notes")
 
     async def get_note_detail(self, note_id: str) -> GranolaNoteDetail:
         """``GET /v1/notes/{note_id}?include=transcript`` → full note payload.
@@ -277,13 +360,20 @@ class GranolaAPIClient:
 
         * 5xx + :class:`httpx.TimeoutException` + :class:`httpx.ConnectError`
           → exponential backoff with jitter, up to ``self._max_retries``.
-        * 429 → honor ``Retry-After``; does NOT consume the retry budget
-          (a rate-limited request is the SERVER asking us to slow down,
-          not a transient transport failure).
+        * 429 → honor ``Retry-After``; does NOT consume the main retry
+          budget (the server is asking us to slow down, not a transport
+          failure) — but a SEPARATE consecutive-429 budget caps repeated
+          rate-limit responses so sustained throttling surfaces as
+          :attr:`GranolaErrorCode.GRANOLA_RATE_LIMITED` instead of
+          looping forever. Resets on any non-429 response.
         * 401/403 → :attr:`GranolaErrorCode.GRANOLA_AUTH_FAILED`, no retry.
-        * 404 → :attr:`GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND`, no retry
-          (the message clarifies whether the missing resource is a folder
-          or a note, based on ``endpoint_kind``).
+        * 404 on ``endpoint_kind='folder'`` →
+          :attr:`GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND`, no retry
+          (Phase 2d treats this as credential-level breakage).
+        * 404 on ``endpoint_kind='note'`` →
+          :attr:`GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND`, no retry
+          (Phase 2d treats this as a per-note skip — a single deleted
+          note must NOT mark the whole credential offline).
         * Other 4xx → :attr:`GranolaErrorCode.GRANOLA_HTTP_ERROR`, no retry
           (the caller has an input bug; retrying won't help).
         """
@@ -294,6 +384,7 @@ class GranolaAPIClient:
         }
 
         retry_attempt = 0
+        consecutive_429s = 0
         while True:
             try:
                 response = await self._client.request(
@@ -348,16 +439,29 @@ class GranolaAPIClient:
 
             if status == 404:
                 if endpoint_kind == "note":
-                    message = "Granola note not found (may have been deleted)"
-                else:
-                    message = "Granola folder not found"
+                    raise GranolaError(
+                        GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND,
+                        "Granola note not found (may have been deleted)",
+                        http_status=status,
+                    )
                 raise GranolaError(
                     GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND,
-                    message,
+                    "Granola folder not found",
                     http_status=status,
                 )
 
             if status == 429:
+                consecutive_429s += 1
+                if consecutive_429s > self._max_consecutive_429s:
+                    # Sustained rate-limit window — stop pretending it's
+                    # transient and surface to the caller. Phase 2d's
+                    # adapter classifies this as a credential-level
+                    # transient error (not a permanent breakage).
+                    raise GranolaError(
+                        GranolaErrorCode.GRANOLA_RATE_LIMITED,
+                        f"Granola returned 429 on {consecutive_429s} consecutive attempts",
+                        http_status=status,
+                    )
                 fallback = _build_jittered_delay(
                     self._retry_base_delay_s, retry_attempt
                 )
@@ -366,13 +470,20 @@ class GranolaAPIClient:
                     fallback_s=fallback,
                 )
                 logger.info(
-                    "granola_api_client: 429 from %s; sleeping %.2fs",
+                    "granola_api_client: 429 from %s (%d consecutive); sleeping %.2fs",
                     path,
+                    consecutive_429s,
                     retry_after,
                 )
                 await asyncio.sleep(retry_after)
-                # Intentional: 429 does NOT consume the retry budget.
+                # 429 does NOT consume the MAIN retry budget; the
+                # consecutive-429 counter above bounds the loop.
                 continue
+
+            # Any non-429 response — including 5xx that we'll retry —
+            # means rate-limit pressure has eased, so reset the
+            # consecutive-429 counter.
+            consecutive_429s = 0
 
             if 500 <= status < 600:
                 if retry_attempt >= self._max_retries:

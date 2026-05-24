@@ -24,9 +24,19 @@ class GranolaErrorCode(str, Enum):
 
     * 401 → :attr:`GRANOLA_AUTH_FAILED` (no retry — auth failures don't
       improve with retry; mark credential ``status='revoked'`` upstream).
-    * 404 on a folder-scoped call → :attr:`GRANOLA_FOLDER_NOT_FOUND`
-      (no retry — folder was deleted; mark ``status='error'`` upstream).
-    * 429 → :attr:`GRANOLA_RATE_LIMITED` (retry, honoring ``Retry-After``).
+    * 404 on a folder-scoped call (``list_folders``, ``list_notes``) →
+      :attr:`GRANOLA_FOLDER_NOT_FOUND` (no retry — folder was deleted;
+      Phase 2d treats this as credential-level breakage and marks the
+      credential ``status='error'``).
+    * 404 on ``get_note_detail`` → :attr:`GRANOLA_NOTE_NOT_FOUND` (no
+      retry — the note was deleted/moved between ``list_notes`` and
+      this call; Phase 2d treats this as a per-note skip, NOT a
+      credential breakage, so a single vanished note doesn't take the
+      whole credential offline).
+    * 429 → :attr:`GRANOLA_RATE_LIMITED` (retry, honoring ``Retry-After``,
+      but bounded by a consecutive-429 budget so sustained rate-limit
+      windows surface as a structured failure instead of hanging
+      forever).
     * 5xx → :attr:`GRANOLA_5XX` (retry with exponential backoff).
     * :class:`httpx.TimeoutException` → :attr:`GRANOLA_TIMEOUT` (retry).
     * Pydantic validation failure on a 2xx body →
@@ -46,6 +56,7 @@ class GranolaErrorCode(str, Enum):
 
     GRANOLA_AUTH_FAILED = "granola_auth_failed"
     GRANOLA_FOLDER_NOT_FOUND = "granola_folder_not_found"
+    GRANOLA_NOTE_NOT_FOUND = "granola_note_not_found"
     GRANOLA_RATE_LIMITED = "granola_429"
     GRANOLA_5XX = "granola_5xx"
     GRANOLA_TIMEOUT = "granola_timeout"

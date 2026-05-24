@@ -46,6 +46,8 @@ def _client_with_handler(
     *,
     max_retries: int = 4,
     retry_base_delay_s: float = 0.001,
+    max_consecutive_429s: int = 3,
+    max_pages: int = 20,
 ) -> GranolaAPIClient:
     """Build a client whose underlying httpx talks to ``handler``.
 
@@ -61,6 +63,8 @@ def _client_with_handler(
         http_client=http_client,
         max_retries=max_retries,
         retry_base_delay_s=retry_base_delay_s,
+        max_consecutive_429s=max_consecutive_429s,
+        max_pages=max_pages,
     )
 
 
@@ -458,7 +462,11 @@ async def test_404_on_list_folders_raises_folder_not_found(sleep_calls):
 
 
 @pytest.mark.asyncio
-async def test_404_on_get_note_detail_raises_with_note_message(sleep_calls):
+async def test_404_on_get_note_detail_raises_note_not_found(sleep_calls):
+    """Codex R1 P1: a deleted note must NOT raise GRANOLA_FOLDER_NOT_FOUND,
+    or Phase 2d will treat a single-note race as credential breakage and
+    take the whole connection offline."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"error": "Not Found"})
 
@@ -469,7 +477,8 @@ async def test_404_on_get_note_detail_raises_with_note_message(sleep_calls):
     finally:
         await client.aclose()
 
-    assert exc_info.value.code is GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND
+    assert exc_info.value.code is GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND
+    assert exc_info.value.http_status == 404
     assert "note" in exc_info.value.message.lower()
     assert sleep_calls == []
 
@@ -663,3 +672,226 @@ async def test_get_note_detail_validation_error_includes_cause(sleep_calls):
     assert exc_info.value.__cause__ is not None
     # Pydantic ValidationError carries error_count() ≥ 1
     assert exc_info.value.__cause__.__class__.__name__ == "ValidationError"
+
+
+# ---------------------------------------------------------------------------
+# Codex R1 fixes: consecutive-429 budget + cursor pagination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_429_consecutive_budget_exhausted_raises_granola_rate_limited(
+    sleep_calls,
+):
+    """Codex R1 P1: sustained 429s must surface as a structured failure
+    instead of looping forever. After ``max_consecutive_429s + 1`` 429
+    responses in a row, the client raises GRANOLA_RATE_LIMITED."""
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "1"})
+
+    client = _client_with_handler(handler, max_consecutive_429s=2)
+    try:
+        with pytest.raises(GranolaError) as exc_info:
+            await client.list_folders()
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.code is GranolaErrorCode.GRANOLA_RATE_LIMITED
+    assert exc_info.value.http_status == 429
+    # 1st 429 counts to 1 (sleep), 2nd to 2 (sleep), 3rd hits >2 → raise.
+    # So we made 3 HTTP calls and slept twice between them.
+    assert call_count["n"] == 3
+    assert len(sleep_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_429_followed_by_non_429_resets_consecutive_counter(sleep_calls):
+    """A 5xx or 200 between 429s clears the consecutive counter — a brief
+    rate-limit window followed by recovery + a fresh window shouldn't trip
+    the cap any faster than a clean 429 sequence would."""
+
+    sequence = iter(
+        [
+            429,
+            429,
+            503,  # non-429 — resets counter
+            429,  # back to 1
+            429,  # 2
+            200,  # success path
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = next(sequence)
+        if status == 429:
+            return httpx.Response(429, headers={"Retry-After": "1"})
+        if status == 503:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"folders": []})
+
+    # max_consecutive_429s=2 would normally fire after 3 in a row; the
+    # 503 mid-stream resets so we never accumulate 3 in a row even though
+    # we see 4 total 429s.
+    client = _client_with_handler(handler, max_consecutive_429s=2, max_retries=4)
+    try:
+        folders = await client.list_folders()
+    finally:
+        await client.aclose()
+
+    assert folders == []
+
+
+@pytest.mark.asyncio
+async def test_list_notes_paginates_with_cursor(sleep_calls):
+    """Codex R1 P2: hasMore=true responses must be paged through via
+    ?cursor=<value> instead of silently truncating at page 1."""
+
+    page_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page_count["n"] += 1
+        cursor_param = request.url.params.get("cursor")
+        if page_count["n"] == 1:
+            assert cursor_param is None  # first page, no cursor
+            return httpx.Response(
+                200,
+                json={
+                    "notes": [
+                        {"id": "not_1", "title": "A", "created_at": "2026-05-24T00:00:00Z"},
+                        {"id": "not_2", "title": "B", "created_at": "2026-05-24T00:01:00Z"},
+                    ],
+                    "hasMore": True,
+                    "cursor": "cur_page2",
+                },
+            )
+        if page_count["n"] == 2:
+            assert cursor_param == "cur_page2"
+            return httpx.Response(
+                200,
+                json={
+                    "notes": [
+                        {"id": "not_3", "title": "C", "created_at": "2026-05-24T00:02:00Z"},
+                    ],
+                    "hasMore": True,
+                    "cursor": "cur_page3",
+                },
+            )
+        assert cursor_param == "cur_page3"
+        return httpx.Response(
+            200,
+            json={
+                "notes": [
+                    {"id": "not_4", "title": "D", "created_at": "2026-05-24T00:03:00Z"},
+                ],
+                "hasMore": False,
+                "cursor": None,
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        notes = await client.list_notes(folder_id="fol_a")
+    finally:
+        await client.aclose()
+
+    assert page_count["n"] == 3
+    assert [n.id for n in notes] == ["not_1", "not_2", "not_3", "not_4"]
+
+
+@pytest.mark.asyncio
+async def test_list_notes_pagination_missing_cursor_raises_parse_error(sleep_calls):
+    """hasMore=true with no cursor is a malformed pagination response —
+    fail loud rather than truncate to first page (data-loss prevention)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "notes": [{"id": "not_1", "title": "A", "created_at": "2026-05-24T00:00:00Z"}],
+                "hasMore": True,
+                # cursor intentionally omitted
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        with pytest.raises(GranolaError) as exc_info:
+            await client.list_notes(folder_id="fol_a")
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.code is GranolaErrorCode.GRANOLA_PARSE_ERROR
+    assert "cursor" in exc_info.value.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_notes_pagination_non_advancing_cursor_raises_parse_error(
+    sleep_calls,
+):
+    """A cursor that doesn't advance between pages would spin forever —
+    fail loud after the second page returns the same cursor as the first."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "notes": [{"id": "not_x", "title": "X", "created_at": "2026-05-24T00:00:00Z"}],
+                "hasMore": True,
+                "cursor": "stuck",
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        with pytest.raises(GranolaError) as exc_info:
+            await client.list_notes(folder_id="fol_a")
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.code is GranolaErrorCode.GRANOLA_PARSE_ERROR
+    assert "advance" in exc_info.value.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_notes_pagination_max_pages_exceeded_raises_parse_error(
+    sleep_calls,
+):
+    """A misbehaving cursor that advances but never sets hasMore=false
+    would exhaust memory; cap at max_pages and surface as parse error."""
+
+    counter = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter["n"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "notes": [
+                    {
+                        "id": f"not_{counter['n']}",
+                        "title": "x",
+                        "created_at": "2026-05-24T00:00:00Z",
+                    }
+                ],
+                "hasMore": True,
+                "cursor": f"cur_{counter['n']}",
+            },
+        )
+
+    client = _client_with_handler(handler, max_consecutive_429s=99)  # unrelated
+    # Override max_pages via direct attr for compactness; in real use
+    # this would be the constructor argument.
+    client._max_pages = 3
+    try:
+        with pytest.raises(GranolaError) as exc_info:
+            await client.list_notes(folder_id="fol_a")
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.code is GranolaErrorCode.GRANOLA_PARSE_ERROR
+    assert "exceeded" in exc_info.value.message.lower()
+    assert counter["n"] == 3
