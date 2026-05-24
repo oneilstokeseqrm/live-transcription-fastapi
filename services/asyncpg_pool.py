@@ -25,13 +25,22 @@ statement cache is also unsafe through PgBouncer. So this pool resolves
 a DIRECT (non-pooler) connection, preferring (in order):
 
 1. ``GRANOLA_DB_DIRECT_URL`` — explicit override if an operator wants a
-   dedicated connection string.
-2. ``DBOS_SYSTEM_DATABASE_URL`` — already REQUIRED to be a direct
-   connection (:mod:`services.dbos_runtime`) and points at the same
-   ``neondb``, so reusing it needs no new Railway env var.
-3. ``DATABASE_URL`` — last-resort fallback. If this is a ``-pooler``
-   host we log a loud warning that advisory-lock serialization will be
-   unreliable.
+   dedicated direct connection string (must point at the APPLICATION
+   database — same ``vault`` / ``public`` schemas as ``DATABASE_URL``).
+2. otherwise derive a direct endpoint FROM ``DATABASE_URL`` by stripping
+   ``-pooler`` from the Neon host. This keeps the SAME database +
+   credentials and only swaps the PgBouncer endpoint for the direct
+   one. We deliberately do NOT reuse ``DBOS_SYSTEM_DATABASE_URL`` —
+   that variable is the DBOS *system* database contract
+   (:mod:`services.dbos_runtime`), which a deployment may point at a
+   dedicated database or role; binding the Granola pool there would
+   query the wrong database for ``vault.user_credentials`` (Codex
+   PR-#28 R5 P1). Deriving from ``DATABASE_URL`` guarantees same-DB.
+
+If the resolved host is STILL a ``-pooler`` host after derivation (an
+explicit ``GRANOLA_DB_DIRECT_URL`` that points at a pooler, or a
+non-Neon pooler whose host we can't rewrite), we log a loud warning
+that advisory-lock serialization will be unreliable.
 
 ``statement_cache_size=0`` is set unconditionally — it's the asyncpg
 setting required for PgBouncer compatibility and costs almost nothing
@@ -86,6 +95,36 @@ _DEFAULT_MIN_SIZE = 1
 _DEFAULT_MAX_SIZE = 10
 
 
+def _to_direct_neon_url(url: str) -> str:
+    """Rewrite a Neon ``-pooler`` host to its direct endpoint, preserving
+    the database, credentials, port, and query string.
+
+    Neon's pooled endpoint is ``<ep>-pooler.<rest>`` and the direct
+    endpoint is ``<ep>.<rest>`` — same database, different connection
+    route. Stripping ``-pooler`` keeps us on the SAME application
+    database (Codex PR-#28 R5 P1) while giving us the direct connection
+    the advisory lock needs (R4 P1). If the host has no ``-pooler``
+    segment (already direct, or a non-Neon host), the URL is returned
+    unchanged.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if "-pooler." not in host:
+        return url
+    direct_host = host.replace("-pooler.", ".", 1)
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+    portpart = f":{parsed.port}" if parsed.port else ""
+    new_netloc = f"{userinfo}{direct_host}{portpart}"
+    return urlunparse(
+        (parsed.scheme, new_netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+    )
+
+
 def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
     """Translate ``DATABASE_URL`` into an asyncpg-acceptable DSN + connect kwargs.
 
@@ -100,22 +139,27 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
        ``verify_mode=CERT_NONE`` matches the existing SQLAlchemy
        engine's setup (services/database.py).
     """
-    # Prefer a DIRECT (non-pooler) connection — see module docstring
-    # (Codex PR-#28 R4 P1). The advisory lock that serializes Granola
-    # cycles is session-scoped and is silently defeated by PgBouncer
-    # transaction pooling.
-    url = (
-        os.environ.get("GRANOLA_DB_DIRECT_URL")
-        or os.environ.get("DBOS_SYSTEM_DATABASE_URL")
-        or os.environ.get("DATABASE_URL")
-    )
-    if not url:
+    # Resolve a DIRECT (non-pooler) connection to the APPLICATION
+    # database — see module docstring (Codex PR-#28 R4 P1 + R5 P1). The
+    # advisory lock that serializes Granola cycles is session-scoped and
+    # is silently defeated by PgBouncer transaction pooling, so we need
+    # a direct endpoint; but it MUST be the same database DATABASE_URL
+    # points at (vault.user_credentials lives there), so we derive the
+    # direct host from DATABASE_URL rather than borrowing the DBOS
+    # system database URL.
+    explicit = os.environ.get("GRANOLA_DB_DIRECT_URL")
+    database_url = os.environ.get("DATABASE_URL")
+    if explicit:
+        url = explicit
+    elif database_url:
+        url = _to_direct_neon_url(database_url)
+    else:
         raise RuntimeError(
-            "No database URL for the asyncpg pool. Set one of "
-            "GRANOLA_DB_DIRECT_URL, DBOS_SYSTEM_DATABASE_URL, or "
-            "DATABASE_URL in Railway env config. Prefer a DIRECT "
-            "(non-pooler) Neon endpoint so the scheduler's advisory "
-            "lock works."
+            "No database URL for the asyncpg pool. Set DATABASE_URL "
+            "(its -pooler host is auto-rewritten to the direct Neon "
+            "endpoint) or GRANOLA_DB_DIRECT_URL (an explicit direct "
+            "connection to the application database) in Railway env "
+            "config."
         )
     parsed = urlparse(url)
     scheme = parsed.scheme

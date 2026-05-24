@@ -84,57 +84,76 @@ def test_resolve_dsn_without_sslmode_omits_ssl_kwarg(monkeypatch):
 
 def test_resolve_dsn_raises_when_no_url_env_set(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
     monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
     with pytest.raises(RuntimeError, match="No database URL"):
         asyncpg_pool._resolve_dsn_and_kwargs()
 
 
-def test_resolve_dsn_prefers_direct_url_over_pooler_database_url(monkeypatch):
-    """Codex PR-#28 R4 P1: the advisory lock needs a DIRECT connection.
-    DBOS_SYSTEM_DATABASE_URL (guaranteed direct) is preferred over the
-    pooler DATABASE_URL."""
+def test_resolve_dsn_derives_direct_host_from_pooler_database_url(monkeypatch):
+    """Codex PR-#28 R5 P1: the pool must stay on the APPLICATION
+    database, so the direct endpoint is derived FROM DATABASE_URL by
+    stripping -pooler — same db, same creds, direct route. We do NOT
+    borrow DBOS_SYSTEM_DATABASE_URL (could be a different database)."""
     monkeypatch.setenv(
         "DATABASE_URL",
-        "postgresql://u:p@ep-x-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
+        "postgresql://neondb_owner:pw@ep-silent-waterfall-adtinpn1-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
     )
-    monkeypatch.setenv(
-        "DBOS_SYSTEM_DATABASE_URL",
-        "postgresql://u:p@ep-x.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
-    )
+    # Even if a (different) DBOS system DB URL is present, it MUST be ignored.
+    monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", "postgresql://u:p@other-db.neon.tech/dbos_only")
     monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
     dsn, _ = asyncpg_pool._resolve_dsn_and_kwargs()
-    # Direct host (no -pooler), not the pooler DATABASE_URL.
+    # Direct endpoint of the SAME database (neondb), -pooler stripped.
     assert "-pooler." not in dsn
-    assert "ep-x.c-2" in dsn
+    assert "ep-silent-waterfall-adtinpn1.c-2.us-east-1.aws.neon.tech" in dsn
+    assert "/neondb" in dsn
+    assert "neondb_owner:pw@" in dsn  # creds preserved
+    # The unrelated DBOS system database must NOT leak in.
+    assert "other-db.neon.tech" not in dsn
+    assert "dbos_only" not in dsn
+
+
+def test_to_direct_neon_url_strips_pooler_preserving_everything():
+    src = "postgresql://user:p%40ss@ep-foo-pooler.c-2.us-east-1.aws.neon.tech:5432/mydb?sslmode=require"
+    out = asyncpg_pool._to_direct_neon_url(src)
+    assert out == "postgresql://user:p%40ss@ep-foo.c-2.us-east-1.aws.neon.tech:5432/mydb?sslmode=require"
+
+
+def test_to_direct_neon_url_noop_when_already_direct():
+    src = "postgresql://u:p@ep-foo.c-2.us-east-1.aws.neon.tech/db"
+    assert asyncpg_pool._to_direct_neon_url(src) == src
 
 
 def test_resolve_dsn_explicit_granola_direct_url_wins(monkeypatch):
-    """GRANOLA_DB_DIRECT_URL overrides everything."""
-    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@pooler-pooler.neon.tech/db")
-    monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", "postgresql://u:p@dbos.neon.tech/db")
-    monkeypatch.setenv("GRANOLA_DB_DIRECT_URL", "postgresql://u:p@explicit.neon.tech/db")
+    """GRANOLA_DB_DIRECT_URL overrides the DATABASE_URL derivation."""
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://u:p@ep-x-pooler.c-2.us-east-1.aws.neon.tech/neondb",
+    )
+    monkeypatch.setenv("GRANOLA_DB_DIRECT_URL", "postgresql://u:p@explicit.neon.tech/appdb")
     dsn, _ = asyncpg_pool._resolve_dsn_and_kwargs()
     assert "explicit.neon.tech" in dsn
+    assert "appdb" in dsn
 
 
 def test_resolve_dsn_always_disables_statement_cache(monkeypatch):
     """statement_cache_size=0 set unconditionally for PgBouncer safety."""
-    monkeypatch.setenv("DBOS_SYSTEM_DATABASE_URL", "postgresql://u:p@direct.neon.tech/db")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@ep-x.c-2.neon.tech/neondb")
     monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
     _, kwargs = asyncpg_pool._resolve_dsn_and_kwargs()
     assert kwargs["statement_cache_size"] == 0
 
 
-def test_resolve_dsn_warns_when_falling_back_to_pooler(monkeypatch, caplog):
-    """If only a -pooler DATABASE_URL is available, warn loudly that the
-    advisory lock will be unreliable."""
+def test_resolve_dsn_warns_when_explicit_url_is_still_pooler(monkeypatch, caplog):
+    """If an explicit GRANOLA_DB_DIRECT_URL still points at a -pooler
+    host (operator misconfiguration), warn loudly that the advisory
+    lock will be unreliable. The DATABASE_URL derivation path can't hit
+    this (it always strips -pooler), so we exercise it via the explicit
+    override."""
     import logging
 
-    monkeypatch.delenv("GRANOLA_DB_DIRECT_URL", raising=False)
-    monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv(
-        "DATABASE_URL",
+        "GRANOLA_DB_DIRECT_URL",
         "postgresql://u:p@ep-x-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require",
     )
     with caplog.at_level(logging.WARNING):
