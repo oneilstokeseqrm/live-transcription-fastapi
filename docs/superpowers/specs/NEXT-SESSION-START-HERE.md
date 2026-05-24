@@ -1,13 +1,15 @@
 # Next Session — Start Here
 
 **Project:** Phase 2 — Granola.ai transcript ingestion integration.
-**Last session:** 2026-05-24 (Phase 2d — text_clean_service extraction (PR-X1) + Granola adapter + Path 2 (PR-X2); two PRs, 8 substantive Codex rounds total).
-**Status:** ✅ **PHASE_2D_SHIPPED + PHASE_2E_NEXT** — Granola adapter live in production as inert code. The full Phase 2b → 2c → 2d composition chain (vault → API client → adapter → text_clean_service) is wired. Phase 2e wires it to a 5-minute Railway-cron + DBOS cadence.
+**Last session:** 2026-05-24 (Phase 2e — the scheduler: `services/granola_ingestion/scheduler.py` DBOS workflow + steps, `routers/granola_cron.py` cron endpoint, `services/asyncpg_pool.py` direct-connection pool. One PR, **11 Codex rounds** — R1-R5 real bugs folded, R8-R11 oscillation frozen + loop stopped).
+**Status:** ✅ **PHASE_2E_SHIPPED + PHASE_2F_NEXT** — scheduler merged PR #28 `4e81bb6`, Railway deploy SUCCESS, verified DORMANT end-to-end in production (authenticated `POST /internal/granola/cron-tick` → 202 `{"enqueued":0}`). `INTERNAL_CRON_SECRET` set in Railway. The scheduler is wired but ships dormant — until Phase 2f's `/connect` lands a credential, there's nothing to poll. The 5-min cron PINGER is deferred to Phase 2f (load-bearing then; the endpoint is verified ready).
 
 **Paste-ready opening prompt for the next session:**
-`docs/superpowers/specs/2026-05-24-phase-2e-session-prompt.md`
+`docs/superpowers/specs/2026-05-24-phase-2f-session-prompt.md`
 
-That prompt is self-contained. It walks the new agent through mandatory reads → 2-paragraph confirmation → Phase 2e implementation (scheduler.py + granola_cron.py + tests) → Codex pre-merge review → ship.
+That prompt is self-contained. It walks the new agent through verify-state → mandatory reads → Phase 2f implementation (`routers/granola.py` admin endpoints: /validate, /connect, /rotate, /status, /disconnect + wire the cron pinger) → Codex pre-merge review → ship. Phase 2f flips the switch: connect → poll → ingest comes alive.
+
+**Prior session (Phase 2d, superseded):** `docs/superpowers/specs/2026-05-24-phase-2e-session-prompt.md`.
 
 ---
 

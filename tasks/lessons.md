@@ -2914,4 +2914,100 @@ consumers that handle the deduplication are exactly the ones whose
 Pydantic contracts we don't modify (LOCKED-38).
 
 
+## Codex oscillates on dead-code edge cases — freeze on the safe side + STOP (2026-05-24)
+
+### Lesson
+
+When a Codex review keeps surfacing P1/P2 findings on the SAME narrow
+surface across many rounds, check whether the rounds are catching NEW
+real bugs or whether the reviewer is OSCILLATING — arguing opposite
+sides of a genuine ambiguity across rounds. If it's oscillating
+(round N says "do X", round N+1 reviews the X-change and says "do
+not-X"), STOP the loop, make a principled engineering decision on the
+SAFE side, freeze it with a comment documenting the trajectory, and
+ship. Do NOT keep folding — you'll ping-pong forever.
+
+### Why
+
+2026-05-24 Phase 2e PR #28 ran **11 Codex rounds**. R1-R5 caught
+genuinely valuable bugs (all folded): R1 overlapping-cycle
+double-publish (advisory lock), R4 P1 the asyncpg pool was on Neon's
+PgBouncer `-pooler` URL which silently defeats the session-scoped
+advisory lock (a real production-correctness bug — the fix derives the
+direct endpoint from DATABASE_URL), R5 P1 the R4 fix had borrowed
+DBOS_SYSTEM_DATABASE_URL which could be a different database. Those
+were the gate doing its job.
+
+But R8-R11 oscillated on a HYPOTHETICAL non-Neon `-pooler` host (dead
+code — this is a Neon-only deployment, and the Neon path auto-derives
+pooler→direct so the branch is unreachable in production):
+- R7: "fail fast on any `-pooler` host" (P1)
+- R8: "don't over-reject — session pooling is lock-safe" (P2, reverses R7)
+- R9: "you removed the guard — fail closed" (P1, reverses R8)
+- R10: "explicit direct URL with a `-pooler` DNS label shouldn't be rejected" (P2, reverses R9)
+- R11: "explicit `-pooler` URL should be rejected (copy-paste risk)" (P1, reverses R10)
+
+R11 even confabulated that dropping `GRANOLA_DB_ALLOW_POOLER` was "a
+regression from the base branch" — but that env var never existed on
+main; it was introduced two rounds earlier in my OWN intermediate
+commit. The reviewer had lost track of what was baseline vs. in-flight.
+
+Root cause of the oscillation: **no hostname rule can distinguish a
+direct host that merely contains `-pooler` in its DNS name from an
+actual transaction pooler.** Both R8 (don't reject) and R9 (reject)
+are individually correct about their failure modes; the ambiguity is
+unresolvable by hostname. When the reviewer is flip-flopping on an
+unresolvable ambiguity, more rounds add churn, not safety.
+
+### How to apply
+
+1. **Distinguish "new real bug each round" (keep folding) from
+   "reviewer reversing its own prior round" (STOP).** The
+   round-N→round-N+1 scope-creep-follow-on pattern
+   ([[adapter-pattern-prs-converge]]) is real bugs at a narrowing
+   surface — keep going. Oscillation is the reviewer contradicting
+   ITS OWN prior verdict — stop.
+
+2. **When you spot oscillation, freeze on the SAFE side.** Here:
+   fail-closed on an ambiguous pooler + a single explicit operator
+   opt-in (`GRANOLA_DB_ALLOW_POOLER`). Silent data corruption
+   (double-publish) is worse than a loud startup error an operator
+   fixes with one env var.
+
+3. **Document the trajectory in a code comment** so the next reader
+   (and the next Codex run) sees the decision is deliberate, not an
+   oversight. A comment that says "R7/R8/R9/R10/R11 argued these
+   sides; frozen here on the safe default because the hostname can't
+   prove the mode" pre-empts the re-litigation.
+
+4. **Weight the deployment reality.** The contested branch was dead
+   code for a Neon-only project — the actual shipped behavior (Neon
+   pooler → auto-derived direct) was unambiguously correct and verified
+   in production (authenticated cron-tick returned 202 over the direct
+   connection). Burning rounds on unreachable code is the tell that
+   you've left the zone of useful review.
+
+5. **The gate's PURPOSE is correctness for the ACTUAL deployment, not
+   a clean bill on every hypothetical.** Once the real-deployment path
+   is correct + tested + the gate has shown 0-P1 on the core logic
+   across multiple rounds, a P1 that's a re-flip of a prior round on
+   dead code is not a blocker — adopt its safe side and ship.
+
+6. **Surface it to the user.** This is a taste/judgment call
+   (mistake-proofing vs convenience on a non-existent deployment), and
+   per gstack voice "cross-model agreement is a recommendation, not a
+   decision — the user decides." Tell them plainly: gate caught real
+   bugs early, then oscillated on a hypothetical; here's the frozen
+   safe choice; here's the merge ask.
+
+### Related
+
+[[feedback-codex-pre-merge-gate]] — the parent rule. This lesson
+bounds it: the 4-round soft cap EXTENDS while real bugs surface, but
+oscillation (not new bugs) is the signal to STOP rather than extend.
+[[adapter-pattern-prs-converge]] — the healthy version (narrowing real
+bugs); contrast with the pathological version (reviewer reversing
+itself) documented here.
+
+
 
