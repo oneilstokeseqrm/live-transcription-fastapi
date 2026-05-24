@@ -39,8 +39,10 @@ a DIRECT (non-pooler) connection, preferring (in order):
 
 If the resolved host is STILL a ``-pooler`` host after derivation (an
 explicit ``GRANOLA_DB_DIRECT_URL`` that points at a pooler, or a
-non-Neon pooler whose host we can't rewrite), we log a loud warning
-that advisory-lock serialization will be unreliable.
+non-Neon pooler whose host we can't rewrite), we RAISE (Codex PR-#28
+R7 P1) — the advisory lock is genuinely unsafe through PgBouncer, so
+the scheduler must not silently run there. The cron tick 5xxs until an
+operator supplies a real direct ``GRANOLA_DB_DIRECT_URL``.
 
 ``statement_cache_size=0`` is set unconditionally — it's the asyncpg
 setting required for PgBouncer compatibility and costs almost nothing
@@ -208,24 +210,29 @@ def _resolve_dsn_and_kwargs() -> tuple[str, dict]:
         ssl_ctx.verify_mode = ssl.CERT_NONE
         kwargs["ssl"] = ssl_ctx
 
-    # Loud warning if we ended up on a pooler host: the advisory lock in
-    # run_cycle_step is session-scoped and unreliable under PgBouncer
-    # transaction pooling, so overlapping cycles could still
-    # double-publish. statement_cache_size=0 covers the prepared-
-    # statement issue but NOT the lock — only a direct endpoint fixes
-    # that.
+    # Fail fast if we ended up on a pooler host (Codex PR-#28 R7 P1).
+    # The advisory lock in run_cycle_step is session-scoped and is
+    # silently defeated by PgBouncer transaction pooling — the lock can
+    # be lost between statements and overlapping cycles double-publish.
+    # statement_cache_size=0 covers the prepared-statement issue but NOT
+    # the lock, so a pooler connection is genuinely unsafe for the
+    # scheduler. Refusing here makes the cron tick 5xx loudly rather
+    # than running in the unsupported mode the module docs warn against.
+    # A Neon DATABASE_URL was already auto-rewritten to its direct
+    # endpoint above, so this only triggers for a non-Neon pooler (or an
+    # explicit GRANOLA_DB_DIRECT_URL mistakenly pointed at a pooler) —
+    # both of which require the operator to supply a real direct URL.
     host = parsed.hostname or ""
     if "-pooler." in host:
-        logger.warning(
-            "asyncpg_pool: resolved a POOLER host (%s). The Granola "
-            "scheduler's pg_try_advisory_lock is session-scoped and is "
-            "NOT reliable under PgBouncer transaction pooling — "
-            "overlapping cycles could double-publish. Set "
-            "GRANOLA_DB_DIRECT_URL to a DIRECT (non-pooler) connection "
-            "to the application database. (A Neon DATABASE_URL is "
-            "auto-rewritten to its direct endpoint; a non-Neon pooler "
-            "needs the explicit GRANOLA_DB_DIRECT_URL.)",
-            host,
+        raise RuntimeError(
+            f"asyncpg_pool resolved a POOLER host ({host}), which cannot "
+            f"safely run the Granola scheduler: pg_try_advisory_lock is "
+            f"session-scoped and unreliable under PgBouncer transaction "
+            f"pooling (overlapping cycles could double-publish). Set "
+            f"GRANOLA_DB_DIRECT_URL to a DIRECT (non-pooler) connection "
+            f"to the application database. (A Neon DATABASE_URL is "
+            f"auto-rewritten to its direct endpoint; a non-Neon pooler "
+            f"needs the explicit GRANOLA_DB_DIRECT_URL.)"
         )
 
     return dsn, kwargs
