@@ -33,10 +33,28 @@ from services.text_clean_service import (
     Lane1PublishError,
     Lane2Extras,
     ProcessResult,
+    TenantIsolationError,
     process,
     release_lane2_slot,
     try_reserve_lane2_slot,
 )
+
+
+async def _call_process(envelope: EnvelopeV1, lane2_extras: Optional[Lane2Extras] = None):
+    """Test helper: call :func:`process` with identity kwargs sourced from envelope.
+
+    Most tests are exercising Lane 1 / Lane 2 / backpressure behavior and want
+    the LOCKED-41 cross-check to pass silently. Tests that exercise the
+    cross-check itself call :func:`process` directly with intentionally
+    mismatched kwargs.
+    """
+    return await process(
+        tenant_id=envelope.tenant_id,
+        user_id=envelope.user_id,
+        account_id=envelope.account_id,
+        envelope=envelope,
+        lane2_extras=lane2_extras,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +204,7 @@ async def test_process_happy_path_publishes_and_dispatches_lane2():
 
     envelope = _build_envelope(text="cleaned content")
     with pub_patch, int_patch:
-        result = await process(envelope=envelope, lane2_extras=None)
+        result = await _call_process(envelope, lane2_extras=None)
         # Stay inside the patch context until Lane 2 has actually run —
         # otherwise the patch reverts and the background task constructs
         # the real (un-patched) IntelligenceService.
@@ -217,7 +235,7 @@ async def test_process_lane2_uses_envelope_content_text_when_extras_missing():
 
     envelope = _build_envelope(text="granola-built content")
     with pub_patch, int_patch:
-        await process(envelope=envelope, lane2_extras=None)
+        await _call_process(envelope, lane2_extras=None)
         for _ in range(5):
             await asyncio.sleep(0)
             if intelligence_instance.process_transcript.await_count > 0:
@@ -257,7 +275,7 @@ async def test_process_lane2_uses_cleaned_transcript_override():
         enrichment_match_method="conference_url",
     )
     with pub_patch, int_patch:
-        await process(envelope=envelope, lane2_extras=extras)
+        await _call_process(envelope, lane2_extras=extras)
         for _ in range(5):
             await asyncio.sleep(0)
             if intelligence_instance.process_transcript.await_count > 0:
@@ -289,7 +307,7 @@ async def test_process_passes_envelope_tenant_id_to_lane2():
     object.__setattr__(envelope, "tenant_id", tenant_a)
 
     with pub_patch, int_patch:
-        await process(envelope=envelope, lane2_extras=None)
+        await _call_process(envelope, lane2_extras=None)
         for _ in range(5):
             await asyncio.sleep(0)
             if intelligence_instance.process_transcript.await_count > 0:
@@ -328,7 +346,7 @@ async def test_process_consumes_slot_on_success():
 
     envelope = _build_envelope()
     with pub_patch, int_patch:
-        result = await process(envelope=envelope, lane2_extras=None)
+        result = await _call_process(envelope, lane2_extras=None)
         # process() returned but Lane 2 is still pending — slot still consumed.
         assert result.lane2_dispatched is True
         assert text_clean_service.get_lane2_in_flight() == 1
@@ -361,7 +379,7 @@ async def test_process_releases_slot_on_lane1_failure():
     envelope = _build_envelope()
     with pub_patch, int_patch:
         with pytest.raises(Lane1PublishError):
-            await process(envelope=envelope, lane2_extras=None)
+            await _call_process(envelope, lane2_extras=None)
 
     # Slot released by process()'s internal finally.
     assert text_clean_service.get_lane2_in_flight() == 0
@@ -406,7 +424,7 @@ async def test_process_releases_slot_on_non_lane1_failure():
     with pub_patch, int_patch, \
          patch.object(text_clean_service, "_BACKGROUND_TASKS", fake_tasks):
         with pytest.raises(RuntimeError, match="simulated post-publish failure"):
-            await process(envelope=_build_envelope(), lane2_extras=None)
+            await _call_process(_build_envelope(), lane2_extras=None)
 
     # Lane 1 ran (publish succeeded before the failure).
     publisher_instance.publish_envelope.assert_awaited_once()
@@ -431,7 +449,7 @@ async def test_lane1_publish_error_preserves_underlying_cause():
 
     with pub_patch, int_patch:
         with pytest.raises(Lane1PublishError) as exc_info:
-            await process(envelope=_build_envelope(), lane2_extras=None)
+            await _call_process(_build_envelope(), lane2_extras=None)
 
     assert exc_info.value.__cause__ is boom
 
@@ -463,7 +481,7 @@ async def test_process_logs_lane1_error_when_publish_raises(caplog):
     with caplog.at_level(logging.ERROR, logger="services.text_clean_service"), \
          pub_patch, int_patch:
         with pytest.raises(Lane1PublishError):
-            await process(envelope=_build_envelope(), lane2_extras=None)
+            await _call_process(_build_envelope(), lane2_extras=None)
 
     error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert any(
@@ -484,7 +502,7 @@ async def test_process_lane2_exception_surfaces_via_on_done(caplog):
     envelope = _build_envelope()
     with caplog.at_level(logging.ERROR, logger="services.text_clean_service"), \
          pub_patch, int_patch:
-        await process(envelope=envelope, lane2_extras=None)
+        await _call_process(envelope, lane2_extras=None)
         # Let the background task run + _on_done fire.
         for _ in range(10):
             await asyncio.sleep(0)
@@ -509,7 +527,7 @@ async def test_process_lane2_completion_logs_info(caplog):
     envelope = _build_envelope()
     with caplog.at_level(logging.INFO, logger="services.text_clean_service"), \
          pub_patch, int_patch:
-        await process(envelope=envelope, lane2_extras=None)
+        await _call_process(envelope, lane2_extras=None)
         for _ in range(10):
             await asyncio.sleep(0)
 
@@ -537,7 +555,7 @@ async def test_process_lane1_disabled_returns_lane1_published_true(caplog):
     envelope = _build_envelope()
     with caplog.at_level(logging.INFO, logger="services.text_clean_service"), \
          pub_patch, int_patch:
-        result = await process(envelope=envelope, lane2_extras=None)
+        result = await _call_process(envelope, lane2_extras=None)
         for _ in range(3):
             await asyncio.sleep(0)
 
@@ -581,7 +599,7 @@ async def test_process_does_not_await_lane2():
 
     envelope = _build_envelope()
     with pub_patch, int_patch:
-        result = await process(envelope=envelope, lane2_extras=None)
+        result = await _call_process(envelope, lane2_extras=None)
 
         # process() returned. Lane 2 should have started but NOT completed.
         assert result.lane2_dispatched is True
@@ -603,3 +621,155 @@ async def test_process_does_not_await_lane2():
             if lane2_done.is_set():
                 break
             await asyncio.sleep(0.01)
+
+
+# ---------------------------------------------------------------------------
+# LOCKED-41 explicit identity cross-check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_raises_tenant_isolation_error_on_tenant_mismatch():
+    """tenant_id kwarg ≠ envelope.tenant_id → TenantIsolationError, no side effects.
+
+    LOCKED-41 cross-tenant defense-in-depth (Codex PR-X1 R3 P2). A caller
+    bug that constructs an envelope under the wrong tenant must surface as
+    a loud error BEFORE Lane 1 publishes — otherwise the bug would persist
+    cross-tenant data and only be detected via downstream forensics.
+    """
+    assert try_reserve_lane2_slot()
+    assert text_clean_service.get_lane2_in_flight() == 1
+
+    pub_patch, publisher_instance = _patch_aws_publisher()
+    int_patch, intelligence_instance = _patch_intelligence_service()
+
+    envelope = _build_envelope()
+    wrong_tenant = uuid.uuid4()
+    assert wrong_tenant != envelope.tenant_id
+
+    with pub_patch, int_patch:
+        with pytest.raises(TenantIsolationError, match="tenant_id mismatch"):
+            await process(
+                tenant_id=wrong_tenant,
+                user_id=envelope.user_id,
+                account_id=envelope.account_id,
+                envelope=envelope,
+                lane2_extras=None,
+            )
+
+    # No side effects: Lane 1 not called, Lane 2 not dispatched, slot released.
+    publisher_instance.publish_envelope.assert_not_called()
+    intelligence_instance.process_transcript.assert_not_called()
+    assert text_clean_service.get_lane2_in_flight() == 0
+
+
+@pytest.mark.asyncio
+async def test_process_raises_tenant_isolation_error_on_user_mismatch():
+    """user_id kwarg ≠ envelope.user_id → TenantIsolationError."""
+    assert try_reserve_lane2_slot()
+    pub_patch, publisher_instance = _patch_aws_publisher()
+    int_patch, _ = _patch_intelligence_service()
+
+    envelope = _build_envelope()
+    with pub_patch, int_patch:
+        with pytest.raises(TenantIsolationError, match="user_id mismatch"):
+            await process(
+                tenant_id=envelope.tenant_id,
+                user_id="auth0|some-other-user",
+                account_id=envelope.account_id,
+                envelope=envelope,
+                lane2_extras=None,
+            )
+
+    publisher_instance.publish_envelope.assert_not_called()
+    assert text_clean_service.get_lane2_in_flight() == 0
+
+
+@pytest.mark.asyncio
+async def test_process_raises_tenant_isolation_error_on_account_mismatch():
+    """account_id kwarg ≠ envelope.account_id → TenantIsolationError."""
+    assert try_reserve_lane2_slot()
+    pub_patch, publisher_instance = _patch_aws_publisher()
+    int_patch, _ = _patch_intelligence_service()
+
+    envelope = _build_envelope()
+    with pub_patch, int_patch:
+        with pytest.raises(TenantIsolationError, match="account_id mismatch"):
+            await process(
+                tenant_id=envelope.tenant_id,
+                user_id=envelope.user_id,
+                account_id=str(uuid.uuid4()),
+                envelope=envelope,
+                lane2_extras=None,
+            )
+
+    publisher_instance.publish_envelope.assert_not_called()
+    assert text_clean_service.get_lane2_in_flight() == 0
+
+
+@pytest.mark.asyncio
+async def test_process_accepts_tenant_id_as_str_or_uuid():
+    """tenant_id comparison normalizes via str() so caller can pass either form.
+
+    Granola adapter passes credential.tenant_id (UUID); /text/clean passes
+    UUID(context.tenant_id) — both are UUID-typed at the call site, but the
+    envelope might be constructed with the same UUID. Comparison normalizes
+    so a caller bug substituting str(uuid) wouldn't fail the cross-check.
+    """
+    assert try_reserve_lane2_slot()
+    pub_patch, _ = _patch_aws_publisher()
+    int_patch, intelligence_instance = _patch_intelligence_service()
+
+    envelope = _build_envelope()
+    # Pass str form of tenant_id; envelope has the UUID form. The
+    # comparison should still pass.
+    with pub_patch, int_patch:
+        await process(
+            tenant_id=envelope.tenant_id,  # already UUID
+            user_id=envelope.user_id,
+            account_id=envelope.account_id,
+            envelope=envelope,
+            lane2_extras=None,
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if intelligence_instance.process_transcript.await_count > 0:
+                break
+
+    intelligence_instance.process_transcript.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Empty-string cleaned_transcript override (Codex R3 P3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_preserves_empty_string_cleaned_transcript_override():
+    """An explicit empty-string override is NOT treated as missing.
+
+    Codex PR-X1 R3 P3: pre-fix, ``(lane2_extras.cleaned_transcript or
+    envelope.content.text)`` evaluated ``""`` as falsy and fell back to
+    envelope.content.text. The pre-extraction route handler passed
+    BatchCleanerService's exact output (including ``""``) to Lane 2; this
+    test pins that semantics post-extraction.
+    """
+    assert try_reserve_lane2_slot()
+    pub_patch, _ = _patch_aws_publisher()
+    int_patch, intelligence_instance = _patch_intelligence_service()
+
+    envelope = _build_envelope(text="this is the envelope text, NOT the Lane 2 input")
+    extras = Lane2Extras(cleaned_transcript="")  # explicit empty-string override
+
+    with pub_patch, int_patch:
+        await _call_process(envelope, lane2_extras=extras)
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if intelligence_instance.process_transcript.await_count > 0:
+                break
+
+    call_kwargs = intelligence_instance.process_transcript.await_args.kwargs
+    assert call_kwargs["cleaned_transcript"] == "", (
+        "Empty-string override was treated as missing — Lane 2 received the "
+        "envelope text instead of the explicit empty string. See Codex R3 P3."
+    )

@@ -68,6 +68,7 @@ import logging
 import os as _os
 from dataclasses import dataclass
 from typing import Any, Optional
+from uuid import UUID
 
 from models.envelope import EnvelopeV1
 from services.aws_event_publisher import AWSEventPublisher
@@ -210,8 +211,58 @@ class Lane1PublishError(Exception):
     """
 
 
+class TenantIsolationError(Exception):
+    """Raised when caller-supplied identity kwargs disagree with the envelope.
+
+    LOCKED-41 requires ``tenant_id`` to flow as an explicit function argument
+    sourced from the caller's entity context (the credential row in vault for
+    the Granola adapter; the JWT-validated context for /text/clean).
+    :func:`process` cross-checks ``tenant_id`` / ``user_id`` / ``account_id``
+    against the corresponding envelope fields and fails loud on mismatch —
+    a caller bug that builds an envelope under the wrong tenant would
+    otherwise publish + persist with no observable signal.
+
+    This is defense-in-depth above the caller's own identity sourcing; both
+    /text/clean and the Granola adapter construct the envelope from the same
+    identity values they pass here, so the cross-check should always pass
+    under correct caller behavior. Failures indicate a coding bug worth
+    raising loudly.
+    """
+
+
+def _check_envelope_identity(
+    *,
+    tenant_id: UUID,
+    user_id: str,
+    account_id: str,
+    envelope: EnvelopeV1,
+) -> None:
+    """Raise :class:`TenantIsolationError` if caller kwargs don't match envelope.
+
+    Comparison is normalized to string form so a UUID kwarg vs a UUID-typed
+    envelope field compare equal regardless of how the caller spelled them.
+    """
+    env_tenant = str(envelope.tenant_id)
+    if env_tenant != str(tenant_id):
+        raise TenantIsolationError(
+            f"tenant_id mismatch: caller={tenant_id!s} envelope={env_tenant} "
+            "— refusing to publish under the wrong tenant"
+        )
+    if envelope.user_id != user_id:
+        raise TenantIsolationError(
+            f"user_id mismatch: caller={user_id!r} envelope={envelope.user_id!r}"
+        )
+    if envelope.account_id != account_id:
+        raise TenantIsolationError(
+            f"account_id mismatch: caller={account_id!r} envelope={envelope.account_id!r}"
+        )
+
+
 async def process(
     *,
+    tenant_id: UUID,
+    user_id: str,
+    account_id: str,
     envelope: EnvelopeV1,
     lane2_extras: Optional[Lane2Extras] = None,
 ) -> ProcessResult:
@@ -228,8 +279,18 @@ async def process(
       - ``envelope`` is fully constructed per the LOCKED envelope shape
         (LOCKED-35/36 for Granola; pre-existing /text/clean shape for
         the /text/clean handler).
+      - ``tenant_id`` / ``user_id`` / ``account_id`` MUST match the
+        corresponding fields on ``envelope`` per LOCKED-41 — these are
+        explicit kwargs sourced from the caller's entity context (vault
+        credential for Granola; JWT context for /text/clean), and
+        :func:`_check_envelope_identity` raises
+        :class:`TenantIsolationError` on mismatch. The cross-check
+        happens BEFORE any side-effecting work, so a caller bug surfaces
+        BEFORE we've published, persisted, or consumed the Lane 2 slot
+        (slot is released via the same internal finally as other failures).
 
     Behavior:
+      - Identity cross-check (above) — raises before any side effects.
       - Lane 1: ``AWSEventPublisher().publish_envelope(envelope)`` is awaited
         synchronously. On exception, :class:`Lane1PublishError` is raised
         AFTER the slot has been internally released — the caller does
@@ -247,6 +308,7 @@ async def process(
     Granola while keeping Lane 1).
 
     Raises:
+      :class:`TenantIsolationError` — when caller kwargs don't match envelope.
       :class:`Lane1PublishError` — when :meth:`publish_envelope` raised.
       Any other exception — preserved as-is; the slot is released via the
       internal ``finally``.
@@ -254,6 +316,15 @@ async def process(
     interaction_id_str = str(envelope.interaction_id) if envelope.interaction_id else ""
     slot_handed_off = False
     try:
+        # LOCKED-41 cross-tenant defense-in-depth: caller identity kwargs
+        # MUST match envelope. Runs inside the try/finally so a mismatch
+        # also releases the slot via the same path as other failures.
+        _check_envelope_identity(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            account_id=account_id,
+            envelope=envelope,
+        )
         # ------------------------------------------------------------------
         # Lane 1 — synchronous publish (Kinesis + EventBridge)
         # ------------------------------------------------------------------
@@ -308,9 +379,18 @@ async def process(
         # ends up on the envelope (the envelope carries the raw input)
         # so the override is necessary to preserve the pre-extraction
         # contract.
+        #
+        # ``is None`` check instead of ``or``: an empty-string override is
+        # a valid explicit caller intent ("I cleaned the text down to
+        # nothing — analyze the empty form"), not a missing value. The
+        # pre-extraction route handler passed whatever ``BatchCleanerService``
+        # returned (including ``""``) directly to Lane 2; preserving that
+        # semantics here (Codex PR-X1 R3 P3 finding).
+        extras_cleaned: Optional[str] = (
+            lane2_extras.cleaned_transcript if lane2_extras else None
+        )
         cleaned_transcript: str = (
-            (lane2_extras.cleaned_transcript if lane2_extras else None)
-            or envelope.content.text
+            extras_cleaned if extras_cleaned is not None else envelope.content.text
         )
         contact_ids: Optional[list[str]] = lane2_extras.contact_ids if lane2_extras else None
         calendar_event_id: Optional[str] = (

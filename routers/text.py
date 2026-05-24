@@ -226,7 +226,17 @@ async def clean_text(body: TextCleanRequest, request: Request):
         # backpressure for subsequent requests (Codex PR-X1 R1 P2 finding).
         try:
             try:
+                # LOCKED-41 explicit identity kwargs sourced from JWT
+                # context (tenant_id) and validated request body
+                # (account_id). text_clean_service.process() cross-checks
+                # these against the envelope and raises TenantIsolationError
+                # on mismatch — a defense-in-depth guard that fails loud
+                # if a future refactor lets envelope tenant/account drift
+                # from the request context.
                 result = await text_clean_service.process(
+                    tenant_id=UUID(context.tenant_id),
+                    user_id=context.user_id,
+                    account_id=context.account_id,
                     envelope=envelope,
                     lane2_extras=text_clean_service.Lane2Extras(
                         cleaned_transcript=cleaned_text,
