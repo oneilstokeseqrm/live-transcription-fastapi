@@ -32,7 +32,9 @@ from routers import batch
 from routers import text
 from routers import upload
 from routers import queue_actions
+from routers import granola_cron
 from routers.upload import reap_stuck_jobs
+from services.asyncpg_pool import close_asyncpg_pool
 
 load_dotenv()
 
@@ -111,14 +113,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     is the cheapest mitigation that meaningfully reduces the silent-loss
     surface area.
     """
-    async with dbos_lifespan(app):
-        logger.info("Running startup tasks...")
-        await reap_stuck_jobs()
-        logger.info("Startup tasks completed")
-        try:
-            yield
-        finally:
-            await _drain_text_clean_background_tasks()
+    try:
+        async with dbos_lifespan(app):
+            logger.info("Running startup tasks...")
+            await reap_stuck_jobs()
+            logger.info("Startup tasks completed")
+            try:
+                yield
+            finally:
+                await _drain_text_clean_background_tasks()
+    finally:
+        # Close the shared asyncpg pool AFTER dbos_lifespan.__aexit__ has
+        # run DBOS.destroy() (Codex PR-#28 R4 P2). Closing it earlier —
+        # inside the dbos_lifespan block — would mark the pool as
+        # closing while the DBOS executor is still alive, so a Granola
+        # workflow still mid-cycle during shutdown would fail its next
+        # pool.acquire() and abort instead of finishing (or being
+        # resumed by DBOS on the next boot). Idempotent — no-op if the
+        # pool was never lazily initialized.
+        await close_asyncpg_pool()
 
 
 async def _drain_text_clean_background_tasks(timeout_s: float = 25.0) -> None:
@@ -179,6 +192,7 @@ app.include_router(batch.router)
 app.include_router(text.router, prefix="/text", tags=["text"])
 app.include_router(upload.router)
 app.include_router(queue_actions.router)
+app.include_router(granola_cron.router)
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
 event_publisher = EventPublisher()
