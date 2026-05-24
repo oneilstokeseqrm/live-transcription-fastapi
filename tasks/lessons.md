@@ -2671,4 +2671,247 @@ is a merge gate, not a follow-up). This lesson refines it with the
 amendment.
 
 
+## Verify mandatory-read files exist before declaring them in handoffs (2026-05-24)
+
+### Lesson
+
+A handoff prompt that lists a file as a mandatory read MUST pre-flight
+that the file actually exists on disk at the target commit. If a LOCKED
+decision references a file that doesn't exist yet, treat the creation
+of that file as an explicit prerequisite milestone — not implicitly
+bundled into the first downstream phase that needs it.
+
+### Why
+
+2026-05-24 Phase 2c→2d handoff: the paste-ready prompt listed
+`services/text_clean_service.py` as a mandatory read (item 5,
+"existing infrastructure Phase 2d composes"). LOCKED-41 in the plan
+had locked the decision that the Granola adapter would call this
+file's `process()` function via direct Python import. But the file
+DIDN'T EXIST — neither Phase 2b nor Phase 2c had created it; the
+extraction was implicitly assumed to happen "as part of Phase 2d."
+
+The Phase 2d session author (me) discovered the gap during the
+mandatory-reads phase. Investigation showed the prior agent's handoff
+was authored without `ls`-checking the path. The user authorized
+splitting Phase 2d into PR-X1 (extraction first) + PR-X2 (adapter
+using the extracted module). PR-X1 closed the LOCKED-41 gap; PR-X2
+built on it. Both shipped same session.
+
+Cost in this case: ~3 hours of additional scope (extraction +
+refactor + Codex review). Cost of NOT catching it: the agent would
+have improvised the adapter against routers/text.py directly, or
+duplicated the publish/dispatch logic, or proceeded under a different
+LOCKED-41 interpretation.
+
+### How to apply
+
+1. **Pre-flight every "mandatory read" path before declaring it
+   readable in a handoff prompt.** Run `ls -la <path>` or `Read <path>`
+   from the target commit. If any path doesn't exist, the handoff is
+   broken — fix it before publishing.
+
+2. **When a LOCKED decision references a file, treat the file's
+   creation as an explicit prerequisite milestone.** The LOCKED list
+   in the plan should have a "first appearance" column or a "where
+   created" annotation pointing to the PR that creates it. The
+   Granola plan had LOCKED-41 reference `services/text_clean_service.py`
+   without a clear owner — leading to the gap.
+
+3. **When the handoff agent (Phase N→N+1) is the same as the
+   plan-writing agent (the brainstorm + plan-review session), the
+   risk is lower because the plan author has working memory of what's
+   built vs. planned. When the handoff agent is downstream of multiple
+   prior sessions, the risk compounds — each session's handoff
+   inherits the prior's claims. The mandatory-read pre-flight is the
+   discipline that catches it.
+
+4. **The 2-PR split pattern this session demonstrated is the
+   recommended recovery** when a downstream phase discovers a missing
+   prerequisite: don't try to roll the extraction + new functionality
+   into one PR. Ship the extraction as its own PR (smaller blast
+   radius, cleaner Codex review), then build on it. The user-
+   authorized 2-PR split is far less risky than a single mega-PR.
+
+### Related
+
+[[feedback-complete-all-handoff-reads-before-action]] — the parent
+rule (complete the reads before acting). This lesson refines it with
+the "pre-flight every path" discipline. The 2-PR split also
+demonstrates the "LOCKED-decision-points-at-a-file" anti-pattern —
+LOCKED decisions should be self-contained ("X must be true") rather
+than referencing artifacts that may not exist ("X must call Y in
+file Z").
+
+
+## Adapter-pattern PRs converge in 2-3 Codex rounds with scope-creep follow-ons (2026-05-24)
+
+### Lesson
+
+PRs that follow the "extract / compose into adapter" pattern converge
+in Codex review at 2-3 substantive rounds + 1 CLEAN delta. R1
+typically finds real bugs at the largest blast-radius surface; the
+fix introduces a narrower bug at a smaller surface; R2 catches that;
+R3 typically CLEAN. This is the round-N convergence pattern from
+Phase 2c (PR #25, 6 rounds) compressed to fewer rounds because the
+PRs are smaller.
+
+### Why
+
+2026-05-24 Phase 2d session shipped two PRs:
+
+**PR-X1 (text_clean_service extraction):**
+- R1: 1 P2 — slot double-release on non-Lane1 raise from process()
+- R2: CLEAN (delta on R1 fix)
+- R3: 1 P2 + 1 P3 — LOCKED-41 explicit kwargs missing; empty-string
+  override
+- R4: CLEAN (delta on R3 fix)
+- R5: CLEAN cumulative against main — convergence
+
+**PR-X2 (Granola adapter + Path 2):**
+- R1: 2 P1 + 1 P2 — stranded failed rows; cycle-end watermark race;
+  publish→DB-fail dup-publish
+- R2: 1 P1 + 3 P2 — SELECT missing eq_interaction_id; UPSERT clobbers
+  it on retry; retry budget not enforced on replay; Scenario C from
+  failed-row replay never defers
+- R3: CLEAN (delta on R2 fix) — convergence
+- R4: wrapper timeout @ 3814 lines cumulative (codified workaround
+  applied: delta scoping past ~1500 lines)
+
+In BOTH cases:
+1. R1 found real bugs at the BROADEST surface (slot lifecycle across
+   route handler + service; cycle-level state mutations)
+2. The R1 fix introduced a NARROWER bug at a smaller surface (kwarg
+   semantics; column projection)
+3. R2 caught the narrower bug
+4. R3 was CLEAN
+
+The 2-3-round trajectory is reproducible because the bug surface
+contracts after each fix. Compare to Phase 2c (PR #25) which ran 6
+rounds because the API client surface was uniformly broad
+(pagination, retry budgets, error codes) — no narrowing convergence.
+
+### How to apply
+
+1. **For "extract / compose into adapter" PRs, plan for 2-3
+   substantive Codex rounds + 1 CLEAN delta.** Don't surface to user
+   as "this is taking too long" — the convergence trajectory is the
+   normal pattern.
+
+2. **The first fix in R1 should explicitly audit blast radius for
+   the narrower bugs the fix exposes.** "I'm changing X in module M;
+   what else in M depends on X's prior shape?" If you do this
+   manually before committing, R2 has less to find and convergence
+   is faster.
+
+3. **For broader API-surface PRs (like Phase 2c's API client), expect
+   4-6 rounds.** The Phase 2b (vault) → Phase 2c (API client) →
+   Phase 2d-X1/X2 (extraction + adapter) trajectory shows the round
+   count compresses as surfaces narrow.
+
+4. **Switch to `codex review --base <prior-commit>` once cumulative
+   diff exceeds ~1500 lines** (codified from Phase 2c). PR-X2 R4
+   timed out at 3814 lines cumulative against main; delta scoping
+   completed in <90s.
+
+5. **The "round-N introduces round-N+1 narrower bug" pattern is
+   evidence of healthy convergence, NOT pathological regression.**
+   Stop feeling like you're regressing when R2 finds something — it's
+   probably finding a real follow-on bug Codex couldn't have seen
+   without the R1 fix in place.
+
+### Related
+
+[[feedback-codex-pre-merge-gate]] — the parent rule (Codex review is
+a merge gate). This lesson refines it with PR-pattern-specific
+guidance. Phase 2c's "scope-creep follow-ons" lesson already
+documented R-N→R-N+1 introducing narrower bugs; this lesson adds the
+PR-pattern dimension.
+
+
+## Pre-write idempotency anchor BEFORE downstream publish (2026-05-24)
+
+### Lesson
+
+For producers with at-least-once delivery semantics + idempotency-
+at-the-DB-layer, write the idempotency-key row to the DB BEFORE the
+downstream publish call. If the publish succeeds but the success
+UPSERT fails, the next retry recovers the prior key and re-publishes
+under the same id — downstream consumers dedup. Without the pre-
+write, the retry mints a new key and downstream sees duplicate
+entities.
+
+### Why
+
+2026-05-24 Phase 2d PR-X2 R1 P2 finding: the adapter's first cut
+wrote the `external_integration_runs` row AFTER calling
+`text_clean_service.process()`. Codex flagged: if `process()` succeeds
+(Lane 1 publishes to Kinesis + EventBridge, Lane 2 dispatches to
+IntelligenceService) but the immediate `_record_success()` UPSERT
+fails (transient asyncpg error, network drop during commit), there
+is no `external_integration_runs` row to short-circuit a retry. The
+next cycle's idempotency check (`_get_integration_run` by composite
+UNIQUE) returns None → adapter mints a fresh envelope.interaction_id
+via `uuid4()` → publishes AGAIN under a different id → downstream
+consumers see two interactions for the same Granola note.
+
+The fix: pre-write a row with `status='in_progress'` + the envelope's
+pre-generated interaction_id BEFORE calling `text_clean_service.process`.
+On retry, `_get_integration_run` recovers the in-progress row's
+`eq_interaction_id`; the adapter reuses it as `envelope.interaction_id`;
+downstream consumers (action-item-graph, eq-structured-graph-core)
+dedup on interaction_id at write time. Worst case is one extra Kinesis
+record + one extra Lane 2 OpenAI call (~$0.02-$0.10) per crashed
+cycle — bounded cost, no downstream entity duplication.
+
+This isn't just for adapters — it's the general "idempotent producer"
+pattern. The /text/clean route doesn't have it because /text/clean is
+not scheduled (a client-driven request; if the worker crashes, the
+client retries on its own). But ANY scheduled producer (Granola
+adapter, future Fireflies adapter, future Outlook calendar adapter)
+needs the pre-write to be retry-safe.
+
+### How to apply
+
+1. **For any producer that's scheduled OR retried by an upstream
+   workflow:** pre-write the idempotency-key row to the DB BEFORE
+   calling the downstream publish.
+
+2. **The pre-write status can be a sentinel** (`'in_progress'`,
+   `'pending_publish'`) that's NOT in the producer's terminal-outcome
+   enum. The downstream UPSERT (success / failed) overwrites it. The
+   idempotency check then short-circuits or recovers based on the
+   row's status.
+
+3. **The pre-write MUST persist the dedup key (interaction_id, etc)
+   so the retry recovers it.** Without this, the pre-write only
+   catches "we tried to ingest" but doesn't fix the actual
+   duplicate-publish problem.
+
+4. **On retry, the producer MUST re-use the recovered dedup key** —
+   passing it into envelope construction explicitly. The default
+   `uuid4()` path generates a new id on each call; the producer must
+   detour around this when the existing row carries an id.
+
+5. **Verify the SELECT projection actually returns the dedup key.**
+   PR-X2 R2 P1: my R1 fix wrote the recovery logic in process_note,
+   but the SELECT query I used didn't include `eq_interaction_id` in
+   the column list — so `existing.get("eq_interaction_id")` was
+   always None. R2 caught this. Always grep the SELECT SQL when
+   adding "if existing.get('X')" logic.
+
+6. **COALESCE the dedup key in the UPSERT.** PR-X2 R2 P2: an UPSERT
+   path that doesn't supply the key (e.g., a backpressure UPSERT that
+   only records the failure) clobbered the prior `eq_interaction_id`
+   with NULL. Fix: `eq_interaction_id = COALESCE(EXCLUDED.eq_interaction_id,
+   table.eq_interaction_id)` in the conflict-update clause.
+
+### Related
+
+[[feedback-codex-pre-merge-gate]] — the lesson surfaced via Codex
+review. [[feedback-envelope-contract-immutable]] — the downstream
+consumers that handle the deduplication are exactly the ones whose
+Pydantic contracts we don't modify (LOCKED-38).
+
+
 

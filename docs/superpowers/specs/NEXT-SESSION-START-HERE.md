@@ -1,59 +1,76 @@
 # Next Session — Start Here
 
 **Project:** Phase 2 — Granola.ai transcript ingestion integration.
-**Last session:** 2026-05-24 (Phase 2c — Granola HTTP API client — built + 6 Codex rounds + merged + deployed).
-**Status:** ✅ **PHASE_2C_SHIPPED + PHASE_2D_NEXT** — HTTP API client live in production as inert code. Ready to build the adapter.
+**Last session:** 2026-05-24 (Phase 2d — text_clean_service extraction (PR-X1) + Granola adapter + Path 2 (PR-X2); two PRs, 8 substantive Codex rounds total).
+**Status:** ✅ **PHASE_2D_SHIPPED + PHASE_2E_NEXT** — Granola adapter live in production as inert code. The full Phase 2b → 2c → 2d composition chain (vault → API client → adapter → text_clean_service) is wired. Phase 2e wires it to a 5-minute Railway-cron + DBOS cadence.
 
 **Paste-ready opening prompt for the next session:**
-`docs/superpowers/specs/2026-05-24-phase-2d-session-prompt.md`
+`docs/superpowers/specs/2026-05-24-phase-2e-session-prompt.md`
 
-That prompt is self-contained. It walks the new agent through mandatory reads → 2-paragraph confirmation → Phase 2d implementation (adapter + Path 2 logic) → Codex pre-merge review → ship.
+That prompt is self-contained. It walks the new agent through mandatory reads → 2-paragraph confirmation → Phase 2e implementation (scheduler.py + granola_cron.py + tests) → Codex pre-merge review → ship.
 
 ---
 
 ## What shipped this session (2026-05-24)
 
-### PR #25 — Granola HTTP API client ✅ MERGED + DEPLOYED
+### PR #26 (PR-X1) — `services/text_clean_service.py` extraction ✅ MERGED + DEPLOYED
 
-- Squash-merged to live-transcription-fastapi main as commit `030523c`
-- Railway deployment `9e393c5a-1fcf-4b10-9d11-e62236f53b87` Status=SUCCESS in <1 min
-- `/health` 200 verified
-- 42 new unit tests via httpx.MockTransport (per `feedback_test_pattern_no_docker`)
-- 245 unit tests total passing; 0 regressions
-- 6 new files, +2070 lines
+- Squash-merged to live-transcription-fastapi main as commit `fa97477`
+- Railway deployment SUCCESS
+- `/health` 200 + `/text/clean` smoke probe HTTP 200 verified (no regression)
+- 23 new unit tests in `tests/unit/test_text_clean_service.py`
+- 9 existing integration tests in `test_text_clean_response_decoupling.py` updated + still pass
+- 5 Codex rounds (R5 CLEAN cumulative)
 
-### Files shipped (all in `services/granola_ingestion/` + `tests/unit/granola_ingestion/`)
+**Why this PR was added mid-session:** Investigation found that LOCKED-41 referenced `services/text_clean_service.py` but the file didn't exist — the prior Phase 2b and 2c sessions had shipped without doing the extraction LOCKED-41 required. The Phase 2c→2d handoff listed it as a mandatory read but pre-flight discovered the gap. User-authorized a split into two PRs: PR-X1 closes the LOCKED-41 gap; PR-X2 builds on it.
 
-| File | Lines | Role |
-|---|---|---|
-| `errors.py` | 96 | `GranolaErrorCode` (8 codes) + `GranolaError` exception |
-| `models.py` | 169 | `GranolaFolder` / `GranolaNoteSummary` / `GranolaNoteDetail` Pydantic models + 4 sub-models |
-| `api_client.py` | 604 | `GranolaAPIClient` async class — 3 methods, retry/pagination/429 budget |
-| `__init__.py` | 47 | Public API re-exports |
-| `tests/.../test_api_client.py` | 1154 | 42 tests |
-| `tests/.../__init__.py` | 0 | Package marker |
+### PR #27 (PR-X2) — Phase 2d Granola adapter + Path 2 logic ✅ MERGED + DEPLOYED
 
-### Codex pre-merge gate (6 rounds; gate clean since R2)
+- Squash-merged to live-transcription-fastapi main as commit `607121d`
+- Railway deployment `edbcf4ef` SUCCESS
+- `/health` 200 + `/text/clean` smoke probe HTTP 200 post-deploy (no regression)
+- Production module imports cleanly (first PR to exercise the full vault → adapter import chain; cryptography wheel present on Railway)
+- 38 new unit tests (17 path2 + 21 adapter, +6 added during R1/R2 folds = 27 adapter total)
+- 84 granola tests pass; 327 unit + integration tests pass overall; 0 regressions
+- 3 substantive Codex rounds + 1 cumulative-timeout (R3 CLEAN delta after R1+R2 folds)
 
-| Round | P1 | P2 | Notes |
-|---|---|---|---|
-| R1 | 2 | 1 | 429 retry-forever; note-vs-folder 404; pagination silently truncates |
-| R2 | 0 | 2 | /folders pagination omitted; 429 fallback delay doesn't grow |
-| R3 | 0 | 2 | `transcript` should be required; 20-page ceiling fails legit backfills |
-| R4 | 0 | 1 | Bumped ceiling leaks into /folders (scope creep from R3) |
-| R5 | 0 | 1 | Endpoint cap shadows caller's `max_pages` knob (scope creep from R4) |
-| R6 | 0 | 0 | **CONVERGENCE: no introduced bugs** |
+---
 
-R1-R3 ran with `--base main` (full diff). R4-R6 hit the 5.5-min wrapper timeout on cumulative diff and switched to `--base <prior-commit>` per the codified workaround.
+## Codex full trajectory cross-PR (this session)
 
-### What's now hardened (compared to my initial Phase 2c draft)
+| PR | Round | Base | P1 | P2 | P3 | Real findings |
+|---|---|---|---|---|---|---|
+| X1 | R1 | main | 0 | 1 | 0 | Slot double-release on non-Lane1 raise |
+| X1 | R2 | R1 | 0 | 0 | 0 | CLEAN (delta) |
+| X1 | R3 | main | 0 | 1 | 1 | LOCKED-41 kwargs; empty-string override |
+| X1 | R4 | R3 | 0 | 0 | 0 | CLEAN (delta) |
+| X1 | R5 | main | 0 | 0 | 0 | **CLEAN cumulative — convergence** |
+| X2 | R1 | main | 2 | 1 | 0 | Stranded failed; watermark race; pub→DB dup |
+| X2 | R2 | R1 | 1 | 3 | 0 | SELECT/UPSERT eq_iid; retry budget; C defer |
+| X2 | R3 | R2 | 0 | 0 | 0 | **CLEAN (delta) — convergence** |
+| X2 | R4 | main | — | — | — | timeout @ 3814 lines (delta scoping works past 1500) |
 
-- **Retry budgets** are structurally bounded across 4 failure modes (5xx, timeouts, connect errors, sustained 429s); no path can loop indefinitely.
-- **429 has a SEPARATE budget** from the main retry counter; fallback delay grows across consecutive 429s (R2 fix); counter resets on any non-429 response.
-- **8 error codes** including `GRANOLA_NOTE_NOT_FOUND` so Phase 2d distinguishes a per-note skip (one note deleted between list + detail) from credential-level folder breakage.
-- **Pagination is transparent + endpoint-aware**: shared `_get_paginated` helper with per-endpoint ceilings (`/folders=20` hardcoded; `/notes=500` configurable). Effective ceiling = `min(caller, endpoint_cap)` so caller-strict always wins.
-- **`transcript` is REQUIRED** in `GranolaNoteDetail` — missing field surfaces as `GRANOLA_PARSE_ERROR` (not silently substituted with `[]`).
-- **`api_key` security**: stored privately; `__repr__` never leaks it; empty-key fails at construction.
+**Pattern observed (codified as lesson #2 this session):** PR-X1 R1 fix introduced a narrower scope-creep bug (R3 LOCKED-41 + R3 empty-string); PR-X2 R1 fix introduced a narrower bug (R2 SELECT projection + R2 UPSERT COALESCE); both converged at R3 (delta). Round-N convergence is the norm, not the exception.
+
+---
+
+## What's now hardened (compared to the initial Phase 2d draft)
+
+**PR-X1 hardening:**
+- Slot lifecycle owned by `text_clean_service.process()` on every exit path (no double-release on non-Lane1 raises)
+- LOCKED-41 cross-tenant guard via explicit tenant_id/user_id/account_id kwargs + envelope cross-check; raises `TenantIsolationError` on mismatch
+- Empty-string `cleaned_transcript` override preserved (not falling back to envelope.content.text)
+- Backpressure state + lifespan-drain target moved to shared service (both /text/clean and Granola adapter use the same cap)
+
+**PR-X2 hardening:**
+- `GRANOLA_NOTE_NOT_FOUND` = per-note skip (credential STAYS active) — the load-bearing Phase 2c finding
+- LOCKED-44 snapshot recoverability verified by `test_reprocess_deferred_note_recovers_from_snapshot_when_404`
+- Failed-row retry (not just deferred) — stranded-failure bug closed
+- Cycle-start watermark (not cycle-end) — note-during-cycle-window race closed
+- `eq_interaction_id` pre-written before publish + reused on retry — duplicate-publish bug closed
+- COALESCE on UPSERT preserves prior eq_interaction_id on retries
+- Retry budget converges to FAILED_PERMANENT under sustained outages
+- Scenario C reclassification from failed-row replay now defers (LOCKED-44 snapshot captured)
 
 ---
 
@@ -63,64 +80,55 @@ R1-R3 ran with `--base main` (full diff). R4-R6 hit the 5.5-min wrapper timeout 
 |---|---|
 | AWS KMS CMK `59a0e2bc-...` (alias `eq-user-secrets`) | ✅ Auto-rotation enabled, LOCKED-40 enforced |
 | IAM user `eq-vault-service` + identity policy | ✅ Empirically verified |
-| Vault Python module (`services/vault/`) | ✅ Live on Railway (deploy `2ce20b0e`, prior session) |
-| Granola API client (`services/granola_ingestion/`) | ✅ Live on Railway (deploy `9e393c5a`, THIS session) |
+| Vault Python module (`services/vault/`) | ✅ Live on Railway |
+| Granola API client (`services/granola_ingestion/api_client.py`) | ✅ Live (Phase 2c) |
+| **Granola adapter (`services/granola_ingestion/adapter.py`)** | ✅ **NEW: Live as inert code (Phase 2d, this session)** |
+| **text_clean_service (`services/text_clean_service.py`)** | ✅ **NEW: Live + actively serving /text/clean (PR-X1, this session)** |
 | Production Neon `vault` schema + 3 tables | ✅ Live |
 | eq-frontend main (vault Prisma models + ignorePattern fix) | ✅ Commit `7905222` |
 | live-transcription-fastapi `/health` | ✅ HTTP 200 |
+| live-transcription-fastapi `/text/clean` smoke probe | ✅ HTTP 200 (post-PR-X1 + post-PR-X2 deploys) |
 | eq-frontend production deploy | ✅ READY (commit `7905222`) |
 
 ---
 
-## What's next: Phase 2d — Granola adapter + Path 2 logic (~1.5 days)
+## What's next: Phase 2e — Granola scheduler (~0.5 day)
 
-Per `tasks/granola-integration-plan.md` §Phase 2d:
+Per `tasks/granola-integration-plan.md` §Phase 2e + LOCKED-28 + LOCKED-39:
 
 **New files:**
-- `services/granola_ingestion/adapter.py` — the per-credential ingestion cycle
-- `services/granola_ingestion/path2.py` — attendee classification + Scenario A/B/C/D branching
-- `services/granola_ingestion/outcomes.py` — `IngestionOutcome` enum (5 values)
+- `services/granola_ingestion/scheduler.py` — DBOS workflow + @DBOS.step functions
+- `routers/granola_cron.py` — HTTP endpoint Railway cron POSTs every 5 min
 
-**What it composes (this is Phase 2d's "integration moment"):**
-- `services.vault.get_granola_credential_for_user` — decrypted credential snapshot
-- `services.granola_ingestion.GranolaAPIClient` — JUST SHIPPED in Phase 2c
-- `services.text_clean_service` — LOCKED-41 direct Python call (NOT HTTP)
-- existing `account_lookup` / `domain_classification` / `pending_account_mappings` infrastructure
-- envelope construction per LOCKED-35 (`source="generic"`, `interaction_type="meeting"`) + LOCKED-36 (six `granola_*` extras)
+**What it does:**
+1. Railway cron posts to `/internal/granola/cron-tick` every 5 min (auth via X-Internal-Cron-Secret header)
+2. The handler lists active credentials via a DBOS step
+3. For each credential, dispatches `granola_poll_one_credential` via `DBOS.start_workflow(workflow_id=f"granola_poll_{credential_id}_{cycle_window//5}", ...)` — SetWorkflowID dedup catches overlapping cycles
+4. The workflow loads the credential (vault decryption via @DBOS.step), then calls `run_one_cycle(credential=credential, pool=pool)` — the existing Phase 2d adapter
+5. PollResult observability surfaced via `/health` (extension) and structured logs
 
-**Per-credential cycle (high level):**
-1. Decrypt credential via vault
-2. Construct `GranolaAPIClient` with the decrypted api_key
-3. `list_notes(folder_id, created_after=last_polled_at)` → get new notes
-4. For each note: `get_note_detail(note_id)` → full payload
-5. Path 2 classification: extract business-domain attendees → `lookup_account_by_domain`
-6. Scenario branching:
-   - **A/B (known accounts)**: build envelope → call `text_clean_service.process(tenant_id=..., envelope=...)`
-   - **C (unknown business)**: queue signals + write `external_integration_runs` with `granola_note_snapshot` JSONB (LOCKED-44)
-   - **D (no business attendees)**: skip
-7. Re-poll deferred-pending-account rows from prior cycles
-8. Update credential `last_polled_at`
+**Critical disciplines for Phase 2e:**
+- LOCKED-39 (NO @DBOS.scheduled — use external Railway cron + explicit SetWorkflowID)
+- workflow_id is `f"granola_poll_{credential_id}_{cycle_window_minute//5}"` (5-min window dedup)
+- Pure orchestration in workflows; all I/O lives in @DBOS.step (matches repo's existing DBOS discipline)
+- Cron auth via INTERNAL_CRON_SECRET env var (random 32-byte hex)
+- DO NOT manipulate Granola API directly from the cron handler — dispatch to DBOS for durability + retries
 
-**Critical disciplines for Phase 2d:**
-- **LOCKED-38** (never modify downstream Pydantic envelope contracts) becomes load-bearing — Phase 2d is the first envelope-construction work since Phase 1
-- **LOCKED-41** (text_clean_service direct call, NOT HTTP; tenant_id as explicit arg)
-- pre-merge `scripts/verify_consumer_contracts.py` mandatory (verify the locked envelope shape against both downstream consumers BEFORE merge)
-- Phase 2c's `GRANOLA_NOTE_NOT_FOUND` MUST be treated as per-note skip (`failed`), NOT credential-level breakage (`status='error'`)
-- adapter is first code to import `services.vault` — vault's ALLOWLIST already includes `services.granola_ingestion.adapter`
-- Tenant isolation: `tenant_id` flows from `credential.tenant_id` (JWT-validated at /connect time per Phase 2f) as explicit argument to every downstream call
-- LOCKED-44 `granola_note_snapshot` (JSONB on `external_integration_runs`) populated at defer time so Scenario C remains recoverable if Granola removes the note before approval
+**The "switch" status after Phase 2e ships:**
+- Scheduler runs every 5 min but finds 0 active credentials (no Phase 2f means no /connect endpoint, so no users have connected Granola yet)
+- This is correct + desired: ship the scheduler first so Phase 2f's /connect → run_one_cycle path works end-to-end the day Phase 2f deploys
 
 ---
 
 ## What this session's work does NOT include
 
-- Phase 2e (scheduler — Railway cron + DBOS queue) — separate session, ~0.5 day
-- Phase 2f (admin endpoints — /validate, /connect, /rotate, /status, /disconnect) — separate session, ~0.5 day
+- Phase 2f (admin endpoints — `/validate`, `/connect`, `/rotate`, `/status`, `/disconnect`) — separate session, ~0.5 day
 - Phase 2g (transactional email on credential breakage) — separate session, ~0.5 day
 - Phase 3 (frontend) — separate session, ~2 days
 - Phase 4 (production E2E with Peter as design partner #0) — separate session, ~1 day
 - Fixing the live-db CI gap (Linear EQ-11 family)
 - Upgrading Prisma 5.22 → 7.x (Linear EQ-11 family)
+- Fixing the 16 pre-existing `test_queue_lifecycle.py` failures (unrelated to Granola work)
 
 ---
 
@@ -129,31 +137,36 @@ Per `tasks/granola-integration-plan.md` §Phase 2d:
 - LOCKED-23 through LOCKED-44 are non-negotiable without strong new information + explicit user authorization to revisit.
 - Phase 2a (Prisma migration) is merged to eq-frontend main; vault tables LIVE in production Neon.
 - Phase 2b (vault module) is merged to live-transcription-fastapi main; module live as inert code; KMS smoke test PASSED.
-- Phase 2c (HTTP API client) is merged to live-transcription-fastapi main; module live as inert code (Phase 2d's adapter is the first thing that will import it).
-- The 8 error codes in Phase 2c's `errors.py` are the canonical wire format; Phase 2d consumes them via the imported enum.
-- Phase 2c's `transparent cursor pagination` semantics are locked in; Phase 2d should call `client.list_notes(...)` and trust the returned list is complete.
+- Phase 2c (HTTP API client) is merged to live-transcription-fastapi main; module live as inert code.
+- **PR-X1 (text_clean_service extraction) is merged to live-transcription-fastapi main (`fa97477`); module live + actively serving /text/clean.**
+- **PR-X2 (Phase 2d adapter + Path 2) is merged to live-transcription-fastapi main (`607121d`); module live as inert code (the scheduler from Phase 2e will be the first to invoke `run_one_cycle`).**
+- The 5-value IngestionOutcome enum is canonical (Phase 2e doesn't add a new value; the 'in_progress' string is an intermediate state managed by the SQL helper, not exposed in the enum).
 
 ---
 
-## NEW lesson codified this session (tasks/lessons.md)
+## NEW lessons codified this session (`tasks/lessons.md`)
 
-1. **Codex round-N convergence: scope-creep follow-ons.** A fix in round N can introduce a narrower bug in round N+1 (R3's ceiling bump → R4's leak to /folders → R5's caller-knob shadow → R6 clean). Audit shared helpers + public knobs for blast radius BEFORE committing a fix that changes a default. Refines [[feedback-codex-pre-merge-gate]].
+1. **Verify mandatory-read files exist before declaring them in handoffs.** The Phase 2c→2d handoff listed `services/text_clean_service.py` as a mandatory read but the file didn't exist; LOCKED-41 had locked the decision without scheduling the extraction work. Pre-flight every mandatory-read path with `ls`/`Read` before declaring it readable; when a LOCKED decision references a file, treat its creation as an explicit prerequisite milestone, not implicitly bundled into the first downstream phase.
+
+2. **Adapter-pattern PRs converge in 2-3 Codex rounds with scope-creep follow-ons.** PR-X1 (extraction) and PR-X2 (adapter composition) both had 2-3 substantive Codex rounds before R3/R5 CLEAN. The pattern: R1 surfaces real bugs at the largest blast-radius surface; fix introduces a narrower bug at a smaller surface; R2 catches that; R3 CLEAN. Refines `[[feedback-codex-pre-merge-gate]]` with PR-pattern-specific guidance.
+
+3. **Pre-write idempotency anchor BEFORE the downstream publish call.** The adapter pre-writes `status='in_progress'` + `eq_interaction_id` to `external_integration_runs` BEFORE calling `text_clean_service.process()`. If publish succeeds but the success UPSERT fails, the next cycle's idempotency check recovers the prior interaction_id and re-publishes under the same id — downstream consumers dedup. Without the pre-write, the retry would mint a new interaction_id and downstream would see two interactions for the same Granola note.
 
 ---
 
 ## Stop conditions for the next session
 
 - `/context-restore` returns NO_CHECKPOINTS or wrong checkpoint title
-- MEMORY.md Active Work doesn't read "PHASE_2C_SHIPPED" / "PHASE_2D_NEXT"
-- live-transcription-fastapi main is NOT at `030523c` (or descendant)
+- MEMORY.md Active Work doesn't read "PHASE_2D_SHIPPED" / "PHASE_2E_NEXT"
+- live-transcription-fastapi main is NOT at `607121d` (or descendant)
 - eq-frontend main is NOT at `7905222` (or descendant)
 - Production `/health` returns non-200
 - Vault schema + 3 tables NOT present in production Neon
 - AWS infrastructure missing
 - Another agent actively working in live-transcription-fastapi within the last hour
 - User asks you to deviate from a LOCKED decision (LOCKED-23..44) without explicit written confirmation
-- Phase 2d code path starts modifying any downstream Pydantic envelope contract → STOP (LOCKED-38)
-- Phase 2d code path starts calling text_clean over HTTP instead of via direct Python import → STOP (LOCKED-41)
+- Phase 2e starts using `@DBOS.scheduled` instead of external cron + SetWorkflowID → STOP (LOCKED-39 violation)
+- Phase 2e tries to manipulate Granola API directly from the cron handler (instead of dispatching to a DBOS workflow) → STOP (durability + retries come from DBOS)
 
 ---
 
@@ -169,21 +182,22 @@ Per `tasks/granola-integration-plan.md` §Phase 2d:
 - Project `847cfa5a-b77c-4fb0-95e4-b20e8773c23e` (live-transcription-fastapi)
 - Production environment `e4c5ec15-1931-4632-9e58-92d9c6be4261`
 - Service `59a69f3d-9a24-4041-942a-891c4a81c5fb`
-- **Latest deployment: `9e393c5a-1fcf-4b10-9d11-e62236f53b87` SUCCESS** (Phase 2c merge)
-- `/health` 200 verified at https://live-transcription-fastapi-production.up.railway.app/health
+- **Latest deployment: `edbcf4ef-8bf3-4be2-80da-b35c98cc267f` SUCCESS** (PR-X2 merge)
+- `/health` 200 at https://live-transcription-fastapi-production.up.railway.app/health
 - 4 vault env vars still set + working
+- Phase 2e adds new env var `INTERNAL_CRON_SECRET` (random 32-byte hex)
 
 ## Vercel state (eq-frontend, unchanged)
 
 - Project ID: `prj_0wDppCftk1VrSAsYswI5pnNRHdN8`
 - Team ID: `team_Hnnnu6r1trggeAXYWHXpKfMt`
-- Production deploy `2he8eDSfSLdapZ1eRXa6mSpjJkdq` READY at 2026-05-24 10:40:22Z
+- Production deploy `2he8eDSfSLdapZ1eRXa6mSpjJkdq` READY
 
 ## Neon state (production, unchanged)
 
 - Project `super-glitter-11265514` (eq-dev), branch `br-holy-block-ads5069w`
 - Database `neondb`
-- Vault schema + 3 tables LIVE with all FKs/UNIQUEs/indexes verified
+- Vault schema + 3 tables LIVE
 - **Important:** Vercel preview builds run against the same production Neon DB (lessons.md)
 
 ---
@@ -199,14 +213,23 @@ Unchanged this session. Items related to EQ-11's family:
 
 ---
 
+## Pre-existing environment gaps (NOT introduced this session)
+
+- Local `.venv` is missing `cryptography>=44.0.0` (pinned in `requirements.txt`). Vault tests (`tests/unit/vault/`) skip-fail in local pytest until `pip install -r requirements.txt` runs. Production Railway has the dep. PR-X2's adapter uses `TYPE_CHECKING` guard on the vault import so adapter tests don't require the dep either.
+- 16 pre-existing `test_queue_lifecycle.py` failures on main — `_SessionStub` related, unrelated to Granola work.
+- 1 deselected pre-existing test (`test_upsert_summary_uses_unique_interaction_id_index`) — old single-column ON CONFLICT migrated to composite during M2/M5.2.
+
+---
+
 ## Build session entry prompt
 
-Paste the contents of `docs/superpowers/specs/2026-05-24-phase-2d-session-prompt.md` as the opening message of the next session.
+Paste the contents of `docs/superpowers/specs/2026-05-24-phase-2e-session-prompt.md` as the opening message of the next session.
 
 That prompt contains:
-- Mandatory reads list (12 numbered items)
-- Phase 2d implementation scope + expected file structure
-- User posture rules + critical disciplines
+- Mandatory reads list (18 numbered items including the DBOS architecture doc + the merged PR-X1 + PR-X2)
+- Phase 2e implementation scope + expected file structure + pseudocode
+- User posture rules + critical disciplines (with DBOS-specific guardrails)
 - Stop conditions
-- Commits summary
+- Full Codex trajectory across both PRs this session
 - AWS + Railway + Vercel + Neon state
+- Pre-existing env gaps + pre-existing test failures

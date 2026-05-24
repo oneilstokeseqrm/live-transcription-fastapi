@@ -52,7 +52,7 @@ The 11-candidate Phase 2 backlog (Neo4j MERGE-everywhere refactor, contact ident
 | LOCKED-23 | Granola adapter lives in `services/granola_ingestion/` inside live-transcription-fastapi | Q1 |
 | LOCKED-24 | Credentials use AWS KMS envelope encryption + `vault.user_credentials` Postgres table with per-tenant `EncryptionContext` | Q2 |
 | LOCKED-25 | Granola transcripts ingest with `interaction_type="meeting"` (FK landmine mitigation per `routers/text.py:80-95`) | Q8 / brainstorm |
-| LOCKED-26 | Path 2 architecture for account resolution: known account → ingest with anchor; no known accounts → defer + re-poll | Q1 |
+| LOCKED-26 | Path 2 architecture for account resolution: known account → ingest with anchor; no known accounts → defer + re-poll. **Shipped PR-X2 `607121d` 2026-05-24** (3 substantive Codex rounds; R3 CLEAN delta after R1+R2 folds). Implementation in `services/granola_ingestion/path2.py` + `services/granola_ingestion/adapter.py`. Path 2 covers Scenario A (≥1 known anchor) / Scenario C (defer + capture LOCKED-44 snapshot) / Scenario D (no business attendees → skip). 84 unit tests pin the branching | Q1 |
 | LOCKED-27 | Snapshot-on-ingest semantics for Granola lifecycle (no reverse-sync) | Q5 |
 | LOCKED-28 | Polling cadence = 5 minutes; scheduling via **external Railway cron + DBOS queue with explicit SetWorkflowID** (NOT @DBOS.scheduled decorator — deprecated per `docs/superpowers/plans/2026-05-15-async-orchestration-dbos.md:768`) | Q3 + Codex consult |
 | LOCKED-29 | External integration dedup via `public.external_integration_runs`; UNIQUE on `(tenant_id, user_id, provider, external_id)` | Q4 |
