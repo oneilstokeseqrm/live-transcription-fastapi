@@ -157,7 +157,12 @@ class GranolaNoteDetail(BaseModel):
     updated_at: Optional[datetime] = None
     attendees: list[Attendee] = Field(default_factory=list)
     calendar_event: Optional[CalendarEvent] = None
-    transcript: list[TranscriptTurn] = Field(default_factory=list)
+    # ``transcript`` is REQUIRED — the client always calls
+    # ``?include=transcript``, so an absent transcript field is a real
+    # shape mismatch (not a degenerate-meeting signal). The list MAY
+    # be empty (zero-audio captures are legitimate); a missing field
+    # is what surfaces as GRANOLA_PARSE_ERROR.
+    transcript: list[TranscriptTurn]
     summary_markdown: Optional[str] = None
     summary_text: Optional[str] = None
     web_url: Optional[str] = None

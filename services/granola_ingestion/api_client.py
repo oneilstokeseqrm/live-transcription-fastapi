@@ -62,13 +62,14 @@ _DEFAULT_RETRY_BASE_DELAY_S = 1.0
 # hang the poll cycle indefinitely. Reset to zero on any non-429 response.
 _DEFAULT_MAX_CONSECUTIVE_429S = 3
 
-# Defensive ceiling on pagination loops. Granola's /notes returns at most
-# ~100 entries per page in our usage and is filtered by ``created_after``
-# (typically the credential's last_polled_at), so realistic pages-per-call
-# are 0-2. 20 pages = 2000 notes per cycle is well beyond any realistic
-# 5-min window; hitting it signals a cursor that isn't advancing (a real
-# bug, not a busy folder).
-_DEFAULT_MAX_PAGES = 20
+# Defensive ceiling on pagination loops. The realistic 5-min poll window
+# generates 0-2 pages (filtered by ``created_after``), but an initial
+# backfill against a newly-connected credential (``last_polled_at=NULL``)
+# can legitimately match thousands of notes — Phase 2c's docstring on
+# list_notes calls this out. 500 pages × ~100 entries = ~50,000 notes
+# accommodates any realistic backfill; the load-bearing runaway guard is
+# the per-page cursor non-advancement check, not this ceiling.
+_DEFAULT_MAX_PAGES = 500
 
 # Cap how long we'll honor a server-suggested Retry-After. Granola's docs
 # advertise 5 req/sec sustained + 300/min — well above what the adapter

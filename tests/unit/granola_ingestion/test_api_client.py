@@ -47,7 +47,7 @@ def _client_with_handler(
     max_retries: int = 4,
     retry_base_delay_s: float = 0.001,
     max_consecutive_429s: int = 3,
-    max_pages: int = 20,
+    max_pages: int = 500,
 ) -> GranolaAPIClient:
     """Build a client whose underlying httpx talks to ``handler``.
 
@@ -976,3 +976,103 @@ async def test_429_fallback_backoff_grows_with_consecutive_429s(sleep_calls):
     assert 0.001 <= sleep_calls[0] < 0.0015
     assert 0.002 <= sleep_calls[1] < 0.003
     assert 0.004 <= sleep_calls[2] < 0.006
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 fixes: transcript required + raise max_pages ceiling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_note_detail_missing_transcript_raises_parse_error(sleep_calls):
+    """Codex R3 P2: the client always requests ?include=transcript, so a
+    response missing the transcript field is a real shape mismatch — must
+    NOT default to []. Phase 2d would otherwise silently ingest a blank
+    meeting where the API actually misbehaved."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "not_x",
+                "title": "Sync",
+                "created_at": "2026-05-24T07:00:00Z",
+                # transcript intentionally absent
+                "summary_text": "Quick chat",
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        with pytest.raises(GranolaError) as exc_info:
+            await client.get_note_detail("not_x")
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.code is GranolaErrorCode.GRANOLA_PARSE_ERROR
+
+
+@pytest.mark.asyncio
+async def test_get_note_detail_empty_transcript_list_is_accepted(sleep_calls):
+    """A legitimately empty transcript list (zero-audio capture) must still
+    validate — the required-field check only triggers on the field being
+    absent, not on an empty list."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "not_empty",
+                "title": "Joined, no audio",
+                "created_at": "2026-05-24T07:00:00Z",
+                "transcript": [],
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        detail = await client.get_note_detail("not_empty")
+    finally:
+        await client.aclose()
+
+    assert detail.id == "not_empty"
+    assert detail.transcript == []
+
+
+@pytest.mark.asyncio
+async def test_list_notes_pagination_accommodates_large_backfill(sleep_calls):
+    """Codex R3 P2: the previous max_pages=20 ceiling would deterministically
+    fail real first-poll backfills against active accounts. With the bumped
+    default of 500, a 50-page run completes cleanly. The non-advancing-cursor
+    guard remains the load-bearing runaway protection (verified by a
+    separate test)."""
+
+    counter = {"n": 0}
+    TOTAL_PAGES = 50
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter["n"] += 1
+        last_page = counter["n"] >= TOTAL_PAGES
+        return httpx.Response(
+            200,
+            json={
+                "notes": [
+                    {
+                        "id": f"not_{counter['n']}",
+                        "title": "x",
+                        "created_at": "2026-05-24T00:00:00Z",
+                    }
+                ],
+                "hasMore": not last_page,
+                "cursor": None if last_page else f"cur_{counter['n']}",
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        notes = await client.list_notes(folder_id="fol_big")
+    finally:
+        await client.aclose()
+
+    assert counter["n"] == TOTAL_PAGES
+    assert len(notes) == TOTAL_PAGES
