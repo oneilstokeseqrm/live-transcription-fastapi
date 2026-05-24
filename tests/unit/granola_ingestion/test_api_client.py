@@ -1118,3 +1118,37 @@ async def test_list_folders_pagination_ceiling_is_tight(sleep_calls):
     assert "exceeded" in exc_info.value.message.lower()
     # Tight ceiling = 20; should fire well before 500.
     assert counter["n"] == 20
+
+
+@pytest.mark.asyncio
+async def test_list_folders_honors_caller_stricter_max_pages(sleep_calls):
+    """Codex R5 P2: when a caller sets a tighter max_pages than the
+    endpoint's hardcoded ceiling, /folders MUST honor the caller's
+    setting. The semantics are min(constructor_max_pages,
+    endpoint_max_pages), not "endpoint always wins". This matters when
+    callers (e.g., a UI dropdown initializer) bound latency by capping
+    request volume per call."""
+
+    counter = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter["n"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "folders": [{"id": f"fol_{counter['n']}", "name": "x"}],
+                "hasMore": True,
+                "cursor": f"cur_{counter['n']}",
+            },
+        )
+
+    # Caller passes max_pages=3 — tighter than the /folders cap of 20.
+    client = _client_with_handler(handler, max_pages=3)
+    try:
+        with pytest.raises(GranolaError):
+            await client.list_folders()
+    finally:
+        await client.aclose()
+
+    # 3 wins, not 20.
+    assert counter["n"] == 3

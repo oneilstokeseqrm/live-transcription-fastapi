@@ -326,12 +326,20 @@ class GranolaAPIClient:
         Defensively accepts a bare list (no wrapper) for forward
         compatibility with possible future endpoint shapes.
 
-        ``max_pages_override`` lets callers tighten the page ceiling for
-        endpoints whose realistic scale is smaller than ``self._max_pages``
-        (which is sized for the worst-case ``/notes`` backfill). When
-        ``None``, the constructor default applies.
+        ``max_pages_override`` lets endpoint-specific callers express a
+        TIGHTER ceiling than the constructor's general ``max_pages`` knob
+        (e.g., ``/folders`` realistically caps at ~20 pages even though
+        ``/notes`` may need 500). The effective page limit is
+        ``min(self._max_pages, max_pages_override)`` — the caller's
+        configured ceiling is always honored, and the endpoint override
+        only tightens further. A caller that intentionally lowered
+        ``GranolaAPIClient(..., max_pages=3)`` for latency control gets
+        a 3-page ceiling on ``/folders`` too, not the endpoint's 20.
         """
-        page_limit = max_pages_override if max_pages_override is not None else self._max_pages
+        if max_pages_override is None:
+            page_limit = self._max_pages
+        else:
+            page_limit = min(self._max_pages, max_pages_override)
         collected: list[Any] = []
         cursor: str | None = None
         for _ in range(page_limit):
