@@ -21,3 +21,8 @@ greenlet>=3.0.0
 
 # Phase 1.5 — DBOS durable execution substrate
 dbos==2.22.0
+
+# Phase 2 Granola integration — vault module needs AES-GCM directly.
+# (currently transitive via PyJWT/dbos; pinned here so a future bump can't
+# yank it from under services/vault/encryption.py.)
+cryptography>=44.0.0

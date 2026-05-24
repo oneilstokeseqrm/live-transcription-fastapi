@@ -27,6 +27,13 @@ Granola released an **official Personal API** in late March 2026 (Series C + API
 
 ### Empirical Granola API findings (verified against Peter's account on 2026-05-21)
 
+> **Empirical correction (2026-05-22 Phase 0 verification):** The original empirical findings below have TWO factual errors that the executable plan (`tasks/granola-integration-plan.md`) has been corrected for:
+>
+> 1. **Base URL:** `api.granola.ai` is WRONG. The correct base URL is **`public-api.granola.ai/v1`**. The wrong host returns CloudFront/API-Gateway 404 on every path.
+> 2. **Filter parameter for time-based filtering:** `since` is WRONG. The correct parameter is **`created_after`** (per `docs.granola.ai`). The `since` param is silently ignored.
+>
+> Other empirical claims below — `folder_id` filter, `not_`/`fol_` ID prefixes, `?include=transcript` payload shape — re-verified ✅ at the corrected base URL. `/folders` endpoint exists (returns `{folders, hasMore, cursor}`) despite not being shown on the public docs page. Bogus `folder_id` returns `VALIDATION_ERROR: Invalid folder ID format` as originally documented.
+
 Key facts confirmed by direct API calls:
 
 - `GET /v1/notes?folder_id=<id>` works as a server-side filter. Sending a bogus folder_id returns `VALIDATION_ERROR: Invalid folder ID format` — proving the param is recognized.

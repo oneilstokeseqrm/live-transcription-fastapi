@@ -104,14 +104,15 @@ The 11-candidate Phase 2 backlog (Neo4j MERGE-everywhere refactor, contact ident
    SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'
      AND table_name IN ('external_integration_runs', 'user_credentials');
    ```
-6. **Verify Granola `since` filter support** (per Codex consult — empirical only confirmed `folder_id` filter):
+6. **Verify Granola `created_after` filter support** (per Codex consult — empirical only confirmed `folder_id` filter):
    ```bash
-   # Test with Peter's real Granola key
+   # Test with the design partner's real Granola key
    curl -H "Authorization: Bearer $GRANOLA_KEY" \
-     "https://api.granola.ai/v1/notes?folder_id=fol_xxx&since=2026-05-01T00:00:00Z&page_size=5"
+     "https://public-api.granola.ai/v1/notes?folder_id=fol_xxx&created_after=2026-05-01T00:00:00Z&limit=5"
    ```
-   - Expected: filtered to notes updated since the timestamp
-   - If `since` param is ignored or returns 400: fall back to client-side filter against `created_at`; document the degradation (every poll = full folder scan). Update Phase 2c API client accordingly.
+   - Expected: filtered to notes created after the timestamp
+   - If `created_after` param is ignored or returns 400: fall back to client-side filter against `created_at`; document the degradation (every poll = full folder scan). Update Phase 2c API client accordingly.
+   - **EMPIRICAL OUTCOME 2026-05-22 (Phase 0 verification):** ✅ confirmed against `public-api.granola.ai/v1`. Far-future `created_after` returns 0 notes; far-past returns baseline. Server-side filter works. Bogus `folder_id` returns `VALIDATION_ERROR: Invalid folder ID format`. `/folders` returns `{folders, hasMore, cursor}`. Note IDs: `not_` prefix; folder IDs: `fol_` prefix. Note: brainstorm doc used `api.granola.ai` + `since` — both factually wrong; corrected throughout this plan.
 7. **Read repo's DBOS architecture doc** before designing Phase 2e scheduler: `docs/superpowers/plans/2026-05-15-async-orchestration-dbos.md` §768 (deprecation of `@DBOS.scheduled`) + §504 (`SetWorkflowID` dedup pattern).
 8. Confirm no other agents are active in the test tenant per shared-infrastructure-collision protocol:
    ```bash
@@ -410,12 +411,12 @@ async def rotate_credential_key(
 ```python
 class GranolaAPIClient:
     async def list_folders(self) -> list[GranolaFolder]: ...
-    async def list_notes(self, folder_id: str, since: datetime | None) -> list[GranolaNoteSummary]: ...
+    async def list_notes(self, folder_id: str, created_after: datetime | None) -> list[GranolaNoteSummary]: ...
     async def get_note_detail(self, note_id: str) -> GranolaNoteDetail: ...
 ```
 
 **Configuration:**
-- Base URL: `https://api.granola.ai`
+- Base URL: `https://public-api.granola.ai/v1` (empirically verified 2026-05-22; brainstorm doc had `api.granola.ai` which is wrong)
 - Timeout: 30s per request
 - Retry strategy on 5xx/network errors: exponential backoff with jitter
   - 1s → 2s → 4s → 8s (max 4 retries per request)
@@ -475,11 +476,11 @@ async def run_one_cycle(credential_id: UUID) -> CycleResult:
 
         client = GranolaAPIClient(api_key=credential.api_key)
 
-        # 1. Fetch new notes since last_polled_at
+        # 1. Fetch new notes created after last_polled_at (Granola's filter param is `created_after`)
         try:
             notes = await client.list_notes(
                 folder_id=credential.config["folder_id"],
-                since=credential.last_polled_at,
+                created_after=credential.last_polled_at,
             )
         except AuthFailedError:
             await mark_credential_revoked(credential_id)

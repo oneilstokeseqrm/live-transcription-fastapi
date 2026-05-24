@@ -1,147 +1,172 @@
 # Next Session — Start Here
 
 **Project:** Phase 2 — Granola.ai transcript ingestion integration.
-**Last session:** 2026-05-22 (brainstorm closed; plan locked + reviewed via /plan-eng-review and /codex consult; build next).
-**Status:** ✅ BRAINSTORM_COMPLETE_PLAN_LOCKED_REVIEWED. Build session is the next step.
+**Last session:** 2026-05-23 (Phase 0 + Phase 1 + Phase 2a all shipped in a single multi-hour session).
+**Status:** ✅ PHASE_2A_COMPLETE — Phase 2b (vault Python module) is the next step.
 
-**Review surfaced 22 LOCKED decisions (LOCKED-23 through LOCKED-44).** Of those, 6 came from the outside-voice Codex review and would have caused build-time bugs:
-- LOCKED-39: `@DBOS.scheduled` is deprecated per repo's own DBOS plan; use external Railway cron
-- LOCKED-40: KMS EncryptionContext must bind all 4 fields (was 2; tenant-internal row-swap gap)
-- LOCKED-41: Extract `/text/clean` core; don't HTTP-call from adapter
-- LOCKED-42: Single Postgres engine for MVP; second role + engine = Phase 2.1
-- LOCKED-43: Fresh DEK + fresh nonce on every encrypted_api_key write
-- LOCKED-44: Capture `granola_note_snapshot` at defer time for recoverability
+**Paste-ready opening prompt for the next session:**
+`docs/superpowers/specs/2026-05-23-phase-2b-next-session-prompt.md`
+
+That prompt is self-contained. It mirrors the structure of the prompt that opened the prior session and walks the new agent through mandatory reads → 2-paragraph confirmation → Phase 2b execution.
 
 ---
 
-## START BY READING THIS DOC
+## What shipped this session (2026-05-23)
 
-**Load-bearing executable plan:** `tasks/granola-integration-plan.md`
+### Phase 0 — Pre-flight verification (~0.5 day) ✅
 
-That plan is comprehensive (~660 lines). It contains:
-- All 16 new LOCKED decisions (LOCKED-23 through LOCKED-38)
-- 6 build phases (Phase 0 pre-flight → Phase 1 AWS → Phase 2 backend → Phase 3 frontend → Phase 4 testing → Phase 5 Codex gate → Phase 6 deploy)
-- 13 test scenarios mapped to Q7 failure modes
-- Phase-by-phase exit criteria
-- Pre-merge checklist
-- Cross-cutting constraint citations (Codex pre-merge gate, verify_consumer_contracts.py, tenant isolation, etc.)
-- Build session entry prompt (paste at the end)
+- `scripts/verify_consumer_contracts.py` confirmed LOCKED-35 envelope shape accepted by all 3 known consumers (action-item-graph strict enum, eq-structured-graph-core loose, eq-interaction-threads loose).
+- Granola API verified empirically against Peter's real key. **Two factual errors in the brainstorm doc caught + amended:**
+  - Base URL: `api.granola.ai` → `public-api.granola.ai/v1` (correct per docs.granola.ai)
+  - Filter param: `since` → `created_after` (correct per docs)
+- Neon schema probe: vault schema + new tables absent; LOCKED-25 FK landmine reconfirmed (`meeting` lowercase exists in interaction_types lookup).
+- Feature branch `phase-2/granola-integration` created in live-transcription-fastapi off origin/main.
 
-**Background brainstorm doc (don't re-litigate):** `docs/superpowers/specs/2026-05-22-granola-integration-brainstorm-decisions.md` (~600 lines).
+### Phase 1 — AWS infrastructure (~0.5 day) ✅
 
-Read the plan first, then the brainstorm doc only if you need to understand WHY a decision was made.
+- IAM user `eq-vault-service` created (Arn `arn:aws:iam::211125681610:user/eq-vault-service`).
+- KMS CMK `59a0e2bc-c636-45e8-bccf-427ad2426ad8` created with alias `alias/eq-user-secrets`.
+- KMS key policy + IAM identity policy applied with **tightened** LOCKED-40 binding (`ForAllValues:StringEquals + Null:false` on Encrypt/Decrypt/GenerateDataKey — strictly more secure than the plan's literal text; user-approved tightening).
+- AWS access keys created; 4 Railway env vars set via Railway MCP (`EQ_VAULT_AWS_ACCESS_KEY_ID/SECRET/KMS_KEY_ALIAS/REGION`).
+- **KMS auto-rotation ENABLED** (annual cadence; next 2027-05-23). Layer 3 master key rotation only — user's Granola API keys (Layer 1) are NEVER touched.
+- `services/vault/` directory created with comprehensive README + canonical policy JSON files for audit.
+
+### Phase 2a — Prisma schema + migration (~0.5 day, +30 min audit log addition) ✅
+
+- 4 new Phase 2a-related items added beyond the locked plan, all user-approved:
+  - **CredentialAccessLog audit table** added to address discovered shortcut "no credential-read forensic log". Phase 2a scope expanded to include this table in the migration.
+  - **IAM policy tightening** beyond the locked plan literal text (`ForAllValues:StringEquals + Null:false` vs the loose `StringEquals` in the plan).
+  - **KMS auto-rotation enabled** during Phase 2a (had been documented but not enabled).
+  - **Linear EQ-11** created for the discovered Prisma schema drift investigation.
+- multiSchema preview feature enabled; `schemas = ["public", "vault"]` declared.
+- 176 existing models/enums/views bulk-annotated with `@@schema("public")` via Python script (mechanical; required by Prisma 5.22 multiSchema enforcement).
+- 3 new models added: `vault.UserCredential`, `vault.CredentialAccessLog`, `public.ExternalIntegrationRun` (with `granola_note_snapshot` JSONB per LOCKED-44).
+- Back-refs added on `Tenant`, `User`, `Account`.
+- **Migration hand-written** (NOT generated via `prisma migrate dev`) because the auto-generated diff between schema.prisma and production Neon contained 350+ statements of pre-existing drift (63 DROP TABLEs, enum/index/FK changes) unrelated to this work. The drift is tracked at Linear EQ-11 for separate investigation.
 
 ---
 
-## SESSION SCOPE — BUILD
+## What's next: Phase 2b
 
 | Phase | Time | Description |
 |---|---|---|
-| Phase 0 | ~0.5 day | Pre-flight verification: scripts/verify_consumer_contracts.py against proposed envelope (source="generic", interaction_type="meeting"). Fall back to source="api" if drift. |
-| Phase 1 | ~0.5 day | AWS infrastructure: KMS CMK `alias/eq-user-secrets` + IAM user `eq-vault-service` + Railway env vars |
-| Phase 2 | ~4-5 days | Backend: Prisma migrations (eq-frontend) → vault module → Granola API client → adapter (Path 2) → DBOS scheduler → admin endpoints → transactional email |
-| Phase 3 | ~2 days | Frontend (eq-frontend): Granola Connect settings page + EQ-native Pending Approvals component |
-| Phase 4 | ~1 day | Testing: unit + integration + production E2E on test tenant |
-| Phase 5 | varies | Pre-merge Codex review gate (4-round soft cap, extend if real P1s persist) |
-| Phase 6 | ~0.5 day | Deploy + verify |
+| **Phase 2b** | **~0.5 day** | **Vault Python module** — encryption.py + audit.py + user_credentials.py + errors.py + __init__.py + AsyncMock unit tests. Uses the AWS infrastructure already provisioned in Phase 1. Implements LOCKED-40/41/42/43 at the Python layer. |
+| Phase 2c | ~0.5 day | Granola API client (httpx + structured errors + Pydantic models for the corrected `public-api.granola.ai/v1` URL and `created_after` filter). |
+| Phase 2d | ~1.5 days | Adapter + Path 2 scenario logic (the architecturally densest piece — likely deserves its own session). |
+| Phase 2e | ~0.5 day | Scheduler (external Railway cron + DBOS queue + SetWorkflowID per LOCKED-39). |
+| Phase 2f | ~0.5 day | Admin endpoints (`/validate`, `/connect`, `/rotate`, `/folder`, `/status`, `/disconnect`). |
+| Phase 2g | ~0.5 day | Transactional email on credential breakage (Resend). |
+| Phase 3 | ~2 days | Frontend (Granola Connect settings page + EQ-native Pending Approvals). |
+| Phase 4 | ~1 day | Testing (unit + integration + production E2E). |
+| Phase 5 | varies | Codex pre-merge review gate (4-round soft cap). |
+| Phase 6 | ~0.5 day | Deploy + verify (cross-repo order: eq-frontend Prisma first → live-transcription-fastapi). |
 
-**Estimated total:** ~6-7 days of focused engineering, likely 3-5 build sessions.
+**Estimated remaining:** ~6 days across 3-4 more sessions.
 
----
-
-## CRITICAL — WHAT NOT TO RELITIGATE
-
-The plan's "LOCKED Decisions" table is non-negotiable without strong new information. The top constraints:
-
-1. **`interaction_type="meeting"`** — anything else trips the `raw_interactions` FK landmine. Verified live in `routers/text.py:80-95`.
-2. **`source="generic"`** with verification gate — fits existing downstream enum; do NOT add "granola" to action-item-graph or eq-structured-graph-core. See [[feedback-envelope-contract-immutable]] memory.
-3. **Path 2 (defer + re-poll)** for account resolution — not Path 1 (pending_transcripts table).
-4. **AWS KMS envelope encryption + `vault.user_credentials`** — not env vars, not Secrets Manager.
-5. **Per-user (not org-scoped) credentials** — Granola's API model is 1 key per user.
-6. **Snapshot-on-ingest** — no reverse-sync on Granola edits/deletes/folder-moves.
-7. **Soft-delete on disconnect** — preserves audit trail.
-8. **No Docker in tests** — AsyncMock unit tests + production E2E on test tenant (per [[test-pattern-no-docker-default]]).
+**Realistic next session:** Phase 2b is a focused ~0.5-day chunk. If energy permits after 2b, Phase 2c (Granola HTTP client) is a natural same-session continuation. Phase 2d (adapter logic, 1.5 days) deserves its own dedicated session.
 
 ---
 
-## OPEN ITEMS NOT IN MVP
+## CRITICAL — What NOT to relitigate
 
-Deferred but tracked in the plan's "Post-implementation follow-ups" section:
+The plan's 22 LOCKED decisions (LOCKED-23 through LOCKED-44) are non-negotiable without strong new information. Phase 2a added zero new LOCKED decisions; it only validated existing ones.
 
-1. **Alerting wire-up (Phase 2.1)** — Slack webhook OR Resend for critical conditions (KMS failure, adapter not running). User-deferred from Q7.
-2. **Org-admin bulk-onboarding (Phase 3)** — when >10 users.
-3. **Reverse-sync** — only if user feedback demands it; LOCKED-27 says no for MVP.
-4. **Webhooks instead of polling** — when Granola releases webhooks.
-5. **Other Phase 2 backlog candidates** (Neo4j MERGE-everywhere, contact identity state machine, etc.) — independent initiatives.
+Phase 0 amendments to the plan (commit `cbc5112`):
+- Base URL is `public-api.granola.ai/v1` (NOT `api.granola.ai/v1`)
+- Time filter param is `created_after` (NOT `since`)
+
+Phase 2a amendments (in services/vault/README.md, NOT yet in granola-integration-plan.md):
+- IAM policy uses `ForAllValues:StringEquals + Null:false` (tighter than plan's literal `StringEquals`)
+- `vault.credential_access_log` table is now part of the design (not in the original plan)
+- Federated identity (Phase 2.1 candidate #3) is blocked by Railway lacking OIDC support — documented as platform constraint, not a free choice
 
 ---
 
-## AWS ACCOUNT STATE (verified 2026-05-22, unchanged)
+## 4 commits to internalize before Phase 2b
+
+**live-transcription-fastapi** branch `phase-2/granola-integration`:
+- `0f86cba` — Phase 2a discoveries: KMS auto-rotation enabled + audit log spec + EQ-11 reference
+- `8f3127f` — Phase 1 AWS infrastructure provisioned + audit docs
+- `cbc5112` — Phase 0 plan amendments (Granola base URL + filter param empirical corrections)
+- `bd458ec` — Phase 2 brainstorm + plan locked (predates this session)
+
+**eq-frontend** branch `phase-2/granola-vault-schema`:
+- `cf870b4` — Phase 2a Prisma migration: vault schema + 3 new tables
+- `556b046` — Phase 1 comments-generator cleanup
+
+All 6 commits are **local-only**. Nothing pushed. Future PR pushes require explicit user authorization.
+
+---
+
+## NEW lessons codified this session
+
+1. **Always verify branch BEFORE commits in shared checkouts.** Prior session experienced a silent branch switch (likely caused by another active agent in the same checkout). Recovery required a user-authorized `git reset --hard`. Discipline: `git branch --show-current` immediately before every `git commit`.
+
+2. **Return to main when pausing in shared checkouts.** Matched half of #1. After committing on a feature branch + before /context-save, switch the checkout back to main as cross-agent courtesy. The next agent's pre-flight expects main. Resume the feature branch with `git checkout <feature-branch>` when continuing. Surfaced by another agent's blocked Session 26 of the UCC initiative on 2026-05-23 PM.
+
+3. **Never auto-apply Prisma migrate diff against drifted production.** Prior session generated a 52KB / 375-statement diff that included 63 DROP TABLEs unrelated to our work. Hand-write the migration with only additive statements. The drift itself goes to a dedicated investigation issue.
+
+4. **Cutting-edge security posture is platform-relative.** Federated identity is the cutting-edge pattern when the deployment platform supports it. Railway doesn't (today). The cutting-edge MVP move on Railway becomes: long-lived AWS keys + minimum-privilege IAM + Encryption Context binding + audit log + rotation cadence. Match the pattern to the platform.
+
+5. **Cross-repo deploy coordination matters.** Phase 2a Prisma migration in eq-frontend must deploy BEFORE Phase 2b vault module in live-transcription-fastapi can be smoke-tested against the test tenant. The Phase 6 deploy ordering is non-negotiable. Document this in PR descriptions when they go up.
+
+---
+
+## Stop conditions for the next session
+
+- /context-restore returns NO_CHECKPOINTS or the wrong checkpoint title
+- MEMORY.md Active Work doesn't read "PHASE_2A_COMPLETE_PHASE_2B_NEXT"
+- AWS infrastructure missing (verify via `aws kms describe-key --key-id 59a0e2bc-...` + `aws iam get-user --user-name eq-vault-service`)
+- Railway env vars missing (`EQ_VAULT_AWS_ACCESS_KEY_ID` + 3 others)
+- Another agent actively working in the same repo within last hour (shared-infra collision)
+- Production /api/health returns non-200
+
+---
+
+## Open items NOT in MVP (Phase 2.1+, do NOT pull forward)
+
+1. **Federated identity** — blocked on Railway not supporting OIDC. Revisit when Railway adds support OR when EQ evaluates platform migration.
+2. **Second Postgres role + engine for vault** — defense-in-depth above the accessor + ALLOWLIST.
+3. **Schema separation for credential_access_log via role permissions** — DB-layer enforcement of append-only (currently app-layer only).
+4. **Automated access-key rotation reminder** — periodic check that warns if access key age > 90 days.
+5. **AES-GCM nonce-reuse detection monitoring**.
+6. **Cross-region replicated CMK** — currently us-east-1 only.
+7. **CloudTrail-based anomaly detection** — alert on unusual KMS access patterns.
+8. **Alerting wire-up** (Slack webhook OR Resend) for credential breakage events.
+9. **Org-admin bulk-onboarding** — Phase 3 trigger at >10 users.
+10. **Reverse-sync, webhooks-not-polling** — LOCKED-27 explicit defer.
+11. **Prisma schema drift investigation + cutting-edge prevention** — tracked at Linear EQ-11.
+
+---
+
+## AWS account state (verified 2026-05-23)
 
 - Account ID: `211125681610`
-- Root: MFA on, no access keys
-- IAM user `peter-admin-cli` with AdministratorAccess (used by CLI + AWS MCP)
-- 8 KMS keys exist (7 AWS-managed for services + 1 unused custom from June 2024)
-- Build will add: KMS CMK aliased `alias/eq-user-secrets` + IAM user `eq-vault-service`
+- Region: us-east-1
+- IAM user `eq-vault-service` exists with inline policy `eq-vault-service-kms-policy`
+- KMS CMK `59a0e2bc-c636-45e8-bccf-427ad2426ad8` (alias `alias/eq-user-secrets`)
+- Auto-rotation enabled (annual; next 2027-05-23)
+- Access key `AKIATCKASHXFPCDN6NXX` created; secret in Railway env vars only
 
 ---
 
-## DESIGN PARTNER CONTEXT (unchanged)
+## Linear EQ-11 — schema drift investigation (separate work)
 
-- 3 design partners on Granola Business plan
-- Peter (you) has personal Business plan account = design partner #0 for testing
-- Granola Personal API released late March 2026, included in Business plan
-- Each user generates their own `grn_…` API key + creates a designated "EQ" folder
-- Empirical API validation done 2026-05-21 against Peter's real account
+https://linear.app/eq-core/issue/EQ-11/investigate-prisma-schema-drift-in-eq-frontend-design-cutting-edge
+
+Two-phase scope (audit + cutting-edge prevention design). DO NOT execute in Phase 2b. Acknowledge it exists; understand the Phase 2a migration was hand-written to bypass the drift cleanly.
 
 ---
 
-## TASK LIST STATE AT END OF LAST SESSION (2026-05-22)
+## Build session entry prompt
 
-| # | Status | Subject |
-|---|---|---|
-| 1 | completed | Walk through Q6 — Granola Connect settings page UX |
-| 2 | completed | Walk through Q7 — error handling |
-| 3 | completed | Walk through Q8 — envelope labels |
-| 4 | completed | Write tasks/granola-integration-plan.md |
-| 5 | optional | Plan reviews (/plan-eng-review and/or /codex consult) |
-| 6 | pending | End session — commit plan + memory update |
+Paste the contents of `docs/superpowers/specs/2026-05-23-phase-2b-next-session-prompt.md` as the opening message of the next session.
 
----
-
-## PHASE 1 STATUS (REFERENCE)
-
-Phase 1 email pipeline initiative: ✅ COMPLETE 2026-05-18. All 8 milestones shipped + verified end-to-end. 22 LOCKED decisions captured. Production stable.
-
-Granola integration is Phase 2 work — the first concrete initiative after Phase 1 closed. Prior Phase 1 session-handoff content has been superseded by this file (Phase 1 docs live in git history).
-
----
-
-## BUILD SESSION ENTRY PROMPT
-
-Paste this block as the opening message of the next session:
-
-```
-You're starting the Granola integration build. The brainstorm is closed; the plan is locked.
-
-START BY READING:
-1. tasks/granola-integration-plan.md (executable plan) — top-to-bottom
-2. docs/superpowers/specs/2026-05-22-granola-integration-brainstorm-decisions.md (background; don't re-litigate)
-3. ~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/MEMORY.md (auto-loaded)
-4. ~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/project_granola_integration.md (status snapshot)
-5. ~/.claude/projects/-Users-peteroneil-EQ-CORE-live-transcription-fastapi/memory/feedback_envelope_contract_immutable.md (load-bearing rule)
-6. tasks/lessons.md (1820 lines of cross-cutting discipline)
-
-Then execute Phase 0 (pre-flight verification) to confirm source="generic" works downstream. If verify_consumer_contracts.py surfaces drift, fall back to source="api" and update LOCKED-35 in the plan; do NOT modify downstream.
-
-Then execute Phase 1 (AWS) → Phase 2 (backend) → Phase 3 (frontend) → Phase 4 (testing) sequentially.
-
-Codex pre-merge gate is mandatory; 4-round soft cap.
-
-Coordinate with user before:
-- Running any destructive SQL on the test tenant
-- Merging the eq-frontend Prisma migration PR (cross-repo coordination)
-- Any decision that deviates from the locked plan
-
-User posture: non-developer founder; plain-English explanations; investigate thoroughly; no shortcuts.
-```
+That prompt contains:
+- Mandatory reads list (11 numbered items)
+- Top LOCKED decisions for Phase 2b (LOCKED-40/41/42/43)
+- Phase 2b implementation order (errors → encryption → audit → user_credentials → __init__ → smoke test → Codex)
+- User posture rules (including NEW branch-verify discipline)
+- Stop conditions
+- Commits summary
+- AWS + Railway state
