@@ -2057,3 +2057,264 @@ next agent having to deal with a working tree pointed at our branch.
 
 [[feedback_branch_safety]] — the parent rule (branch verification
 before commits) is the matched half of this discipline.
+
+
+## Vercel preview failure predicts production failure (2026-05-24)
+
+### Lesson
+
+When a Vercel preview build fails on a PR, treat it as a **production
+blocker** — the preview build pipeline is identical to the production
+deploy pipeline. If preview fails, merging that PR would fail production
+the same way. Don't frame preview failures as "just preview" or "not
+affecting production yet"; they ARE a prediction of production failure.
+
+### Why
+
+2026-05-24 Phase 2b session: pushed eq-frontend#418 (Phase 2a Prisma
+migration); Vercel preview failed on `prisma migrate deploy` of an
+auto-generated `update_comments` migration. I framed it to the user as
+"the preview failed but production is fine — here are options." User
+correctly pushed back: "if the preview deployment failed, the production
+will, so I don't know why you're not concerned about that." They were
+right. Production HAD NOT been redeployed because we hadn't merged, but
+the preview failure was an accurate prediction that the merge would
+break production identically. Treating it as low-urgency was a real
+framing mistake that risked the user authorizing a merge that would
+have broken production.
+
+### How to apply
+
+1. **When a Vercel preview build fails on your PR**, surface it as:
+   "preview build failed; this predicts a production failure on merge.
+   We must NOT merge until preview passes."
+   NOT "preview failed but production is fine; here are options to
+   proceed."
+
+2. **When pushing a branch that will trigger Vercel preview**, explicitly
+   warn the user beforehand: "this push will trigger Vercel preview
+   builds; the dashboard will light up. If they fail, that predicts a
+   production failure on merge — we'll investigate."
+
+3. **Mental model:** the canary is the preview. The canary dying means
+   the mineshaft is unsafe, even though no one is in the mineshaft yet.
+   Treat dead canaries as blocking.
+
+4. **Operationally:** any merge of a PR with a failing preview build
+   requires explicit user authorization that includes acknowledgment of
+   the preview failure. Don't surface options as if shipping is on the
+   table when the canary is dead.
+
+### Related
+
+[[feedback_codex_pre_merge_gate]] — same family: pre-merge gates that
+predict post-merge failures must be respected as merge blockers.
+
+
+## Prisma multiSchema exposes brittleness in third-party generators (2026-05-24)
+
+### Lesson
+
+When introducing Prisma's `multiSchema` preview feature to a project,
+verify EVERY third-party Prisma generator in the pipeline (db-comments
+generators, ERD generators, type generators for non-JS clients) builds
+successfully against the new schema BEFORE pushing. Generators that
+worked under single-schema may NOT correctly populate `model.schema` for
+multiSchema models in their DMMF integration — even when their own code
+appears multiSchema-aware.
+
+### Why
+
+2026-05-24 Phase 2b session: eq-frontend#418's Vercel preview build
+failed at `prisma migrate deploy` because the
+`@onozaty/prisma-db-comments-generator@1.5.0` tool (which runs as part
+of `prisma generate` via the `generator dbComments` block in
+schema.prisma) emitted SQL like:
+
+  COMMENT ON COLUMN "user_credentials"."some_col" IS '...';
+
+UNQUALIFIED. The vault tables live in the `vault` schema
+(`@@schema("vault")` annotations). So the generated SQL failed:
+
+  Database error: ERROR: relation "user_credentials" does not exist
+
+The generator's source code IS multiSchema-aware (uses `model.schema`
+and a `joinNames(schema, tableName)` helper). But its DMMF integration
+with Prisma 5.22 + our multiSchema annotations doesn't pass
+`model.schema = "vault"` through to the helper for vault models. Root
+cause: DMMF API may differ between Prisma versions for multiSchema;
+the generator was built against an older Prisma where the schema
+field landed differently.
+
+We discovered this bug ONLY after pushing the PR and watching Vercel's
+preview fail. No local check caught it because `prisma generate` runs
+silently in dev environments (it generates the migration but doesn't
+apply it until Vercel runs `prisma migrate deploy`).
+
+### How to apply
+
+1. **Before introducing multiSchema to ANY repo with existing Prisma
+   generators**, audit the generator block in schema.prisma:
+   - List every `generator X { provider = "..." }` block
+   - For each, run a local end-to-end build (`pnpm install` →
+     `prisma generate` → `prisma migrate deploy --create-only`)
+     against a test branch DB with multiSchema enabled
+   - Inspect the generated migrations / artifacts for unqualified
+     references to your new-schema tables
+
+2. **Look for `@@schema(...)` round-trip support** in the generator's
+   source code OR changelog. "Multi-schema support" must appear
+   explicitly. If it doesn't, assume the generator will NOT correctly
+   handle your new schema.
+
+3. **Consider known generator categories that often break under
+   multiSchema:** comment / description generators, ERD generators,
+   custom-client generators (e.g., prisma-client-py for non-default
+   schemas). Anything that introspects DMMF and emits SQL or DDL is
+   suspect.
+
+4. **If a generator breaks**, the resolution paths are (in order of
+   cost): (a) upgrade the generator and re-test; (b) configure an
+   exclusion / skip for your new-schema tables; (c) patch the generator
+   to correctly read `model.schema` and submit upstream PR; (d) switch
+   to a different generator; (e) disable the generator and check in
+   static artifacts.
+
+### Related
+
+Linear EQ-11 (eq-frontend schema drift) — the comments-generator
+multiSchema gap is in the same class of issues (eq-frontend repo-config
+brittleness exposed when Phase 2 work touches load-bearing Prisma
+config). Consider tracking the resolution as part of EQ-11's scope or
+as a new linked issue.
+
+
+## Pool-based vault accessors avoid nested-pool-acquire deadlock (2026-05-24)
+
+### Lesson
+
+When a function holds a connection from an `asyncpg.Pool` inside an open
+transaction, it MUST NOT call any helper that acquires a SECOND
+connection from the same pool. That nested acquire deadlocks at
+`pool.max_size=1` and under N concurrent operations on a pool of size
+N. For audit writes that must participate in the credential transaction,
+pass the held connection in (e.g., `write_audit_row_on_conn(conn=cred_conn)`)
+rather than asking the audit helper to acquire its own (`write_audit_row(pool=pool)`).
+
+### Why
+
+2026-05-24 Phase 2b Codex round 4 finding: the Phase 2b vault module's
+`store_credential` originally called `audit.write_audit_row(pool=pool, ...)`
+inside `async with cred_conn.transaction():`. The audit helper internally
+ran `async with pool.acquire() as conn`. So the call sequence held one
+pool connection (cred_conn) while attempting to acquire a second from
+the same pool. At realistic production pool sizing this deadlocks:
+
+- `max_size=1`: every write hangs forever (second acquire waits for
+  the first slot that the write itself holds).
+- pool of size N + N concurrent writes: each task holds 1 slot, each
+  waits for a second slot. Dining philosophers.
+
+Codex round 4 caught it in `store_credential`; round 5 caught that the
+fix was only applied to `store` and not `rotate`/`reactivate`.
+
+### How to apply
+
+1. **Whenever you write a function that takes an `asyncpg.Pool` and
+   opens a transaction**, audit EVERY helper called inside the
+   transaction body. If any helper internally calls `pool.acquire()`,
+   refactor: have it take a `Connection` parameter instead and pass
+   in the connection you're already holding.
+
+2. **Design the audit / observability helpers with two variants:**
+   - `*_on_conn(conn=..., ...)` for callers inside a transaction
+   - `*(pool=..., ...)` for callers outside a transaction (autocommit-
+     equivalent; no nesting risk)
+   Document the nesting trap in the pool variant's docstring so
+   future callers don't repeat the mistake.
+
+3. **Test it.** Add a contract test that asserts the function calls
+   `pool.acquire` exactly N times where N is the expected number of
+   distinct connections (typically 1 for write accessors, 2 for those
+   that do a separate identity lookup). If the count is N+1, you've
+   nested.
+
+4. **Why not always use a separate pool for audit?** That eliminates
+   the nesting risk but loses atomicity (credential + audit can no
+   longer commit as a single SQL transaction). The Pool-based API
+   structurally prevents callers from wrapping vault in their own
+   outer transaction (vault acquires its own conn from its own pool),
+   so audit + credential on the same conn is safe AND atomic.
+
+### Related
+
+[[feedback_codex_pre_merge_gate]] — this bug was caught at Codex round 4,
+fixed incompletely (only applied to store), and the propagation gap
+caught at round 5. Every round found real issues; that's the value of
+the gate.
+
+
+## Codex rounds find real bugs at progressively deeper layers (2026-05-24)
+
+### Lesson
+
+When running pre-merge Codex review on security-critical code, the
+4-round soft cap is a starting point, NOT an upper bound. If each round
+continues to find real bugs (zero false positives) at new surfaces,
+keep going. The gate-passing round (0 P1 findings) is the merge
+authorization signal — earlier rounds finding issues doesn't mean
+"we're done after fixing them"; it means "keep going until clean."
+
+### Why
+
+2026-05-24 Phase 2b session: ran 7 rounds of Codex review on the vault
+module. Every round found real bugs at NEW surfaces:
+
+- R1: atomicity within conn + AccessDenied mapping
+- R2: Pool architecture + reactivate primitive + status reset
+- R3: tenant isolation in rotate + DB-error wrapping + status filter
+- R4: nested-pool deadlock (fixed in store only)
+- R5: R4 propagation gap (rotate + reactivate also affected) + cursor reset
+- R6: BotoCoreError catch + rotate not-found audit FK fix
+- R7: client lookup inside try block (P2 only; 0 P1; gate passes)
+
+Severity stayed P1 every round through R6. None were false positives.
+Each round's fix exposed the surface the previous round had hidden.
+Round 4's fix to `store_credential` was incomplete; round 5 caught the
+propagation gap to `rotate`/`reactivate`. That kind of bug is exactly
+what the gate is for.
+
+If we had stopped at the 4-round soft cap, we'd have shipped 5 P1 bugs:
+nested-pool deadlock (in 2 of 3 write accessors), BotoCoreError leak,
+audit FK violation, and the cursor-reset silent-skip. All real
+production defects.
+
+### How to apply
+
+1. **Treat the 4-round soft cap as advisory.** If each round finds
+   real bugs at new surfaces (not repeating the same finding, not
+   false positives), keep going.
+
+2. **When extending past the cap, surface the pattern to the user.**
+   Frame it as: "We're past the cap; here's the round-by-round pattern;
+   here's why I recommend continuing." Let the user decide whether
+   to keep iterating, ship-with-documentation, or step back.
+
+3. **The gate-passing signal is unambiguous:** 0 P1 findings. P2s are
+   judgment calls (fold in if small; ticket if large). Don't merge
+   until P1 count is zero (or user explicitly authorizes shipping
+   with documented limitations).
+
+4. **Each round costs context.** By round 4-5, the diff is large
+   enough that Codex may time out on a single `codex review --base main`
+   call. Workaround: scope to delta against the prior round's commit
+   (e.g., `codex review --base <prior-round-SHA>`) to fit within the
+   5-min wrapper timeout.
+
+### Related
+
+[[feedback_codex_pre_merge_gate]] — this is the parent rule; this
+lesson updates it with the "extending past 4 rounds is justified when
+each round finds real bugs at new surfaces" amendment.
+
+
