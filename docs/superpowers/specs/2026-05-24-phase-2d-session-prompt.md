@@ -451,9 +451,17 @@ STOP CONDITIONS (HARD — SURFACE TO USER IMMEDIATELY)
   - eq-frontend main is NOT at 7905222 (or descendant)
   - Production /health returns non-200
   - Vault schema or 3 tables MISSING from production Neon
-  - AWS infrastructure missing
+  - AWS infrastructure missing (verify):
+    * aws kms describe-key --key-id 59a0e2bc-c636-45e8-bccf-427ad2426ad8
+      → expect Enabled=true, KeyState=Enabled, KeyManager=CUSTOMER
+    * aws iam get-user --user-name eq-vault-service
+      → expect Arn=arn:aws:iam::211125681610:user/eq-vault-service
   - Another agent actively working in live-transcription-fastapi within
-    the last hour
+    the last hour (run: ls -lt ~/.claude/projects/-Users-peteroneil-EQ-
+    CORE-live-transcription-fastapi/*.jsonl | head -3 — files modified
+    in last hour = hazard signal; if so, switch to a Conductor worktree
+    rather than working in the main checkout, or coordinate with the
+    other agent before any commit on shared branches)
   - User asks you to deviate from a LOCKED decision (LOCKED-23..44)
   - Phase 2d starts modifying any downstream Pydantic envelope contract
     → STOP (LOCKED-38)
