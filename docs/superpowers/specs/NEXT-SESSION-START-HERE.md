@@ -66,6 +66,11 @@ Database error: ERROR: relation "user_credentials" does not exist
 - Newer version 1.7.0 exists on npm; unknown if it fixes this.
 - Same class of issue as Linear EQ-11 (eq-frontend schema drift) — these are eq-frontend repo-config gaps surfacing as merge blockers when our Phase 2 work touches load-bearing Prisma config.
 
+### Bug evidence file (LOAD-BEARING for /investigate)
+
+Full forensic dump at `tasks/comments-generator-multischema-bug-evidence.md`:
+Vercel build logs, generator source code with exact disk path, root cause hypothesis, 5 ranked resolution paths with commands, local reproduction steps, what's NOT this bug. Without it, the next agent re-does file-spelunking. With it, they pick a path and execute.
+
 ### What this blocks
 
 - **eq-frontend#418 cannot merge** until Vercel preview passes (same build pipeline as production).

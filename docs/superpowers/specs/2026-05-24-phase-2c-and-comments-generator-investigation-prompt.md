@@ -148,21 +148,23 @@ mid-read. Use parallel tool calls to read fast.
     - "Codex rounds find real bugs at progressively deeper layers — don't
       stop early; the gate-passing round (R7) is the merge authorization"
 
-11. THE COMMENTS-GENERATOR BUG EVIDENCE:
-    Vercel build logs from preview `eq-frontend-6cuw79l2a-...vercel.app`:
-    ```
-    Comments generation completed: 20260523235715_update_comments
-    [...]
-    Applying migration `20260523235715_update_comments`
-    Error: P3018
-    Database error code: 42P01
-    Database error: ERROR: relation "user_credentials" does not exist
-    ```
-    Generator source `@onozaty/prisma-db-comments-generator@1.5.0` IS
-    multiSchema-aware in its code (uses model.schema and joinNames helper)
-    but DMMF integration with Prisma 5.22 + our multiSchema annotations
-    must not wire through correctly for the vault models.
-    Newer version 1.7.0 exists on npm; unknown if it fixes this.
+11. **THE COMMENTS-GENERATOR BUG EVIDENCE (LOAD-BEARING — read in full):**
+    `tasks/comments-generator-multischema-bug-evidence.md`
+    — Forensic dump from this session's investigation. 10 sections:
+      (1) Vercel build logs with exact error;
+      (2) Where the generator runs (schema.prisma + package.json);
+      (3) Generator source code with confirmed multiSchema-awareness
+          intent + exact disk path in node_modules;
+      (4) Schema annotations verified correct in our schema.prisma;
+      (5) Root cause hypothesis (DMMF field name mismatch);
+      (6) 5 resolution paths ranked (A: upgrade to 1.7.0; B: exclude
+          flag; C: patch generator; D: switch tools; E: disable);
+      (7) Local reproduction commands using worktree pattern;
+      (8) Related context (Linear EQ-11; other agents in eq-frontend);
+      (9) **What's NOT this bug** (saves you re-investigating ruled-out hypotheses);
+      (10) Definition of done.
+    — Without reading this file, /investigate will re-do the file-spelunking
+      I already did. With it, you start where I left off and pick a path.
 
 12. AFTER ALL READS, write a 2-paragraph confirmation:
     - Para 1: What this session executes — investigate comments-generator
