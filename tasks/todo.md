@@ -35,5 +35,39 @@ Auth: `get_auth_context_polling` (no X-Account-ID). tenant_id=UUID(ctx.tenant_id
 ## 6. Cron pinger — DECISION NEEDED (surface to user after endpoints ready)
 - [ ] Railway cron service (curlimages/curl, `*/5 * * * *`) vs external cron (cron-job.org / GitHub Actions). INTERNAL_CRON_SECRET already set. Needs Railway dashboard (MCP can't set cronSchedule).
 
-## Review (filled at end)
-- (pending)
+## Progress
+- [x] §1 vault accessors (get_credential_status, archive_credential) + exports — DONE
+- [x] §2 routers/granola.py — 5 endpoints — DONE
+- [x] §3 main.py register — DONE
+- [x] §4 tests (93 granola+vault; full unit suite green, 1 pre-existing unrelated failure) — DONE
+- [x] §5 verify_consumer_contracts.py 0 drift — DONE
+- [x] §5 Codex pre-merge review — IN PROGRESS (see trajectory below)
+- [ ] §5 PR opened (awaiting user auth)
+- [ ] §6 cron pinger — DECISION PENDING with user
+
+## Codex review trajectory (branch phase-2f/granola-admin)
+R1: 2 P2 + 1 P3 — /connect insert disambiguation, post-store load wrap, status mapping → folded
+R2: 3 P2 — activity rollup updated_at not created_at; _activity_counts 503; /disconnect wrap → folded
+R3: 2 P1 + 2 P2 — require pg_user_id (no Auth0 fallback; also enforces JWT); transient→connected; reconnect-race 409 → folded
+R4: 2 P2 — /validate JWT gate; /connect read-back-None graceful + advisory lock around the test poll (closes connect/scheduler concurrent-poll race) → folded
+R5: 1 P1 (oscillation) + 1 P2 — lock-setup graceful; /validate auth flip (freeze) → folded + frozen
+R6: 2 P2 — audit-failure→503; /validate JWT oscillation RESOLVED via bearer-token gate (JWT required, pg_user_id not) → folded
+R7: 1 P1 — reconnect-during-in-flight-cycle stale write-back → gate reactivate on advisory lock → folded
+R8: 1 P1 + 1 P2 — /rotate same race (shared _credential_poll_lock helper) → folded; bad-folder recovery (P2) → SURFACE to user
+R9: final confirmation of the R8 refactor — (running)
+
+NOTE: rounds far exceeded the 4-round soft cap because this is a genuinely
+concurrency-rich surface (credential mutations + a 5-min scheduler). R1-R8
+were real bugs (gate doing its job); the only oscillation was /validate auth
+(R4↔R5↔R6), resolved at the root in R6 (bearer-token gate). Per the
+codex-oscillation lesson, stopping the loop after R9 and surfacing remaining
+PRODUCT decisions (bad-folder recovery; cron pinger) to the user.
+
+## Open decisions for the user
+1. **Bad-folder recovery (Codex R8 P2):** /connect stores the credential before
+   the first poll proves folder_id is valid. A bad folder_id leaves a stuck
+   non-archived row (must /disconnect to retry). Options: validate folder in
+   /connect before store; allow /connect to re-configure a broken (revoked/error)
+   row; or ship + ticket. (No PATCH /folder endpoint in this phase.)
+2. **Cron pinger:** Railway cron service vs external cron. Needs Railway change
+   (user auth). INTERNAL_CRON_SECRET already set.
