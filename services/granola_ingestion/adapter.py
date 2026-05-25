@@ -257,6 +257,14 @@ async def run_one_cycle(
             )
             return CycleResult(credential_error_code=outcome_code, outcomes={})
 
+        # Edge #12 (Codex R6 [P2] #1): track mid-cycle deactivation so the
+        # end-of-cycle reprocess + success bookkeeping is SKIPPED on abort. The
+        # success UPDATE only guards ``archived_at IS NULL``, so for a
+        # revoked/error row (archived_at still NULL) it would otherwise clear
+        # last_error / reset consecutive_failures / advance last_polled_at on a
+        # credential we just detected as deactivated.
+        cycle_aborted = False
+
         for note_summary in note_summaries:
             # Edge #12: re-check the credential is still active before each
             # note. A /disconnect (or a revoke/error transition) that lands
@@ -274,6 +282,7 @@ async def run_one_cycle(
                     "aborting remaining notes (%d processed this cycle)",
                     credential.id, notes_processed,
                 )
+                cycle_aborted = True
                 break
             try:
                 outcome = await process_note(
@@ -284,35 +293,45 @@ async def run_one_cycle(
                     internal_domains=internal_domains,
                 )
             except _CredentialDeactivated:
-                # /disconnect landed during this note's fetch/classify; the
-                # final pre-publish gate aborted before any downstream emit.
-                # Stop the cycle (the SQL guards make the end-of-cycle
-                # write-back a no-op on the now-archived row).
+                # /disconnect (or revoke/error) landed during this note's
+                # fetch/classify; a gate aborted before any state mutation.
+                # Stop the cycle AND skip the end-of-cycle success bookkeeping
+                # (Codex R6 #1) so we don't clear a revoked/error row's
+                # last_error or advance its last_polled_at.
                 logger.info(
                     "granola_adapter: credential %s deactivated mid-note; "
                     "aborting cycle (%d processed this cycle)",
                     credential.id, notes_processed,
                 )
+                cycle_aborted = True
                 break
             outcomes[outcome.value] = outcomes.get(outcome.value, 0) + 1
             notes_processed += 1
 
-        # Reprocess BOTH deferred and failed rows from prior cycles
-        # (Codex PR-X2 R1 P1 finding). A note-level transient failure
-        # (5xx on detail fetch, lane2_backpressure, etc) used to be
-        # stranded forever once last_polled_at advanced past it; this
-        # cycle-end pass gives those rows a retry against the SAME
-        # external_id without needing them to reappear in list_notes.
-        deferred_reprocessed = await reprocess_pending_notes(
-            credential=credential,
-            client=client,
-            pool=pool,
-            internal_domains=internal_domains,
-        )
+        # Skip the end-of-cycle reprocess + success bookkeeping when the cycle
+        # aborted on a mid-cycle deactivation (Codex R6 [P2] #1): a deactivated
+        # credential must not have its last_error cleared or last_polled_at
+        # advanced, and we must not re-publish prior deferred/failed rows for
+        # it. (An archived row would no-op the success UPDATE via the
+        # archived_at guard anyway; a revoked/error row would NOT — hence this
+        # explicit skip.)
+        if not cycle_aborted:
+            # Reprocess BOTH deferred and failed rows from prior cycles
+            # (Codex PR-X2 R1 P1 finding). A note-level transient failure
+            # (5xx on detail fetch, lane2_backpressure, etc) used to be
+            # stranded forever once last_polled_at advanced past it; this
+            # cycle-end pass gives those rows a retry against the SAME
+            # external_id without needing them to reappear in list_notes.
+            deferred_reprocessed = await reprocess_pending_notes(
+                credential=credential,
+                client=client,
+                pool=pool,
+                internal_domains=internal_domains,
+            )
 
-        await _mark_credential_polled_success(
-            credential=credential, pool=pool, last_polled_at=cycle_start_at
-        )
+            await _mark_credential_polled_success(
+                credential=credential, pool=pool, last_polled_at=cycle_start_at
+            )
     finally:
         if owned_client:
             await client.aclose()
@@ -1552,6 +1571,23 @@ async def _credential_is_active(
     instead of ingesting the remaining notes (plan §2.1 #12 — the
     disconnect-during-sync gap from Phase 2f Codex R9). Tenant + user
     scoped (LOCKED tenant isolation); never decrypts the key.
+
+    **Why a current-state check (not a credential-generation token) is
+    sufficient (Codex R6 [P2] #2).** A disconnect→quick-reconnect could in
+    principle reactivate the SAME credential id (``reactivate_credential``
+    preserves the row id, sets ``status='active'``/``archived_at=NULL``),
+    which would make this predicate return True for a stale in-flight cycle
+    still holding the old key/folder. That race is structurally prevented:
+    BOTH callers of :func:`run_one_cycle` hold the per-credential
+    ``pg_try_advisory_lock`` for the whole cycle
+    (:func:`services.granola_ingestion.scheduler.run_cycle_step` and
+    ``routers.granola._save_and_test_locked``), and
+    ``reactivate_credential`` is itself gated on that same lock
+    (``routers.granola._credential_poll_lock``) — so a reconnect cannot
+    interleave with a running cycle (it 409s until the cycle releases the
+    lock). A generation token would only matter for a hypothetical future
+    lock-free caller; that's tracked as a defense-in-depth follow-up, not a
+    reachable bug today.
     """
     async with pool.acquire() as conn:
         return bool(

@@ -1795,6 +1795,61 @@ async def test_reprocess_failed_row_writes_nothing_when_disconnected_mid_fetch()
 
 
 @pytest.mark.asyncio
+async def test_run_one_cycle_skips_success_bookkeeping_on_mid_cycle_deactivation():
+    """Edge #12 (Codex R6 [P2] #1): when a cycle aborts on mid-cycle
+    deactivation, it must NOT run the end-of-cycle success UPDATE — that UPDATE
+    only guards archived_at IS NULL, so on a revoked/error-mid-cycle row
+    (archived_at still NULL) it would wrongly clear last_error, reset
+    consecutive_failures, and advance last_polled_at."""
+    credential = _build_credential()
+    note1 = _make_note_summary("not_rev_1")
+    note2 = _make_note_summary("not_rev_2")
+    detail1 = _make_note_detail(note_id="not_rev_1", attendees=[Attendee(email="bob@bigco.com")])
+    detail2 = _make_note_detail(note_id="not_rev_2", attendees=[Attendee(email="carol@bigco.com")])
+
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    state = {"active": True}
+
+    async def _publish_then_deactivate(**_kwargs):
+        state["active"] = False  # credential goes revoked/error after note1
+        return text_clean_service.ProcessResult(
+            interaction_id="00000000-0000-4000-8000-00000000ae01",
+            lane1_published=True, lane2_dispatched=True)
+
+    process_mock = AsyncMock(side_effect=_publish_then_deactivate)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[note1, note2])
+    client.get_note_detail = AsyncMock(side_effect=[detail1, detail2])
+    client.aclose = AsyncMock()
+
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "_credential_is_active", new=_liveness_gate(state)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "process", new=process_mock):
+        await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    # The end-of-cycle success UPDATE (clears last_error/consecutive_failures,
+    # advances last_polled_at) must NOT have run after the deactivation abort.
+    success_marks = [
+        c for c in conn.execute_calls
+        if "last_polled_at = $4" in c[0] and "consecutive_failures = 0" in c[0]
+    ]
+    assert success_marks == []
+
+
+@pytest.mark.asyncio
 async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
     """Regression guard for edge #12: credential active the whole cycle → every
     note is processed + published (no behavior change from the guards)."""
