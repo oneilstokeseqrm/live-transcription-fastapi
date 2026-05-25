@@ -610,6 +610,33 @@ def test_status_revoked_is_connected_but_flagged(client):
     assert body["status"] == "revoked"
 
 
+def test_status_activity_db_failure_maps_to_503(client):
+    """A transient failure in the 7-day activity rollup → 503, not 500
+    (Codex R2 P2)."""
+    import asyncpg as _asyncpg
+
+    class _RaisingConn:
+        async def fetch(self, *_a):
+            raise _asyncpg.PostgresError("db down")
+
+    pool = _FakePool(_RaisingConn())
+    get_status = AsyncMock(return_value=_cred_status(status="active"))
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, patch.object(granola, "get_credential_status", get_status):
+        resp = client.get(f"{_BASE}/status")
+
+    assert resp.status_code == 503
+
+
+def test_activity_sql_filters_updated_at_not_created_at():
+    """external_integration_runs is UPSERTed in place, so the 7-day window
+    must key off updated_at (last status change), not created_at (Codex R2 P2)."""
+    sql = granola._ACTIVITY_COUNTS_7D_SQL
+    assert "updated_at >= NOW()" in sql
+    assert "created_at >=" not in sql
+
+
 # ---------------------------------------------------------------------------
 # /disconnect
 # ---------------------------------------------------------------------------
@@ -661,6 +688,23 @@ def test_disconnect_idempotent_when_already_archived(client):
 
     assert resp.status_code == 200
     archive.assert_not_awaited()
+
+
+def test_disconnect_archive_failure_maps_to_http(client):
+    """A transient vault failure on the soft-delete → clean retryable HTTP,
+    not a generic 500 (Codex R2 P2)."""
+    get_status = AsyncMock(return_value=_cred_status(status="active"))
+    archive = AsyncMock(
+        side_effect=VaultError(VaultErrorCode.VAULT_DB_QUERY_FAILED, "db down")
+    )
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "archive_credential", archive):
+        resp = client.delete(_BASE)
+
+    assert resp.status_code == 503
 
 
 def test_disconnect_requires_auth_401(client, monkeypatch):

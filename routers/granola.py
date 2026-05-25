@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
+import asyncpg
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
@@ -186,13 +187,18 @@ async def _load_status_or_http(*, tenant_id: UUID, user_id: UUID, pool, trace_id
         raise _http_from_vault_error(exc)
 
 
+# Filter on updated_at, NOT created_at (Codex R2 P2): external_integration_runs
+# is UPSERTed in place on the composite UNIQUE, so created_at is pinned to
+# first-seen while retries + status transitions only bump updated_at. A note
+# deferred 10 days ago and ingested yesterday must count as recent ingestion —
+# created_at would exclude it from the 7-day window.
 _ACTIVITY_COUNTS_7D_SQL = """
 SELECT status, COUNT(*)::int AS n
 FROM public.external_integration_runs
 WHERE tenant_id = $1
   AND user_id = $2
   AND provider = $3
-  AND created_at >= NOW() - INTERVAL '7 days'
+  AND updated_at >= NOW() - INTERVAL '7 days'
 GROUP BY status
 """
 
@@ -203,9 +209,19 @@ async def _activity_counts_7d(*, pool, tenant_id: UUID, user_id: UUID) -> dict:
     Reads the public dedup-ledger directly via the asyncpg pool (same
     pattern the adapter uses for these non-encrypted rows). The status
     values are the IngestionOutcome enum strings written by the adapter.
+
+    A transient DB failure here surfaces as a retryable 503 rather than a
+    generic 500 (Codex R2 P2) — consistent with the rest of the router's
+    storage-error posture.
     """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(_ACTIVITY_COUNTS_7D_SQL, tenant_id, user_id, _PROVIDER)
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(_ACTIVITY_COUNTS_7D_SQL, tenant_id, user_id, _PROVIDER)
+    except (asyncpg.PostgresError, OSError) as exc:
+        logger.warning("granola /status: 7-day activity rollup failed: %r", exc)
+        raise HTTPException(
+            status_code=503, detail="Temporary storage error; please retry."
+        )
     by_status = {r["status"]: r["n"] for r in rows}
     return {
         "ingested_7d": by_status.get("success", 0),
@@ -555,12 +571,17 @@ async def disconnect_granola(request: Request) -> dict:
         # Nothing connected, or already disconnected — idempotent success.
         return {"ok": True, "status": "disconnected"}
 
-    await archive_credential(
-        tenant_id=tenant_id,
-        user_id=user_id,
-        credential_id=status_row.id,
-        caller_module=_CALLER_MODULE,
-        pool=pool,
-        trace_id=ctx.trace_id,
-    )
+    try:
+        await archive_credential(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            credential_id=status_row.id,
+            caller_module=_CALLER_MODULE,
+            pool=pool,
+            trace_id=ctx.trace_id,
+        )
+    except VaultError as exc:
+        # A transient vault/DB failure on the soft-delete → clean retryable
+        # HTTP, not a generic 500 (Codex R2 P2).
+        raise _http_from_vault_error(exc)
     return {"ok": True, "status": "disconnected"}
