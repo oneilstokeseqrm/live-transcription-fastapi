@@ -1,78 +1,71 @@
-# Phase 2f — Granola admin endpoints + cron pinger
+# Session: Phase 2f follow-ups — edge #12 → wire trigger → first /connect E2E → edge #13
 
-Branch: `phase-2f/granola-admin` off `main` (63af319).
-Plan spec: `tasks/granola-integration-plan.md` §Phase 2f (lines 689-731). LOCKED-30/31/34.
+Start state: `main` @ `1831235` (Phase 2f #29 `260b863` shipped + prod-verified). /health 200.
+Plan spec: `tasks/granola-integration-plan.md` §2.1 #12 (line 955) + #13 (line 956); §Phase 4c E2E (836-877).
+Locked decisions this session (with user, 2026-05-25):
+- Execution order: **#12 first** (it makes the disconnect-during-sync race live once the trigger runs), then trigger, then E2E, then #13.
+- Trigger platform: **AWS EventBridge Scheduler** (free at our volume — 8.7k/mo vs 14M free tier; I build it all via AWS MCP w/ user authorization). Co-exists with existing EventBridge event fabric (16 rules) but is a net-new *scheduler* (0 schedules today).
+- Infra documentation: commit `docs/infrastructure/granola-eventbridge-scheduler.md` (live ARNs + exact create/teardown/modify commands) — the bridge to future IaC. No IaC framework adopted now (repo has none).
 
-## 1. Vault module — 2 new accessors (services/vault/user_credentials.py)
-Both stay behind the ALLOWLIST gate; `"archive"` is already a valid AuditOperation.
-- [ ] `get_credential_status(*, tenant_id, user_id, caller_module, pool, trace_id=None) -> CredentialStatus | None`
-      — non-decrypting SELECT of lifecycle columns for ANY status (active/revoked/error/archived). Serves /rotate, /status, /disconnect. Audit op="read".
-- [ ] `archive_credential(*, tenant_id, user_id, credential_id, caller_module, pool, trace_id=None) -> bool`
-      — soft-delete: status='archived', archived_at=NOW, WHERE id+tenant+user AND archived_at IS NULL. Idempotent. Audit op="archive".
-- [ ] Export both + CredentialStatus from services/vault/__init__.py.
+---
 
-## 2. routers/granola.py (NEW) — 5 JWT-authed endpoints, prefix `/integrations/granola`
-Auth: `get_auth_context_polling` (no X-Account-ID). tenant_id=UUID(ctx.tenant_id); user_id via `_resolve_user_uuid(ctx)` (pg_user_id; 400 if not UUID-shaped). caller_module="routers.granola".
-- [ ] `POST /validate` {api_key} → GranolaAPIClient.list_folders() validates auth + returns folders. Map GranolaError→{ok:false, reason}. Does NOT store. HTTP 200 with ok flag.
-- [ ] `POST /connect` {api_key, folder_id, folder_name?} → store_credential; on UNIQUE-violation fall to reactivate_credential; if active→409. Then load via get_granola_credential_for_user (decrypt round-trip) + run_one_cycle once (LOCKED-31 save&test). Return {ok, status, first_poll}.
-- [ ] `POST /rotate` {new_api_key} → get_credential_status for id; 404 if none/archived; rotate_credential_key.
-- [ ] `GET /status` → get_credential_status + 7d activity counts from external_integration_runs. No decryption.
-- [ ] `DELETE /` → archive_credential (soft-delete); idempotent.
+## 1. EDGE #12 — adapter `archived_at`-awareness  [IN PROGRESS]
+Branch: `phase-2.1/granola-adapter-archived-at-guard` off `main`.
+Root fix (plan §2.1 #12): a credential archived/disconnected mid-cycle must abort the in-flight cycle cleanly instead of ingesting a few more notes.
+- [ ] Guard the 3 credential-state UPDATE SQLs on `AND archived_at IS NULL`:
+      `_UPDATE_CREDENTIAL_POLL_SUCCESS_SQL` (adapter.py:1286), `_UPDATE_CREDENTIAL_STATUS_SQL` (:1298),
+      `_INCREMENT_CREDENTIAL_FAILURES_SQL` (:1308). (Tenant+user already in WHERE.)
+- [ ] Re-check the credential is still active before each publish in `process_note` / `_ingest_scenario_a`
+      (re-read status/archived_at just before `text_clean_service.process`; abort the note if archived mid-cycle).
+- [ ] Decide + handle the "UPDATE matched 0 rows because archived" signal (e.g. `_record_credential_transient_failure`
+      already returns threshold when row gone — extend the success/status helpers similarly; don't crash the cycle).
+- [ ] TDD: AsyncMock tests (mirror tests/unit/granola_ingestion/test_adapter.py `_FakeConn`/`_FakePool`):
+      archived-mid-cycle → no publish + clean abort; 3 UPDATE SQLs contain `archived_at IS NULL`; active path unchanged.
+- [ ] Run suite with `DBOS_SYSTEM_DATABASE_URL=x pytest` — 0 new regressions (baseline: 1 unit + 16 integration pre-existing).
+- [ ] `verify_consumer_contracts.py --source generic --interaction-type meeting` → 0 drift (envelope untouched; sanity).
+- [ ] Codex pre-merge gate (4-round soft cap; SPLIT/FREEZE per the two oscillation lessons).
+- [ ] Open PR. DO NOT merge / push-to-main without per-action user auth.
+NOTE: closing #12 means the per-endpoint `_credential_poll_lock` gates become belt-and-suspenders (can stay; removing is optional, out of scope this PR unless trivial).
 
-## 3. main.py
-- [ ] `app.include_router(granola.router)` (router carries its own prefix).
+## 2. WIRE THE 5-MIN TRIGGER — EventBridge Scheduler  [after #12 merges]
+- [ ] Provision via AWS MCP (user authorizes each AWS change): Connection (secret header) + API destination
+      (POST public /internal/granola/cron-tick) + IAM invoke role + `rate(5 minutes)` schedule + DLQ.
+- [ ] Put INTERNAL_CRON_SECRET value into the EventBridge Connection (it must match Railway's env value).
+- [ ] Verify: one real tick → cron-tick returns 202; with 0 credentials enqueued=0; logs show the dispatch.
+- [ ] Commit `docs/infrastructure/granola-eventbridge-scheduler.md` (ARNs + create/teardown/modify commands).
 
-## 4. Tests (AsyncMock + FastAPI TestClient, NO Docker — mirror test_granola_cron.py)
-- [ ] tests/unit/test_granola_admin.py — validate (happy/auth_failed/outage/401), connect (happy/reconnect-reactivate/already-active-409/bad-key-first-poll-error), rotate (happy/404), status (connected/not-connected shape), disconnect (soft-delete/idempotent), auth-401 on each.
-- [ ] tests/unit/vault/test_user_credentials.py — get_credential_status (active/archived/none/allowlist-reject), archive_credential (happy/idempotent/cross-tenant-noop/allowlist-reject).
+## 3. FIRST REAL /connect E2E  [after trigger live]
+- [ ] Pre-flight collision check (feedback_shared_infrastructure_collision): `ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl | head`.
+- [ ] User provides real Granola API key + test folder. /validate → /connect → wait one tick → verify ingest:
+      vault.user_credentials row, external_integration_runs status='success', raw_interactions meeting row, no DLQ.
+- [ ] LOCKED-11 atomic cleanup of test artifacts afterward.
 
-## 5. Pre-merge gates
-- [ ] `DBOS_SYSTEM_DATABASE_URL=... pytest` granola + vault suites pass; 0 regressions (baseline: 1 unit + 16 integration pre-existing failures unrelated).
-- [ ] `verify_consumer_contracts.py --source generic --interaction-type meeting` → 0 drift (envelopes untouched; sanity).
-- [ ] Codex pre-merge review — 4-round soft cap; STOP on oscillation (lessons.md).
-- [ ] Open PR. DO NOT merge / push-to-main / change Railway without per-action user auth.
+## 4. EDGE #13 — /connect bad-folder recovery  [lower priority]
+- [ ] Plan §2.1 #13 options: validate folder_id in /connect before store; OR let /connect re-configure a broken
+      non-archived row instead of 409; OR PATCH /folder. Decide approach, implement smallest, Codex gate.
 
-## 6. Cron pinger — DECISION NEEDED (surface to user after endpoints ready)
-- [ ] Railway cron service (curlimages/curl, `*/5 * * * *`) vs external cron (cron-job.org / GitHub Actions). INTERNAL_CRON_SECRET already set. Needs Railway dashboard (MCP can't set cronSchedule).
+## Out of scope this session
+- Phase 2g (transactional email on credential breakage) — its own session.
+- Removing the per-endpoint advisory-lock gates (optional cleanup; leave unless trivial).
+
+## Disciplines (non-negotiable)
+- `git branch --show-current` immediately before every commit (shared checkout).
+- Per-action user auth for push-to-main / merge / Railway / AWS / GitHub-secret changes.
+- Tenant isolation: every query carries tenant_id. NEVER modify downstream envelope contracts (LOCKED-38).
+- Tests: AsyncMock, no Docker. Run with DBOS_SYSTEM_DATABASE_URL set.
+- ALLOW_LEGACY_HEADER_AUTH=true in prod (load-bearing context for any auth reasoning).
 
 ## Progress
-- [x] §1 vault accessors (get_credential_status, archive_credential) + exports — DONE
-- [x] §2 routers/granola.py — 5 endpoints — DONE
-- [x] §3 main.py register — DONE
-- [x] §4 tests (93 granola+vault; full unit suite green, 1 pre-existing unrelated failure) — DONE
-- [x] §5 verify_consumer_contracts.py 0 drift — DONE
-- [x] §5 Codex pre-merge review — 9 rounds, all folded (see trajectory below)
-- [x] §5 PR #29 opened + MERGED (squash) as `260b863`
-- [x] §6 deploy verified — Railway `eb2d4c81` SUCCESS; prod endpoints live + auth-gated
-- [ ] §6 cron pinger — DEFERRED by user to a focused next session (see NEXT-SESSION-START-HERE.md)
-
-## PHASE 2f COMPLETE (2026-05-25)
-Admin endpoints shipped + deployed + prod-verified. Cron pinger held for next session.
-2 edges ticketed (plan §2.1 #12/#13). Next: wire trigger + first real /connect E2E + Phase 2g.
-
-## Codex review trajectory (branch phase-2f/granola-admin)
-R1: 2 P2 + 1 P3 — /connect insert disambiguation, post-store load wrap, status mapping → folded
-R2: 3 P2 — activity rollup updated_at not created_at; _activity_counts 503; /disconnect wrap → folded
-R3: 2 P1 + 2 P2 — require pg_user_id (no Auth0 fallback; also enforces JWT); transient→connected; reconnect-race 409 → folded
-R4: 2 P2 — /validate JWT gate; /connect read-back-None graceful + advisory lock around the test poll (closes connect/scheduler concurrent-poll race) → folded
-R5: 1 P1 (oscillation) + 1 P2 — lock-setup graceful; /validate auth flip (freeze) → folded + frozen
-R6: 2 P2 — audit-failure→503; /validate JWT oscillation RESOLVED via bearer-token gate (JWT required, pg_user_id not) → folded
-R7: 1 P1 — reconnect-during-in-flight-cycle stale write-back → gate reactivate on advisory lock → folded
-R8: 1 P1 + 1 P2 — /rotate same race (shared _credential_poll_lock helper) → folded; bad-folder recovery (P2) → SURFACE to user
-R9: final confirmation of the R8 refactor — (running)
-
-NOTE: rounds far exceeded the 4-round soft cap because this is a genuinely
-concurrency-rich surface (credential mutations + a 5-min scheduler). R1-R8
-were real bugs (gate doing its job); the only oscillation was /validate auth
-(R4↔R5↔R6), resolved at the root in R6 (bearer-token gate). Per the
-codex-oscillation lesson, stopping the loop after R9 and surfacing remaining
-PRODUCT decisions (bad-folder recovery; cron pinger) to the user.
-
-## Open decisions for the user
-1. **Bad-folder recovery (Codex R8 P2):** /connect stores the credential before
-   the first poll proves folder_id is valid. A bad folder_id leaves a stuck
-   non-archived row (must /disconnect to retry). Options: validate folder in
-   /connect before store; allow /connect to re-configure a broken (revoked/error)
-   row; or ship + ticket. (No PATCH /folder endpoint in this phase.)
-2. **Cron pinger:** Railway cron service vs external cron. Needs Railway change
-   (user auth). INTERNAL_CRON_SECRET already set.
+- [x] §1 EDGE #12 coded + TDD (RED→GREEN): 3 SQL guards (`archived_at IS NULL`) + `_credential_is_active`
+      recheck in run_one_cycle main loop + reprocess pass. 5 new tests. Full unit suite 496 pass /
+      1 pre-existing failure / 0 regressions. 0 envelope contract drift (script exit-1 is pre-existing
+      stale-rule-registry noise, proven via stash test — unrelated to this change).
+- [x] §1 Codex pre-merge gate — 8 rounds. R1-R7 folded (each a real narrowing bug; gate passed/no-P1 from R2 on);
+      R6#2 declined (reconnect-generation race is lock-prevented — both run_one_cycle callers hold the advisory
+      lock, reactivate is gated on it); R8 residual (sub-ms window inside _defer_pending_account) ship+ticketed by
+      user. 11 new tests; 504 unit pass / 1 pre-existing failure / 0 regressions; 0 envelope contract drift.
+      Final gate state: PASS. Deferred items ticketed as plan §2.1 #14 (defer-path atomicity) + #15 (generation token).
+- [~] §1 push branch + open PR (user-authorized 2026-05-25; in progress — NOT merge, that's separate per-action auth)
+- [ ] §2 wire EventBridge Scheduler trigger + infra manifest (docs/infrastructure/granola-eventbridge-scheduler.md)
+- [ ] §3 first real /connect E2E
+- [ ] §4 edge #13
