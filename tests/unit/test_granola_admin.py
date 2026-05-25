@@ -73,9 +73,10 @@ class _FakeConn:
     the /connect advisory-lock acquire (True = lock free → poll proceeds);
     `execute` swallows the unlock."""
 
-    def __init__(self, fetch_returns=None, fetchval_returns=True):
+    def __init__(self, fetch_returns=None, fetchval_returns=True, fetchval_raises=None):
         self.fetch_returns = fetch_returns or []
         self.fetchval_returns = fetchval_returns
+        self.fetchval_raises = fetchval_raises
         self.fetch_calls = []
         self.fetchval_calls = []
         self.execute_calls = []
@@ -86,6 +87,8 @@ class _FakeConn:
 
     async def fetchval(self, sql, *args):
         self.fetchval_calls.append((sql, args))
+        if self.fetchval_raises is not None:
+            raise self.fetchval_raises
         return self.fetchval_returns
 
     async def execute(self, sql, *args):
@@ -237,6 +240,26 @@ def test_validate_requires_auth_401(client, monkeypatch):
     # Do NOT patch get_auth_context_polling — exercise the real gate.
     resp = client.post(f"{_BASE}/validate", json={"api_key": "grn_test"})
     assert resp.status_code == 401
+
+
+def test_validate_accepts_jwt_without_pg_user_id(client):
+    """/validate is stateless and must accept a valid JWT that omits the
+    optional pg_user_id claim — it must NOT require pg_user_id the way the
+    mutation routes do (Codex R5 P1)."""
+    folders = [types.SimpleNamespace(id="fol_eq", name="EQ")]
+    fake_client = MagicMock()
+    fake_client.list_folders = AsyncMock(return_value=folders)
+    fake_client.aclose = AsyncMock()
+
+    # JWT present but pg_user_id absent (a valid prod case).
+    ctx_no_pg = _ctx(pg_user=None, user_id="auth0|abc")
+    auth = patch.object(granola, "get_auth_context_polling", MagicMock(return_value=ctx_no_pg))
+    pool = patch.object(granola, "get_asyncpg_pool", AsyncMock(return_value=_FakePool()))
+    with auth, pool, patch.object(granola, "GranolaAPIClient", MagicMock(return_value=fake_client)):
+        resp = client.post(f"{_BASE}/validate", json={"api_key": "grn_test"})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +531,37 @@ def test_connect_readback_non_active_reports_real_state(client):
     assert body["status"] == "revoked"
     assert body["ok"] is False
     assert body["error_code"] == "granola_auth_failed"
+    run.assert_not_awaited()
+
+
+def test_connect_lock_setup_failure_is_graceful(client):
+    """A transient asyncpg failure acquiring the advisory lock AFTER the
+    credential committed must report 'connected, first poll failed', not 500
+    (which a retry would turn into a spurious 409) — Codex R5 P2."""
+    import asyncpg as _asyncpg
+
+    store = AsyncMock(return_value=uuid4())
+    load = AsyncMock()
+    run = AsyncMock()
+    # pg_try_advisory_lock raises a transient error.
+    pool = _FakePool(_FakeConn(fetchval_raises=_asyncpg.PostgresError("pool blip")))
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "run_one_cycle", run):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_test", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["status"] == "connected"
+    assert body["error_code"] == "first_poll_failed"
+    load.assert_not_awaited()
     run.assert_not_awaited()
 
 

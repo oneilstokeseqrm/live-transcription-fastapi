@@ -265,6 +265,38 @@ def _first_poll_zero() -> dict:
 async def _run_save_and_test(
     *, credential_id: UUID, tenant_id: UUID, user_id: UUID, pool, trace_id
 ) -> dict:
+    """LOCKED-31 "save & test" first poll. Thin wrapper that converts a
+    transient advisory-lock SETUP failure (``pool.acquire`` /
+    ``pg_try_advisory_lock`` raising) into the graceful "connected, first poll
+    failed" response: the credential is already committed + active, so a
+    lock-setup blip must not 500 a retry into a spurious 409 (Codex R5 P2).
+    The locked body is :func:`_save_and_test_locked`.
+    """
+    try:
+        return await _save_and_test_locked(
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            pool=pool,
+            trace_id=trace_id,
+        )
+    except (asyncpg.PostgresError, OSError):
+        logger.exception(
+            "granola /connect: advisory-lock setup failed (credential saved + "
+            "active; scheduler retries). credential=%s",
+            credential_id,
+        )
+        return {
+            "ok": False,
+            "status": "connected",
+            "first_poll": {**_first_poll_zero(), "errors": 1},
+            "error_code": "first_poll_failed",
+        }
+
+
+async def _save_and_test_locked(
+    *, credential_id: UUID, tenant_id: UUID, user_id: UUID, pool, trace_id
+) -> dict:
     """LOCKED-31 "save & test" first poll, serialized against the scheduler.
 
     Holds the SAME per-credential advisory lock the scheduler's
@@ -433,14 +465,21 @@ async def validate_granola_key(body: ValidateRequest, request: Request) -> dict:
     the wizard can render inline messaging without treating a bad key as a
     transport error.
     """
-    # Validate doesn't store anything, but it DOES proxy a call to Granola
-    # with a caller-supplied key, so it must be held to the same JWT contract
-    # as the mutation routes. _resolve_identity requires the JWT's pg_user_id
-    # (and 400s a legacy-header request that lacks it), so /validate can't be
-    # reached without a verified JWT even when ALLOW_LEGACY_HEADER_AUTH=true
-    # (Codex R4 P2). The resolved identity is unused — validate is stateless.
-    ctx = get_auth_context_polling(request)
-    _resolve_identity(ctx)
+    # Auth gate: get_auth_context_polling requires a verified JWT in
+    # production (ALLOW_LEGACY_HEADER_AUTH is off), which is the right bar for
+    # this stateless route. We deliberately do NOT call _resolve_identity:
+    # /validate never touches vault.user_credentials, and pg_user_id is an
+    # OPTIONAL JWT claim (middleware/jwt_auth.py) — requiring it would reject
+    # valid production JWTs that omit it.
+    #
+    # (Codex review trajectory: R4 flagged that /validate could be reached via
+    # legacy headers and added a _resolve_identity gate; R5 flagged that
+    # gate rejects valid pg_user_id-less JWTs in prod. Frozen here on plain
+    # JWT auth — prod requires a JWT, and a stateless key-check doesn't need
+    # the DB-only pg_user_id claim. The MUTATION routes below DO require
+    # pg_user_id via _resolve_identity, which is where JWT-only enforcement
+    # actually protects credential writes.)
+    get_auth_context_polling(request)
 
     client = GranolaAPIClient(api_key=body.api_key)
     try:
