@@ -108,6 +108,33 @@ class GranolaCredential:
     archived_at: datetime | None
 
 
+@dataclass(frozen=True)
+class CredentialStatus:
+    """Non-decrypting lifecycle snapshot of a credential row.
+
+    Returned by :func:`get_credential_status` for the Phase 2f admin
+    endpoints (/status, /rotate, /disconnect). Unlike
+    :class:`GranolaCredential`, it carries NO ``api_key`` — the key
+    material is never decrypted for a status read, so there is nothing
+    secret to leak. It also surfaces credentials in ANY ``status``
+    (active / revoked / error / archived), whereas
+    :func:`get_granola_credential_for_user` only returns active rows.
+    """
+
+    id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    provider: str
+    config: dict[str, Any]
+    status: str
+    last_polled_at: datetime | None
+    last_error: dict[str, Any] | None
+    consecutive_failures: int
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None
+
+
 _SELECT_GRANOLA_CREDENTIAL_SQL = """
 SELECT
     id,
@@ -205,6 +232,50 @@ SET encrypted_api_key = $1,
 WHERE id = $5
   AND archived_at IS NOT NULL
 RETURNING tenant_id
+"""
+
+# Non-decrypting lifecycle read for the Phase 2f admin endpoints. Returns
+# the row in ANY status (active / revoked / error / archived) so /status
+# can surface a broken or disconnected credential and /rotate + /disconnect
+# can find the credential_id. Tenant + user scoped (LOCKED tenant isolation).
+# Encrypted columns are deliberately NOT selected — a status read never
+# needs the key material.
+_SELECT_CREDENTIAL_STATUS_SQL = """
+SELECT
+    id,
+    tenant_id,
+    user_id,
+    provider,
+    config,
+    status,
+    last_polled_at,
+    last_error,
+    consecutive_failures,
+    created_at,
+    updated_at,
+    archived_at
+FROM vault.user_credentials
+WHERE tenant_id = $1
+  AND user_id = $2
+  AND provider = $3
+"""
+
+# Soft-delete (LOCKED-34): preserve the row + its audit trail, just mark it
+# archived so the scheduler's list_active_credentials (status='active' AND
+# archived_at IS NULL) stops dispatching it. Idempotent via
+# ``archived_at IS NULL`` — a replay on an already-archived row returns 0
+# rows. Tenant + user scoped so a wrong-tenant credential_id can't be
+# archived.
+_ARCHIVE_CREDENTIAL_SQL = """
+UPDATE vault.user_credentials
+SET status = 'archived',
+    archived_at = CURRENT_TIMESTAMP,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1
+  AND tenant_id = $2
+  AND user_id = $3
+  AND archived_at IS NULL
+RETURNING id
 """
 
 
@@ -1025,6 +1096,211 @@ async def reactivate_credential(
         raise wrapped from exc
 
     return credential_id
+
+
+async def get_credential_status(
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    caller_module: str,
+    pool: asyncpg.Pool,
+    trace_id: str | None = None,
+) -> CredentialStatus | None:
+    """Read a credential's lifecycle state WITHOUT decrypting the key.
+
+    The Phase 2f admin read accessor. Returns the row regardless of
+    ``status`` (active / revoked / error / archived) so /status can
+    render a broken or disconnected connection, and /rotate + /disconnect
+    can find the ``credential_id``. Returns ``None`` when no row exists
+    for ``(tenant_id, user_id, provider='granola')``.
+
+    Unlike :func:`get_granola_credential_for_user`, this performs NO KMS
+    Decrypt — the ``api_key`` is never materialized, so there is no secret
+    to leak on a status read. The ALLOWLIST gate + a per-call read-audit
+    still apply, keeping every ``vault.user_credentials`` access uniformly
+    gated and logged.
+
+    Raises :class:`VaultPermissionError` if ``caller_module`` is not in
+    :data:`ALLOWLIST`; raises :class:`VaultError` on DB failure.
+    """
+    try:
+        _check_allowlist(caller_module)
+    except VaultPermissionError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="read",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                _SELECT_CREDENTIAL_STATUS_SQL,
+                tenant_id,
+                user_id,
+                _GRANOLA_PROVIDER,
+            )
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="status SELECT")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="read",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
+        )
+        raise wrapped from exc
+
+    if row is None:
+        await audit.write_audit_row(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="read",
+            success=True,
+            trace_id=trace_id,
+        )
+        return None
+
+    await audit.write_audit_row(
+        pool=pool,
+        credential_id=row["id"],
+        tenant_id=tenant_id,
+        user_id=user_id,
+        provider=_GRANOLA_PROVIDER,
+        caller_module=caller_module,
+        operation="read",
+        success=True,
+        trace_id=trace_id,
+    )
+
+    return CredentialStatus(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        user_id=row["user_id"],
+        provider=row["provider"],
+        config=_coerce_jsonb(row["config"]) or {},
+        status=row["status"],
+        last_polled_at=row["last_polled_at"],
+        last_error=_coerce_jsonb(row["last_error"]),
+        consecutive_failures=row["consecutive_failures"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        archived_at=row["archived_at"],
+    )
+
+
+async def archive_credential(
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    credential_id: UUID,
+    caller_module: str,
+    pool: asyncpg.Pool,
+    trace_id: str | None = None,
+) -> bool:
+    """Soft-delete a credential (LOCKED-34): ``status='archived'`` + ``archived_at=NOW``.
+
+    The Phase 2f /disconnect write accessor. Tenant + user scoped so a
+    wrong-tenant ``credential_id`` cannot archive another tenant's row.
+    Idempotent: a row that is already archived — or doesn't exist for
+    this ``(tenant_id, user_id)`` — returns ``False`` without mutating.
+    Returns ``True`` when a row transitioned to archived.
+
+    The row is PRESERVED (not deleted) so the audit trail survives and a
+    later reconnect via :func:`reactivate_credential` can resurrect it
+    (``UNIQUE(tenant_id, user_id, provider)`` covers archived rows). A
+    successful soft-delete writes one ``"archive"`` audit row inside the
+    same transaction as the UPDATE.
+
+    Raises :class:`VaultPermissionError` if ``caller_module`` is not in
+    :data:`ALLOWLIST`; raises :class:`VaultError` on DB failure.
+    """
+    try:
+        _check_allowlist(caller_module)
+    except VaultPermissionError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=None,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="archive",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+
+    try:
+        async with pool.acquire() as cred_conn:
+            async with cred_conn.transaction():
+                archived = await cred_conn.fetchrow(
+                    _ARCHIVE_CREDENTIAL_SQL,
+                    credential_id,
+                    tenant_id,
+                    user_id,
+                )
+                if archived is None:
+                    # Already archived OR not found for this (tenant, user).
+                    # Idempotent no-op — nothing changed, so no audit row.
+                    return False
+                # Same-transaction audit using cred_conn — no nested pool
+                # acquire (matches store/rotate/reactivate since Codex R4).
+                await audit.write_audit_row_on_conn(
+                    conn=cred_conn,
+                    credential_id=credential_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    provider=_GRANOLA_PROVIDER,
+                    caller_module=caller_module,
+                    operation="archive",
+                    success=True,
+                    trace_id=trace_id,
+                )
+    except VaultError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="archive",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="archive DB section")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="archive",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
+        )
+        raise wrapped from exc
+
+    return True
 
 
 # Sentinel for the "provider unknown" case in audit rows. Used by rotate

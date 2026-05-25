@@ -7,10 +7,13 @@ and rotation procedures.
 Public API:
 
 * :class:`GranolaCredential` — decrypted credential snapshot returned by reads.
+* :class:`CredentialStatus` — non-decrypting lifecycle snapshot (any status).
 * :func:`get_granola_credential_for_user` — read-and-decrypt accessor.
+* :func:`get_credential_status` — non-decrypting lifecycle read (any status).
 * :func:`store_credential` — encrypt-and-insert accessor.
 * :func:`rotate_credential_key` — replace key material on an existing row.
 * :func:`reactivate_credential` — re-enable a previously archived row.
+* :func:`archive_credential` — soft-delete a row (LOCKED-34 disconnect).
 * :data:`ALLOWLIST` — caller modules permitted to use the accessor.
 * :class:`VaultError`, :class:`VaultPermissionError`, :class:`VaultErrorCode`
   — structured failure signaling.
@@ -32,7 +35,10 @@ from __future__ import annotations
 from .errors import VaultError, VaultErrorCode, VaultPermissionError
 from .user_credentials import (
     ALLOWLIST,
+    CredentialStatus,
     GranolaCredential,
+    archive_credential,
+    get_credential_status,
     get_granola_credential_for_user,
     reactivate_credential,
     rotate_credential_key,
@@ -41,10 +47,13 @@ from .user_credentials import (
 
 __all__ = [
     "ALLOWLIST",
+    "CredentialStatus",
     "GranolaCredential",
     "VaultError",
     "VaultErrorCode",
     "VaultPermissionError",
+    "archive_credential",
+    "get_credential_status",
     "get_granola_credential_for_user",
     "reactivate_credential",
     "rotate_credential_key",

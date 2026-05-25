@@ -1348,3 +1348,320 @@ class TestAllowlistDefaults:
 
     def test_allowlist_is_frozen(self):
         assert not hasattr(user_credentials.ALLOWLIST, "add")
+
+
+def _status_row(
+    *,
+    credential_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    status: str = "active",
+    archived_at=None,
+    config: dict | None = None,
+) -> dict:
+    """Fake Record for the non-decrypting status SELECT (no encrypted cols)."""
+    return {
+        "id": credential_id,
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "provider": "granola",
+        "config": config if config is not None else {"folder_id": "fol_abc", "folder_name": "EQ"},
+        "status": status,
+        "last_polled_at": None,
+        "last_error": None,
+        "consecutive_failures": 0,
+        "created_at": MagicMock(),
+        "updated_at": MagicMock(),
+        "archived_at": archived_at,
+    }
+
+
+class TestGetCredentialStatus:
+    """Phase 2f non-decrypting lifecycle read for /status, /rotate, /disconnect."""
+
+    @pytest.mark.asyncio
+    async def test_caller_not_in_allowlist_raises_and_audits(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        with pytest.raises(VaultPermissionError):
+            await user_credentials.get_credential_status(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                caller_module=_BLOCKED_CALLER,
+                pool=fake_pool,
+            )
+        audit_spy.assert_awaited_once()
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "read"
+        assert kw["success"] is False
+        assert kw["error_code"] == VaultErrorCode.VAULT_CALLER_NOT_ALLOWED.value
+        assert kw["credential_id"] is None
+        fake_pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_row_returns_none_and_audits_success(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        result = await user_credentials.get_credential_status(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            caller_module="routers.granola",
+            pool=fake_pool,
+        )
+        assert result is None
+        audit_spy.assert_awaited_once()
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "read"
+        assert kw["success"] is True
+        assert kw["credential_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_happy_path_returns_status_without_decrypting(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock, decrypt_spy: MagicMock
+    ):
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = _status_row(
+            credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
+        )
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        result = await user_credentials.get_credential_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            caller_module="routers.granola",
+            pool=fake_pool,
+            trace_id="trace-status",
+        )
+
+        assert result is not None
+        assert result.id == credential_id
+        assert result.status == "active"
+        assert result.config == {"folder_id": "fol_abc", "folder_name": "EQ"}
+        assert result.archived_at is None
+        # No key material is ever materialized for a status read.
+        decrypt_spy.assert_not_called()
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "read"
+        assert kw["success"] is True
+        assert kw["credential_id"] == credential_id
+        assert kw["trace_id"] == "trace-status"
+
+    @pytest.mark.asyncio
+    async def test_returns_archived_and_revoked_rows_unlike_active_accessor(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        """Unlike get_granola_credential_for_user, the status accessor returns
+        rows in ANY status (archived / revoked) so /status can render a broken
+        or disconnected connection."""
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = _status_row(
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="archived",
+            archived_at=MagicMock(),
+        )
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        result = await user_credentials.get_credential_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            caller_module="routers.granola",
+            pool=fake_pool,
+        )
+        assert result is not None
+        assert result.status == "archived"
+        assert result.archived_at is not None
+
+    @pytest.mark.asyncio
+    async def test_select_sql_does_not_filter_status_or_archived(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        """The status SELECT must NOT filter status='active' or
+        archived_at IS NULL — that's what makes it return ANY lifecycle
+        state. It selects archived_at as a COLUMN but never in the WHERE."""
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = None
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        await user_credentials.get_credential_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            caller_module="routers.granola",
+            pool=fake_pool,
+        )
+        args = conn.fetchrow.await_args.args
+        sql = args[0]
+        assert "status = 'active'" not in sql
+        assert "archived_at IS NULL" not in sql
+        # Tenant isolation: scoped to tenant + user + provider.
+        assert "tenant_id = $1" in sql
+        assert "user_id = $2" in sql
+        assert "provider = $3" in sql
+        assert args[1] == tenant_id
+        assert args[2] == user_id
+        assert args[3] == "granola"
+
+    @pytest.mark.asyncio
+    async def test_wraps_raw_db_error_and_audits(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        conn = _make_fake_conn()
+        conn.fetchrow = AsyncMock(side_effect=ConnectionError("network drop"))
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.get_credential_status(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                caller_module="routers.granola",
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_QUERY_FAILED
+        audit_spy.assert_awaited_once()
+        assert audit_spy.await_args.kwargs["success"] is False
+        assert audit_spy.await_args.kwargs["operation"] == "read"
+
+
+class TestArchiveCredential:
+    """Phase 2f /disconnect soft-delete (LOCKED-34)."""
+
+    @pytest.mark.asyncio
+    async def test_caller_not_in_allowlist_raises_and_audits(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        with pytest.raises(VaultPermissionError):
+            await user_credentials.archive_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                credential_id=uuid.uuid4(),
+                caller_module=_BLOCKED_CALLER,
+                pool=fake_pool,
+            )
+        audit_spy.assert_awaited_once()
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "archive"
+        assert kw["success"] is False
+        assert kw["error_code"] == VaultErrorCode.VAULT_CALLER_NOT_ALLOWED.value
+        assert kw["credential_id"] is None
+        fake_pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_happy_path_soft_deletes_and_audits(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = {"id": credential_id}  # RETURNING id
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        result = await user_credentials.archive_credential(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            credential_id=credential_id,
+            caller_module="routers.granola",
+            pool=fake_pool,
+            trace_id="trace-disc",
+        )
+        assert result is True
+
+        sql = conn.fetchrow.await_args.args[0]
+        assert "status = 'archived'" in sql
+        assert "archived_at = CURRENT_TIMESTAMP" in sql
+        # Idempotency + tenant isolation in the WHERE.
+        assert "archived_at IS NULL" in sql
+        assert "AND tenant_id = $2" in sql
+        assert "AND user_id = $3" in sql
+        update_args = conn.fetchrow.await_args.args
+        assert update_args[1] == credential_id
+        assert update_args[2] == tenant_id
+        assert update_args[3] == user_id
+
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "archive"
+        assert kw["success"] is True
+        assert kw["credential_id"] == credential_id
+        assert kw["trace_id"] == "trace-disc"
+        # Same-transaction audit (no nested pool acquire).
+        assert "conn" in kw and "pool" not in kw
+
+    @pytest.mark.asyncio
+    async def test_idempotent_noop_returns_false_without_audit(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        """Already-archived / not-found → UPDATE matches 0 rows → False,
+        no state change, so no audit row."""
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = None  # RETURNING matched nothing
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        result = await user_credentials.archive_credential(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            credential_id=uuid.uuid4(),
+            caller_module="routers.granola",
+            pool=fake_pool,
+        )
+        assert result is False
+        audit_spy.assert_not_awaited()
+        # Transaction committed cleanly (no rollback) on the no-op path.
+        tx = conn._transactions[0]
+        assert tx.rolled_back is False
+
+    @pytest.mark.asyncio
+    async def test_only_one_pool_acquire(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        """archive's success-audit must use write_audit_row_on_conn(conn=...)
+        so it doesn't nest a second pool acquire inside the open txn."""
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = {"id": credential_id}
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        await user_credentials.archive_credential(
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            credential_id=credential_id,
+            caller_module="routers.granola",
+            pool=fake_pool,
+        )
+        assert fake_pool.acquire.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_wraps_raw_db_error_and_audits_failure(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow = AsyncMock(side_effect=ConnectionError("network drop"))
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.archive_credential(
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                credential_id=credential_id,
+                caller_module="routers.granola",
+                pool=fake_pool,
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_QUERY_FAILED
+        audit_spy.assert_awaited_once()
+        kw = audit_spy.await_args.kwargs
+        assert kw["success"] is False
+        assert kw["operation"] == "archive"
+        assert kw["credential_id"] == credential_id
