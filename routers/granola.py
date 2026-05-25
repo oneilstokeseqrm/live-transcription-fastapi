@@ -48,6 +48,14 @@ from services.asyncpg_pool import get_asyncpg_pool
 from services.granola_ingestion.adapter import run_one_cycle
 from services.granola_ingestion.api_client import GranolaAPIClient
 from services.granola_ingestion.errors import GranolaError, GranolaErrorCode
+# Shared per-credential advisory-lock key convention (pure UUID->int64). The
+# /connect "save & test" poll holds the SAME lock the scheduler's
+# run_cycle_step holds, so a synchronous connect poll and a 5-min scheduler
+# cycle can never run the same credential concurrently (which would bypass the
+# adapter's per-note idempotency anchor and double-publish). We import only the
+# key helper, NOT run_cycle_step — that's a @DBOS.step and calling it outside a
+# launched workflow has uncertain production semantics.
+from services.granola_ingestion.scheduler import _advisory_lock_key
 from services.vault import (
     VaultError,
     VaultErrorCode,
@@ -244,6 +252,172 @@ def _empty_activity() -> dict:
     return {"ingested_7d": 0, "deferred_7d": 0, "errors_7d": 0}
 
 
+def _first_poll_zero() -> dict:
+    return {
+        "notes_processed": 0,
+        "ingested": 0,
+        "deferred": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+
+
+async def _run_save_and_test(
+    *, credential_id: UUID, tenant_id: UUID, user_id: UUID, pool, trace_id
+) -> dict:
+    """LOCKED-31 "save & test" first poll, serialized against the scheduler.
+
+    Holds the SAME per-credential advisory lock the scheduler's
+    ``run_cycle_step`` holds, keyed on ``credential_id``. If a 5-min
+    scheduler cycle is already polling this credential, ``pg_try_advisory_lock``
+    fails and we skip the synchronous poll (the credential is saved + active
+    and the scheduler is already on it) — never running two concurrent cycles
+    for the same credential, which would bypass the adapter's per-note
+    idempotency anchor and double-publish (Codex R4 P2 + the LOCKED-39 race
+    the scheduler's lock exists to prevent).
+
+    Returns the /connect response body. The credential is durable + active
+    before this runs, so EVERY failure path here reports the connection's
+    real state rather than 500ing — a failed first poll just means the
+    scheduler picks it up on the next tick.
+    """
+    lock_key = _advisory_lock_key(credential_id)
+    async with pool.acquire() as lock_conn:
+        got_lock = await lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_key)
+        if not got_lock:
+            logger.info(
+                "granola /connect: scheduler holds the poll lock for credential "
+                "%s; deferring the first poll to the scheduler",
+                credential_id,
+            )
+            return {
+                "ok": True,
+                "status": "connected",
+                "first_poll": _first_poll_zero(),
+                "error_code": None,
+            }
+        try:
+            # Load (decrypt round-trip). A structured VaultError here (DB /
+            # audit / decrypt) is NOT a failed connection — the credential is
+            # committed + active — so report it like a failed first poll
+            # rather than a 500 that a retry would turn into a spurious 409.
+            try:
+                credential = await get_granola_credential_for_user(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    caller_module=_CALLER_MODULE,
+                    pool=pool,
+                    trace_id=trace_id,
+                )
+            except VaultError:
+                logger.exception(
+                    "granola /connect: read-back failed (credential active; "
+                    "scheduler retries). tenant=%s user=%s",
+                    tenant_id, user_id,
+                )
+                return {
+                    "ok": False,
+                    "status": "connected",
+                    "first_poll": {**_first_poll_zero(), "errors": 1},
+                    "error_code": "first_poll_failed",
+                }
+
+            if credential is None:
+                # Saved, but get_granola_credential_for_user (active-only)
+                # returned nothing: a PRIOR scheduler cycle flipped it
+                # (revoked/error) or a concurrent /disconnect archived it.
+                # Report the real state, not a 500 (Codex R4 P2).
+                post = await _load_status_or_http(
+                    tenant_id=tenant_id, user_id=user_id, pool=pool, trace_id=trace_id
+                )
+                if post is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Credential was saved but could not be read back; please retry.",
+                    )
+                if post.archived_at is not None:
+                    return {
+                        "ok": False,
+                        "status": "disconnected",
+                        "first_poll": _first_poll_zero(),
+                        "error_code": (post.last_error or {}).get("error_code"),
+                    }
+                real_status = "connected" if post.status == "active" else post.status
+                return {
+                    "ok": post.status == "active",
+                    "status": real_status,
+                    "first_poll": _first_poll_zero(),
+                    "error_code": (post.last_error or {}).get("error_code"),
+                }
+
+            # NOTE: a brand-new credential has last_polled_at=NULL, so
+            # run_one_cycle does a full-folder backfill. For design-partner
+            # folders this is fast; a very large folder could approach
+            # Railway's ~5-min edge timeout (reference_railway_proxy_timeout).
+            # The api_client bounds each request (30s + max_pages); if
+            # production shows slow first polls, Phase 2.1 can move the first
+            # poll to a dispatched DBOS workflow. LOCKED-31 mandates the
+            # synchronous one-shot for the ~2s confirmation UX.
+            try:
+                cycle = await run_one_cycle(credential=credential, pool=pool)
+            except Exception:  # noqa: BLE001 — credential is saved; never 500 the connect
+                logger.exception(
+                    "granola /connect: first poll raised (credential saved + "
+                    "active; scheduler retries). tenant=%s user=%s",
+                    tenant_id, user_id,
+                )
+                return {
+                    "ok": False,
+                    "status": "connected",
+                    "first_poll": {**_first_poll_zero(), "errors": 1},
+                    "error_code": "first_poll_failed",
+                }
+
+            outcomes = cycle.outcomes or {}
+            first_poll = {
+                "notes_processed": cycle.notes_processed,
+                "ingested": outcomes.get("success", 0),
+                "deferred": outcomes.get("deferred_pending_account", 0),
+                "skipped": outcomes.get("skipped_no_business_attendees", 0),
+                "errors": (
+                    outcomes.get("failed", 0)
+                    + outcomes.get("failed_permanent", 0)
+                    + (1 if cycle.credential_error_code else 0)
+                ),
+            }
+            # Report the credential's REAL post-poll lifecycle by mirroring the
+            # adapter's credential-level branch table (Codex P3 + R3 P2): only
+            # auth failure ('revoked') and folder-not-found ('error') are
+            # terminal; every other credential error (429/5xx/timeout/parse/
+            # http) is TRANSIENT — the adapter bumps consecutive_failures but
+            # leaves status='active' until the 3-cycle threshold and the
+            # scheduler keeps retrying, so report 'connected'.
+            err = cycle.credential_error_code
+            if err == GranolaErrorCode.GRANOLA_AUTH_FAILED.value:
+                connected_status = "revoked"
+            elif err == GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND.value:
+                connected_status = "error"
+            else:
+                connected_status = "connected"
+            return {
+                "ok": err is None,
+                "status": connected_status,
+                "first_poll": first_poll,
+                "error_code": err,
+            }
+        finally:
+            # Release before the connection returns to the pool — session
+            # advisory locks persist across pool checkin (matches
+            # run_cycle_step's finally-unlock).
+            try:
+                await lock_conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
+            except Exception:  # noqa: BLE001 — unlock must not mask the poll result
+                logger.exception(
+                    "granola /connect: pg_advisory_unlock failed for credential %s",
+                    credential_id,
+                )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -259,9 +433,14 @@ async def validate_granola_key(body: ValidateRequest, request: Request) -> dict:
     the wizard can render inline messaging without treating a bad key as a
     transport error.
     """
-    # Auth only — validate doesn't touch the DB, so tenant/user aren't used,
-    # but the route is still gated (401 without a valid JWT).
-    get_auth_context_polling(request)
+    # Validate doesn't store anything, but it DOES proxy a call to Granola
+    # with a caller-supplied key, so it must be held to the same JWT contract
+    # as the mutation routes. _resolve_identity requires the JWT's pg_user_id
+    # (and 400s a legacy-header request that lacks it), so /validate can't be
+    # reached without a verified JWT even when ALLOW_LEGACY_HEADER_AUTH=true
+    # (Codex R4 P2). The resolved identity is unused — validate is stateless.
+    ctx = get_auth_context_polling(request)
+    _resolve_identity(ctx)
 
     client = GranolaAPIClient(api_key=body.api_key)
     try:
@@ -316,7 +495,7 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
     # for a non-uniqueness reason → surface 502 rather than masquerade as a
     # reconnect and confusingly 500 with vault_db_not_found.
     try:
-        await store_credential(
+        credential_id = await store_credential(
             tenant_id=tenant_id,
             user_id=user_id,
             provider=_PROVIDER,
@@ -357,7 +536,7 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
         # Archived row → reconnect: reactivate UPDATEs in place (preserving
         # the credential UUID so EncryptionContext stays consistent).
         try:
-            await reactivate_credential(
+            credential_id = await reactivate_credential(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 provider=_PROVIDER,
@@ -386,111 +565,17 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                 )
             raise _http_from_vault_error(react_exc)
 
-    # --- Save & test: load (decrypt round-trip) + one synchronous cycle ----
-    # The load can raise a structured VaultError (DB / audit / decrypt). The
-    # credential is already committed + active at this point, so a load
-    # failure is NOT a failed connection — treat it like a failed first poll
-    # (the scheduler retries every 5 min) rather than a 500 that would make
-    # a retry hit the 409 path (Codex P2).
-    try:
-        credential = await get_granola_credential_for_user(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            caller_module=_CALLER_MODULE,
-            pool=pool,
-            trace_id=ctx.trace_id,
-        )
-    except VaultError:
-        logger.exception(
-            "granola /connect: credential saved but read-back failed "
-            "(credential active; next cron tick retries). tenant=%s user=%s",
-            tenant_id, user_id,
-        )
-        return {
-            "ok": False,
-            "status": "connected",
-            "first_poll": {**_first_poll_zero(), "errors": 1},
-            "error_code": "first_poll_failed",
-        }
-    if credential is None:
-        # We just stored an active row; its absence here is a real
-        # invariant break (concurrent disconnect, or a store/read DB split).
-        logger.error(
-            "granola /connect: credential missing immediately after store "
-            "(tenant=%s user=%s)",
-            tenant_id, user_id,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="Credential was saved but could not be read back; please retry.",
-        )
-
-    # NOTE: a brand-new credential has last_polled_at=NULL, so run_one_cycle
-    # does a full-folder backfill. For design-partner folders this is fast;
-    # a very large folder could approach Railway's ~5-min edge timeout
-    # (reference_railway_proxy_timeout). The api_client bounds each request
-    # (30s + max_pages); if production data shows slow first polls, Phase 2.1
-    # can move the first poll to a dispatched DBOS workflow. LOCKED-31
-    # mandates the synchronous one-shot for the ~2s confirmation UX.
-    try:
-        cycle = await run_one_cycle(credential=credential, pool=pool)
-    except Exception as exc:  # noqa: BLE001 — the credential is saved; don't 500 the connect
-        logger.exception(
-            "granola /connect: first poll raised (credential saved + active; "
-            "next cron tick retries). tenant=%s user=%s",
-            tenant_id, user_id,
-        )
-        return {
-            "ok": False,
-            "status": "connected",
-            "first_poll": {**_first_poll_zero(), "errors": 1},
-            "error_code": "first_poll_failed",
-        }
-
-    outcomes = cycle.outcomes or {}
-    first_poll = {
-        "notes_processed": cycle.notes_processed,
-        "ingested": outcomes.get("success", 0),
-        "deferred": outcomes.get("deferred_pending_account", 0),
-        "skipped": outcomes.get("skipped_no_business_attendees", 0),
-        "errors": (
-            outcomes.get("failed", 0)
-            + outcomes.get("failed_permanent", 0)
-            + (1 if cycle.credential_error_code else 0)
-        ),
-    }
-    # Report the credential's REAL post-poll lifecycle by mirroring the
-    # adapter's credential-level branch table (Codex P3 + R3 P2). The adapter
-    # marks the credential terminally ONLY for auth failure ('revoked') and
-    # folder-not-found ('error'); every OTHER credential error (429, 5xx,
-    # timeout, parse, http) is TRANSIENT — it bumps consecutive_failures but
-    # leaves status='active' until the 3-cycle threshold, and the scheduler
-    # keeps retrying. So a transient first-poll blip must report the
-    # connection as still 'connected', not a broken 'error'.
-    err = cycle.credential_error_code
-    if err == GranolaErrorCode.GRANOLA_AUTH_FAILED.value:
-        connected_status = "revoked"
-    elif err == GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND.value:
-        connected_status = "error"
-    else:
-        # None (clean) OR a transient credential error → credential is active.
-        connected_status = "connected"
-    return {
-        "ok": cycle.credential_error_code is None,
-        "status": connected_status,
-        "first_poll": first_poll,
-        "error_code": cycle.credential_error_code,
-    }
-
-
-def _first_poll_zero() -> dict:
-    return {
-        "notes_processed": 0,
-        "ingested": 0,
-        "deferred": 0,
-        "skipped": 0,
-        "errors": 0,
-    }
+    # --- Save & test (LOCKED-31): one synchronous poll, serialized against
+    # the scheduler via the shared per-credential advisory lock. Every failure
+    # path inside reports the connection's real state rather than 500ing —
+    # the credential is durable + active before this runs.
+    return await _run_save_and_test(
+        credential_id=credential_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        pool=pool,
+        trace_id=ctx.trace_id,
+    )
 
 
 @router.post("/rotate")

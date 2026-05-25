@@ -56,7 +56,7 @@ def client():
     return TestClient(app)
 
 
-def _ctx(*, tenant=_TENANT, pg_user=_PG_USER, user_id="auth0|abc", trace=_TRACE):
+def _ctx(*, tenant=_TENANT, pg_user: str | None = _PG_USER, user_id="auth0|abc", trace=_TRACE):
     """A RequestContext-shaped stand-in (only the attrs the router reads)."""
     return types.SimpleNamespace(
         tenant_id=tenant,
@@ -69,13 +69,28 @@ def _ctx(*, tenant=_TENANT, pg_user=_PG_USER, user_id="auth0|abc", trace=_TRACE)
 
 
 class _FakeConn:
-    def __init__(self, fetch_returns=None):
+    """asyncpg stand-in: `fetch` feeds activity rollups; `fetchval` answers
+    the /connect advisory-lock acquire (True = lock free → poll proceeds);
+    `execute` swallows the unlock."""
+
+    def __init__(self, fetch_returns=None, fetchval_returns=True):
         self.fetch_returns = fetch_returns or []
+        self.fetchval_returns = fetchval_returns
         self.fetch_calls = []
+        self.fetchval_calls = []
+        self.execute_calls = []
 
     async def fetch(self, sql, *args):
         self.fetch_calls.append((sql, args))
         return list(self.fetch_returns)
+
+    async def fetchval(self, sql, *args):
+        self.fetchval_calls.append((sql, args))
+        return self.fetchval_returns
+
+    async def execute(self, sql, *args):
+        self.execute_calls.append((sql, args))
+        return "OK"
 
 
 class _FakeAcquireCM:
@@ -97,7 +112,7 @@ class _FakePool:
         return _FakeAcquireCM(self.conn)
 
 
-def _cred_status(*, status="active", archived_at=None, config=None):
+def _cred_status(*, status="active", archived_at=None, config=None, last_error=None):
     now = datetime.now(timezone.utc)
     return CredentialStatus(
         id=uuid4(),
@@ -107,7 +122,7 @@ def _cred_status(*, status="active", archived_at=None, config=None):
         config=config if config is not None else {"folder_id": "fol_eq", "folder_name": "EQ"},
         status=status,
         last_polled_at=now,
-        last_error=None,
+        last_error=last_error,
         consecutive_failures=0,
         created_at=now,
         updated_at=now,
@@ -230,7 +245,7 @@ def test_validate_requires_auth_401(client, monkeypatch):
 
 
 def test_connect_happy_new_stores_and_first_polls(client):
-    store = AsyncMock()
+    store = AsyncMock(return_value=uuid4())
     load = AsyncMock(return_value=MagicMock())  # decrypted credential (opaque here)
     cycle = _cycle(notes_processed=2, outcomes={"success": 2})
     run = AsyncMock(return_value=cycle)
@@ -339,7 +354,7 @@ def test_connect_non_uniqueness_insert_failure_returns_502(client):
 def test_connect_load_failure_after_store_is_graceful(client):
     """A vault read failure AFTER the credential committed must not 500
     (a retry would hit 409) — report it like a failed first poll (Codex P2)."""
-    store = AsyncMock()
+    store = AsyncMock(return_value=uuid4())
     load = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_QUERY_FAILED, "db blip"))
     run = AsyncMock()
 
@@ -364,7 +379,7 @@ def test_connect_load_failure_after_store_is_graceful(client):
 def test_connect_first_poll_auth_failure_reports_revoked(client):
     """First-poll auth failure flips the credential to 'revoked' in the
     adapter; the response must report 'revoked', not 'error' (Codex P3)."""
-    store = AsyncMock()
+    store = AsyncMock(return_value=uuid4())
     load = AsyncMock(return_value=MagicMock())
     run = AsyncMock(return_value=_cycle(credential_error_code="granola_auth_failed"))
 
@@ -389,7 +404,7 @@ def test_connect_first_poll_auth_failure_reports_revoked(client):
 def test_connect_first_poll_folder_error_reports_error_status(client):
     """A non-auth credential error (folder deleted, sustained outage) →
     status='error' (the adapter marks it 'error', not 'revoked')."""
-    store = AsyncMock()
+    store = AsyncMock(return_value=uuid4())
     load = AsyncMock(return_value=MagicMock())
     run = AsyncMock(return_value=_cycle(credential_error_code="granola_folder_not_found"))
 
@@ -414,7 +429,7 @@ def test_connect_first_poll_transient_error_stays_connected(client):
     """A transient first-poll error (429/5xx/timeout) leaves the credential
     'active' in the adapter (retries until the threshold); the connection
     must report 'connected', not a broken 'error' (Codex R3 P2)."""
-    store = AsyncMock()
+    store = AsyncMock(return_value=uuid4())
     load = AsyncMock(return_value=MagicMock())
     run = AsyncMock(return_value=_cycle(credential_error_code="granola_5xx"))
 
@@ -434,6 +449,66 @@ def test_connect_first_poll_transient_error_stays_connected(client):
     assert body["ok"] is False  # the poll itself didn't fully succeed
     assert body["error_code"] == "granola_5xx"
     assert body["first_poll"]["errors"] == 1
+
+
+def test_connect_defers_first_poll_when_scheduler_holds_lock(client):
+    """If a 5-min scheduler cycle already holds the per-credential advisory
+    lock, /connect skips the synchronous poll (no concurrent double-publish)
+    and reports the credential connected — the scheduler is already on it."""
+    store = AsyncMock(return_value=uuid4())
+    load = AsyncMock()
+    run = AsyncMock()
+    # Lock NOT free: pg_try_advisory_lock returns False.
+    pool = _FakePool(_FakeConn(fetchval_returns=False))
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "run_one_cycle", run):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_test", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["status"] == "connected"
+    assert body["first_poll"]["notes_processed"] == 0
+    # Poll skipped: neither the load nor the cycle ran.
+    load.assert_not_awaited()
+    run.assert_not_awaited()
+
+
+def test_connect_readback_non_active_reports_real_state(client):
+    """If the credential is saved but a prior scheduler cycle flipped it
+    non-active, get_granola_credential_for_user (active-only) returns None.
+    /connect must report the real state (via get_credential_status), not 500
+    a retry into a spurious 409 (Codex R4 P2)."""
+    store = AsyncMock(return_value=uuid4())
+    load = AsyncMock(return_value=None)  # active-only read finds nothing
+    revoked = _cred_status(status="revoked", last_error={"error_code": "granola_auth_failed"})
+    get_status = AsyncMock(return_value=revoked)
+    run = AsyncMock()
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "run_one_cycle", run):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_test", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "revoked"
+    assert body["ok"] is False
+    assert body["error_code"] == "granola_auth_failed"
+    run.assert_not_awaited()
 
 
 def test_connect_concurrent_reconnect_race_returns_409(client):
@@ -466,7 +541,7 @@ def test_connect_concurrent_reconnect_race_returns_409(client):
 def test_connect_first_poll_raise_is_graceful(client):
     """If run_one_cycle raises (infra error), the credential is still saved;
     connect returns ok:false + first_poll_failed rather than a 500."""
-    store = AsyncMock()
+    store = AsyncMock(return_value=uuid4())
     load = AsyncMock(return_value=MagicMock())
     run = AsyncMock(side_effect=RuntimeError("db blip"))
 
@@ -520,7 +595,7 @@ def test_connect_non_uuid_pg_user_returns_400(client):
 def test_connect_does_not_fall_back_to_auth0_user_id(client):
     """Even when user_id is UUID-shaped, a missing pg_user_id must 400 — we
     never bind a credential to the Auth0 subject (Codex R3 P1)."""
-    store = AsyncMock()
+    store = AsyncMock(return_value=uuid4())
     # pg_user_id absent; user_id is a valid UUID string (the dangerous case
     # the old `pg_user_id or user_id` fallback would have silently accepted).
     bad_ctx = _ctx(pg_user=None, user_id=str(uuid4()))
