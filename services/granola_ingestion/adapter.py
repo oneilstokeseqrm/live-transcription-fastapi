@@ -226,6 +226,23 @@ async def run_one_cycle(
             return CycleResult(credential_error_code=outcome_code, outcomes={})
 
         for note_summary in note_summaries:
+            # Edge #12: re-check the credential is still active before each
+            # note. A /disconnect (or a revoke/error transition) that lands
+            # mid-cycle must STOP further ingestion immediately rather than
+            # keep publishing the remaining notes downstream (the Phase 2f
+            # Codex R9 disconnect-during-sync gap).
+            if not await _credential_is_active(
+                pool=pool,
+                credential_id=credential.id,
+                tenant_id=credential.tenant_id,
+                user_id=credential.user_id,
+            ):
+                logger.info(
+                    "granola_adapter: credential %s deactivated mid-cycle; "
+                    "aborting remaining notes (%d processed this cycle)",
+                    credential.id, notes_processed,
+                )
+                break
             outcome = await process_note(
                 credential=credential,
                 note_summary=note_summary,
@@ -651,6 +668,21 @@ async def reprocess_pending_notes(
 
     reprocessed = 0
     for row in rows:
+        # Edge #12: the reprocess pass also publishes (Scenario A re-promotion),
+        # so it must honor a mid-cycle deactivation too — stop re-publishing if
+        # the credential was archived/revoked since the cycle began.
+        if not await _credential_is_active(
+            pool=pool,
+            credential_id=credential.id,
+            tenant_id=credential.tenant_id,
+            user_id=credential.user_id,
+        ):
+            logger.info(
+                "granola_adapter: credential %s deactivated mid-cycle; "
+                "aborting reprocess (%d re-processed this cycle)",
+                credential.id, reprocessed,
+            )
+            break
         reprocessed += 1
         external_id: str = row["external_id"]
         status: str = row.get("status", "")
@@ -1293,6 +1325,7 @@ SET last_polled_at = $4,
 WHERE id = $1
   AND tenant_id = $2
   AND user_id = $3
+  AND archived_at IS NULL
 """
 
 _UPDATE_CREDENTIAL_STATUS_SQL = """
@@ -1303,6 +1336,7 @@ SET status = $4,
 WHERE id = $1
   AND tenant_id = $2
   AND user_id = $3
+  AND archived_at IS NULL
 """
 
 _INCREMENT_CREDENTIAL_FAILURES_SQL = """
@@ -1313,8 +1347,52 @@ SET consecutive_failures = consecutive_failures + 1,
 WHERE id = $1
   AND tenant_id = $2
   AND user_id = $3
+  AND archived_at IS NULL
 RETURNING consecutive_failures
 """
+
+# Edge #12 (plan §2.1 #12): a lightweight, non-decrypting liveness probe for
+# the credential row, used to re-check active-state mid-cycle. The three
+# credential-state UPDATEs above now also guard on ``archived_at IS NULL`` so a
+# stale cycle's terminal write-back is a no-op once the row is archived; this
+# SELECT is the complementary pre-publish guard (see ``_credential_is_active``).
+_CREDENTIAL_IS_ACTIVE_SQL = """
+SELECT EXISTS(
+    SELECT 1
+    FROM vault.user_credentials
+    WHERE id = $1
+      AND tenant_id = $2
+      AND user_id = $3
+      AND status = 'active'
+      AND archived_at IS NULL
+)
+"""
+
+
+async def _credential_is_active(
+    *,
+    pool: asyncpg.Pool,
+    credential_id: UUID,
+    tenant_id: UUID,
+    user_id: UUID,
+) -> bool:
+    """Return True iff the credential row is still active + not archived.
+
+    The ``credential`` snapshot a cycle starts with is read once and goes
+    stale: a ``/disconnect`` (soft-delete → ``archived_at`` set) or a
+    revoke/error transition that lands MID-cycle is invisible to the
+    in-memory object. Re-reading the live lifecycle state before each
+    publish lets a credential archived mid-cycle abort the cycle cleanly
+    instead of ingesting the remaining notes (plan §2.1 #12 — the
+    disconnect-during-sync gap from Phase 2f Codex R9). Tenant + user
+    scoped (LOCKED tenant isolation); never decrypts the key.
+    """
+    async with pool.acquire() as conn:
+        return bool(
+            await conn.fetchval(
+                _CREDENTIAL_IS_ACTIVE_SQL, credential_id, tenant_id, user_id
+            )
+        )
 
 
 async def _get_integration_run(

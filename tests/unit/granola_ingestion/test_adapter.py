@@ -59,6 +59,8 @@ class _FakeConn:
         fetchrow_returns: Optional[dict[str, Any]] = None,
         fetchrow_seq: Optional[list[Optional[dict[str, Any]]]] = None,
         fetch_returns: Optional[list[dict[str, Any]]] = None,
+        fetchval_returns: Any = True,
+        fetchval_seq: Optional[list[Any]] = None,
     ) -> None:
         # ``fetchrow_seq`` lets tests return DIFFERENT rows for sequential
         # fetchrow calls (e.g. _get_integration_run before vs after a
@@ -67,9 +69,18 @@ class _FakeConn:
         self.fetchrow_returns = fetchrow_returns
         self.fetchrow_seq = list(fetchrow_seq) if fetchrow_seq else None
         self.fetch_returns = fetch_returns or []
+        # ``fetchval`` backs the edge #12 per-note active-recheck
+        # (``_credential_is_active`` issues ``SELECT EXISTS(...)``). Defaults
+        # to True ("credential still active") so cycle tests that don't care
+        # about mid-cycle deactivation behave exactly as before. ``fetchval_seq``
+        # returns DIFFERENT values for sequential calls (active for note 1,
+        # archived for note 2, etc.).
+        self.fetchval_returns = fetchval_returns
+        self.fetchval_seq = list(fetchval_seq) if fetchval_seq else None
         self.execute_calls: list[tuple[str, tuple]] = []
         self.fetchrow_calls: list[tuple[str, tuple]] = []
         self.fetch_calls: list[tuple[str, tuple]] = []
+        self.fetchval_calls: list[tuple[str, tuple]] = []
 
     async def execute(self, sql: str, *args: Any) -> str:
         self.execute_calls.append((sql, args))
@@ -86,6 +97,14 @@ class _FakeConn:
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
         self.fetch_calls.append((sql, args))
         return list(self.fetch_returns)
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        self.fetchval_calls.append((sql, args))
+        if self.fetchval_seq is not None:
+            if not self.fetchval_seq:
+                return None
+            return self.fetchval_seq.pop(0)
+        return self.fetchval_returns
 
 
 class _FakeAcquireCM:
@@ -1408,3 +1427,174 @@ async def test_scenario_a_lane2_backpressure_records_failed_not_success():
     upserts = [c for c in conn.execute_calls if "external_integration_runs" in c[0]]
     # status='failed' + error_code='lane2_backpressure'
     assert any("lane2_backpressure" in c[1] for c in upserts)
+
+
+# ---------------------------------------------------------------------------
+# Edge #12 (plan §2.1 #12): adapter archived_at-awareness — a credential
+# archived/disconnected mid-cycle must abort the in-flight cycle cleanly
+# (stop publishing), and the 3 credential-state UPDATEs must no-op on an
+# archived row so a stale cycle can't write back onto a just-disconnected
+# credential.
+# ---------------------------------------------------------------------------
+
+
+def test_credential_state_update_sqls_guard_on_archived_at():
+    """The 3 credential-state UPDATE SQLs must filter ``archived_at IS NULL``
+    so an in-flight cycle's terminal write-back is a no-op once the credential
+    is archived/disconnected (plan §2.1 #12)."""
+    for name, sql in (
+        ("_UPDATE_CREDENTIAL_POLL_SUCCESS_SQL", adapter._UPDATE_CREDENTIAL_POLL_SUCCESS_SQL),
+        ("_UPDATE_CREDENTIAL_STATUS_SQL", adapter._UPDATE_CREDENTIAL_STATUS_SQL),
+        ("_INCREMENT_CREDENTIAL_FAILURES_SQL", adapter._INCREMENT_CREDENTIAL_FAILURES_SQL),
+    ):
+        assert "archived_at IS NULL" in sql, (
+            f"{name} must guard on archived_at IS NULL (edge #12)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_credential_is_active_queries_active_and_not_archived():
+    """``_credential_is_active`` returns True only for an active, non-archived
+    row, scoped to (id, tenant_id, user_id)."""
+    credential = _build_credential()
+
+    conn_active = _FakeConn(fetchval_returns=True)
+    is_active = await adapter._credential_is_active(
+        pool=_FakePool(conn_active),  # type: ignore[arg-type]
+        credential_id=credential.id,
+        tenant_id=credential.tenant_id,
+        user_id=credential.user_id,
+    )
+    assert is_active is True
+    sql, args = conn_active.fetchval_calls[0]
+    assert "status = 'active'" in sql
+    assert "archived_at IS NULL" in sql
+    assert args == (credential.id, credential.tenant_id, credential.user_id)
+
+    conn_archived = _FakeConn(fetchval_returns=False)
+    is_active2 = await adapter._credential_is_active(
+        pool=_FakePool(conn_archived),  # type: ignore[arg-type]
+        credential_id=credential.id,
+        tenant_id=credential.tenant_id,
+        user_id=credential.user_id,
+    )
+    assert is_active2 is False
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_aborts_remaining_notes_when_archived_mid_cycle():
+    """Edge #12 core: if the credential is archived between notes, the cycle
+    stops — subsequent notes are NOT fetched or published downstream."""
+    credential = _build_credential()
+    note1 = _make_note_summary("not_mid_1")
+    note2 = _make_note_summary("not_mid_2")
+    detail1 = _make_note_detail(note_id="not_mid_1", attendees=[Attendee(email="bob@bigco.com")])
+    detail2 = _make_note_detail(note_id="not_mid_2", attendees=[Attendee(email="carol@bigco.com")])
+
+    # fetchrow=None → no existing runs; fetch=[] → no pending rows.
+    # fetchval_seq drives the per-note recheck: active for note1, archived for note2.
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, False])
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[note1, note2])
+    client.get_note_detail = AsyncMock(side_effect=[detail1, detail2])
+    client.aclose = AsyncMock()
+
+    process_mock = AsyncMock(return_value=text_clean_service.ProcessResult(
+        interaction_id="00000000-0000-4000-8000-00000000ab01",
+        lane1_published=True, lane2_dispatched=True))
+
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "process", new=process_mock):
+        result = await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    # Only the FIRST note published; the second was skipped because the
+    # credential was archived between notes.
+    assert process_mock.await_count == 1
+    assert result.notes_processed == 1
+    # The second note's detail must never have been fetched.
+    assert client.get_note_detail.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
+    """Regression guard for edge #12: when the credential stays active the
+    whole cycle, every note is processed + published (no behavior change)."""
+    credential = _build_credential()
+    note1 = _make_note_summary("not_act_1")
+    note2 = _make_note_summary("not_act_2")
+    detail1 = _make_note_detail(note_id="not_act_1", attendees=[Attendee(email="bob@bigco.com")])
+    detail2 = _make_note_detail(note_id="not_act_2", attendees=[Attendee(email="carol@bigco.com")])
+
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, True])
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[note1, note2])
+    client.get_note_detail = AsyncMock(side_effect=[detail1, detail2])
+    client.aclose = AsyncMock()
+
+    process_mock = AsyncMock(return_value=text_clean_service.ProcessResult(
+        interaction_id="00000000-0000-4000-8000-00000000ac01",
+        lane1_published=True, lane2_dispatched=True))
+
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "process", new=process_mock):
+        result = await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    assert process_mock.await_count == 2
+    assert result.notes_processed == 2
+
+
+@pytest.mark.asyncio
+async def test_reprocess_pending_notes_aborts_when_credential_archived():
+    """Edge #12: the end-of-cycle reprocess pass also re-checks active-state —
+    an archived credential does not re-publish deferred/failed rows."""
+    credential = _build_credential()
+    pending_row = {
+        "id": uuid4(),
+        "external_id": "not_pending_1",
+        "status": "failed",
+        "granola_note_snapshot": None,
+        "retry_count": 1,
+        "eq_interaction_id": None,
+    }
+    conn = _FakeConn(fetch_returns=[pending_row], fetchval_returns=False)  # archived
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.get_note_detail = AsyncMock()  # must NOT be called
+
+    process_mock = AsyncMock()
+    with patch.object(text_clean_service, "process", new=process_mock):
+        count = await adapter.reprocess_pending_notes(
+            credential=credential,  # type: ignore[arg-type]
+            client=client,
+            pool=pool,  # type: ignore[arg-type]
+            internal_domains=set(),
+        )
+
+    assert count == 0
+    client.get_note_detail.assert_not_called()
+    process_mock.assert_not_called()
