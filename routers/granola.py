@@ -167,6 +167,25 @@ def _http_from_vault_error(exc: VaultError) -> HTTPException:
     return HTTPException(status_code=500, detail=f"Vault error ({code.value}).")
 
 
+async def _load_status_or_http(*, tenant_id: UUID, user_id: UUID, pool, trace_id):
+    """get_credential_status, mapping a structured VaultError to clean HTTP.
+
+    The status accessor can raise on a DB / audit-write failure; without
+    this wrapper those would surface as a generic 500 (Codex P2). Mapping
+    VAULT_DB_QUERY_FAILED → 503 tells the client the read is retryable.
+    """
+    try:
+        return await get_credential_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            caller_module=_CALLER_MODULE,
+            pool=pool,
+            trace_id=trace_id,
+        )
+    except VaultError as exc:
+        raise _http_from_vault_error(exc)
+
+
 _ACTIVITY_COUNTS_7D_SQL = """
 SELECT status, COUNT(*)::int AS n
 FROM public.external_integration_runs
@@ -261,6 +280,15 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
         config["folder_name"] = body.folder_name
 
     # --- Store (new) or reactivate (previously archived) -------------------
+    # store_credential INSERTs a new row. VAULT_DB_INSERT_FAILED is generic
+    # (ANY rejected INSERT), so on that code we must distinguish a real
+    # uniqueness collision (a row already exists for this tenant/user/provider)
+    # from a different insert rejection — e.g. a stale pg_user_id that no
+    # longer satisfies the user_credentials.user_id -> users.id FK (Codex P2).
+    # We read the row back: present + archived → reconnect (reactivate);
+    # present + active → already connected (409); absent → the INSERT failed
+    # for a non-uniqueness reason → surface 502 rather than masquerade as a
+    # reconnect and confusingly 500 with vault_db_not_found.
     try:
         await store_credential(
             tenant_id=tenant_id,
@@ -276,10 +304,32 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
         if exc.code is not VaultErrorCode.VAULT_DB_INSERT_FAILED:
             # KMS / generic DB failure — clean HTTP, never a raw 500.
             raise _http_from_vault_error(exc)
-        # UNIQUE(tenant, user, provider) hit — a row already exists (active
-        # or archived). Reactivate handles the archived case (UPDATE in
-        # place, preserving the credential UUID so EncryptionContext stays
-        # consistent); an active row means "already connected".
+        existing = await _load_status_or_http(
+            tenant_id=tenant_id, user_id=user_id, pool=pool, trace_id=ctx.trace_id
+        )
+        if existing is None:
+            # INSERT failed but no row exists → not a uniqueness collision
+            # (FK violation, constraint, etc). Don't pretend it's a reconnect.
+            logger.warning(
+                "granola /connect: store INSERT failed with no existing row "
+                "(non-uniqueness rejection) for tenant=%s user=%s",
+                tenant_id, user_id,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Could not store the Granola credential; please retry.",
+            )
+        if existing.archived_at is None:
+            # An active (or revoked/error) row already exists.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Granola is already connected. Use /rotate to change "
+                    "the key, or /disconnect first to reconnect a new one."
+                ),
+            )
+        # Archived row → reconnect: reactivate UPDATEs in place (preserving
+        # the credential UUID so EncryptionContext stays consistent).
         try:
             await reactivate_credential(
                 tenant_id=tenant_id,
@@ -292,25 +342,34 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                 trace_id=ctx.trace_id,
             )
         except VaultError as react_exc:
-            if react_exc.code is VaultErrorCode.VAULT_DB_INSERT_FAILED:
-                # reactivate's "row is active" signal.
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Granola is already connected. Use /rotate to change "
-                        "the key, or /disconnect first to reconnect a new one."
-                    ),
-                )
             raise _http_from_vault_error(react_exc)
 
     # --- Save & test: load (decrypt round-trip) + one synchronous cycle ----
-    credential = await get_granola_credential_for_user(
-        tenant_id=tenant_id,
-        user_id=user_id,
-        caller_module=_CALLER_MODULE,
-        pool=pool,
-        trace_id=ctx.trace_id,
-    )
+    # The load can raise a structured VaultError (DB / audit / decrypt). The
+    # credential is already committed + active at this point, so a load
+    # failure is NOT a failed connection — treat it like a failed first poll
+    # (the scheduler retries every 5 min) rather than a 500 that would make
+    # a retry hit the 409 path (Codex P2).
+    try:
+        credential = await get_granola_credential_for_user(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            caller_module=_CALLER_MODULE,
+            pool=pool,
+            trace_id=ctx.trace_id,
+        )
+    except VaultError:
+        logger.exception(
+            "granola /connect: credential saved but read-back failed "
+            "(credential active; next cron tick retries). tenant=%s user=%s",
+            tenant_id, user_id,
+        )
+        return {
+            "ok": False,
+            "status": "connected",
+            "first_poll": {**_first_poll_zero(), "errors": 1},
+            "error_code": "first_poll_failed",
+        }
     if credential is None:
         # We just stored an active row; its absence here is a real
         # invariant break (concurrent disconnect, or a store/read DB split).
@@ -359,10 +418,17 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
         ),
     }
     # A credential-level error in the first poll (bad key slipped past
-    # validate, deleted folder, sustained outage) flips the credential to
-    # revoked/error inside run_one_cycle; reflect that rather than claim
-    # "connected".
-    connected_status = "error" if cycle.credential_error_code else "connected"
+    # validate, deleted folder, sustained outage) flips the credential
+    # inside run_one_cycle. Mirror the adapter's lifecycle mapping so the
+    # response reports the REAL state (auth failure → 'revoked', everything
+    # else → 'error') rather than collapsing all errors to 'error' and
+    # driving the wrong reconnect banner (Codex P3).
+    if cycle.credential_error_code == GranolaErrorCode.GRANOLA_AUTH_FAILED.value:
+        connected_status = "revoked"
+    elif cycle.credential_error_code:
+        connected_status = "error"
+    else:
+        connected_status = "connected"
     return {
         "ok": cycle.credential_error_code is None,
         "status": connected_status,
@@ -395,12 +461,8 @@ async def rotate_granola_key(body: RotateRequest, request: Request) -> dict:
     tenant_id, user_id = _resolve_identity(ctx)
     pool = await get_asyncpg_pool()
 
-    status_row = await get_credential_status(
-        tenant_id=tenant_id,
-        user_id=user_id,
-        caller_module=_CALLER_MODULE,
-        pool=pool,
-        trace_id=ctx.trace_id,
+    status_row = await _load_status_or_http(
+        tenant_id=tenant_id, user_id=user_id, pool=pool, trace_id=ctx.trace_id
     )
     if status_row is None or status_row.archived_at is not None:
         raise HTTPException(
@@ -443,12 +505,8 @@ async def granola_status(request: Request) -> dict:
     tenant_id, user_id = _resolve_identity(ctx)
     pool = await get_asyncpg_pool()
 
-    status_row = await get_credential_status(
-        tenant_id=tenant_id,
-        user_id=user_id,
-        caller_module=_CALLER_MODULE,
-        pool=pool,
-        trace_id=ctx.trace_id,
+    status_row = await _load_status_or_http(
+        tenant_id=tenant_id, user_id=user_id, pool=pool, trace_id=ctx.trace_id
     )
 
     if status_row is None or status_row.archived_at is not None:
@@ -490,12 +548,8 @@ async def disconnect_granola(request: Request) -> dict:
     tenant_id, user_id = _resolve_identity(ctx)
     pool = await get_asyncpg_pool()
 
-    status_row = await get_credential_status(
-        tenant_id=tenant_id,
-        user_id=user_id,
-        caller_module=_CALLER_MODULE,
-        pool=pool,
-        trace_id=ctx.trace_id,
+    status_row = await _load_status_or_http(
+        tenant_id=tenant_id, user_id=user_id, pool=pool, trace_id=ctx.trace_id
     )
     if status_row is None or status_row.archived_at is not None:
         # Nothing connected, or already disconnected — idempotent success.

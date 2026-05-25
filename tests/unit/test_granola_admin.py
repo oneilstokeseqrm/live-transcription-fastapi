@@ -266,8 +266,11 @@ def test_connect_happy_new_stores_and_first_polls(client):
 
 
 def test_connect_reconnect_after_disconnect_uses_reactivate(client):
-    """store raises UNIQUE-violation (row exists incl. archived) → reactivate."""
+    """store UNIQUE-violation + an ARCHIVED row exists → reactivate (UPDATE)."""
     store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
+    get_status = AsyncMock(
+        return_value=_cred_status(status="archived", archived_at=datetime.now(timezone.utc))
+    )
     reactivate = AsyncMock(return_value=uuid4())
     load = AsyncMock(return_value=MagicMock())
     run = AsyncMock(return_value=_cycle(notes_processed=1, outcomes={"success": 1}))
@@ -275,6 +278,7 @@ def test_connect_reconnect_after_disconnect_uses_reactivate(client):
     auth, pool = _patch_auth_and_pool()
     with auth, pool, \
          patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_credential_status", get_status), \
          patch.object(granola, "reactivate_credential", reactivate), \
          patch.object(granola, "get_granola_credential_for_user", load), \
          patch.object(granola, "run_one_cycle", run):
@@ -291,15 +295,15 @@ def test_connect_reconnect_after_disconnect_uses_reactivate(client):
 
 
 def test_connect_already_active_returns_409(client):
-    """store UNIQUE-violation → reactivate reports row is ACTIVE → 409."""
+    """store UNIQUE-violation + an ACTIVE row exists → 409 (no reactivate)."""
     store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
-    reactivate = AsyncMock(
-        side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "is active")
-    )
+    get_status = AsyncMock(return_value=_cred_status(status="active", archived_at=None))
+    reactivate = AsyncMock()
 
     auth, pool = _patch_auth_and_pool()
     with auth, pool, \
          patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_credential_status", get_status), \
          patch.object(granola, "reactivate_credential", reactivate):
         resp = client.post(
             f"{_BASE}/connect",
@@ -308,11 +312,58 @@ def test_connect_already_active_returns_409(client):
 
     assert resp.status_code == 409
     assert "already connected" in resp.json()["detail"].lower()
+    reactivate.assert_not_awaited()
 
 
-def test_connect_first_poll_credential_error_reflected(client):
-    """A bad key that slipped past validate fails inside the first poll →
-    run_one_cycle returns credential_error_code → status='error', ok=false."""
+def test_connect_non_uniqueness_insert_failure_returns_502(client):
+    """INSERT_FAILED with NO existing row (e.g. a stale pg_user_id failing the
+    users FK) must NOT masquerade as a reconnect → 502, not 409/500 (Codex P2)."""
+    store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "fk violation"))
+    get_status = AsyncMock(return_value=None)  # no row → not a uniqueness collision
+    reactivate = AsyncMock()
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "reactivate_credential", reactivate):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_x", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 502
+    reactivate.assert_not_awaited()
+
+
+def test_connect_load_failure_after_store_is_graceful(client):
+    """A vault read failure AFTER the credential committed must not 500
+    (a retry would hit 409) — report it like a failed first poll (Codex P2)."""
+    store = AsyncMock()
+    load = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_QUERY_FAILED, "db blip"))
+    run = AsyncMock()
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "run_one_cycle", run):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_test", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["status"] == "connected"
+    assert body["error_code"] == "first_poll_failed"
+    run.assert_not_awaited()  # never reached the poll
+
+
+def test_connect_first_poll_auth_failure_reports_revoked(client):
+    """First-poll auth failure flips the credential to 'revoked' in the
+    adapter; the response must report 'revoked', not 'error' (Codex P3)."""
     store = AsyncMock()
     load = AsyncMock(return_value=MagicMock())
     run = AsyncMock(return_value=_cycle(credential_error_code="granola_auth_failed"))
@@ -330,9 +381,33 @@ def test_connect_first_poll_credential_error_reflected(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is False
-    assert body["status"] == "error"
+    assert body["status"] == "revoked"
     assert body["error_code"] == "granola_auth_failed"
     assert body["first_poll"]["errors"] == 1
+
+
+def test_connect_first_poll_folder_error_reports_error_status(client):
+    """A non-auth credential error (folder deleted, sustained outage) →
+    status='error' (the adapter marks it 'error', not 'revoked')."""
+    store = AsyncMock()
+    load = AsyncMock(return_value=MagicMock())
+    run = AsyncMock(return_value=_cycle(credential_error_code="granola_folder_not_found"))
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "run_one_cycle", run):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_test", "folder_id": "fol_gone"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["status"] == "error"
+    assert body["error_code"] == "granola_folder_not_found"
 
 
 def test_connect_first_poll_raise_is_graceful(client):
@@ -440,6 +515,24 @@ def test_rotate_archived_credential_returns_404(client):
         resp = client.post(f"{_BASE}/rotate", json={"new_api_key": "grn_x"})
 
     assert resp.status_code == 404
+    rotate.assert_not_awaited()
+
+
+def test_rotate_status_read_failure_maps_to_503(client):
+    """A transient vault read failure on the status lookup → 503 (retryable),
+    not a generic 500 (Codex P2 consistency)."""
+    get_status = AsyncMock(
+        side_effect=VaultError(VaultErrorCode.VAULT_DB_QUERY_FAILED, "db down")
+    )
+    rotate = AsyncMock()
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "rotate_credential_key", rotate):
+        resp = client.post(f"{_BASE}/rotate", json={"new_api_key": "grn_x"})
+
+    assert resp.status_code == 503
     rotate.assert_not_awaited()
 
 
