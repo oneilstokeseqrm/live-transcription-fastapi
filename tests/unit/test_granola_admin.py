@@ -589,6 +589,34 @@ def test_connect_lock_setup_failure_is_graceful(client):
     run.assert_not_awaited()
 
 
+def test_connect_reconnect_blocked_while_cycle_in_flight(client):
+    """Reconnect while a stale scheduler cycle still holds the per-credential
+    advisory lock → 409 'sync running'. Reactivating underneath the running
+    cycle would let its terminal last_polled_at write-back clobber the reset
+    and skip notes in the new folder (Codex R7 P1)."""
+    store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
+    get_status = AsyncMock(
+        return_value=_cred_status(status="archived", archived_at=datetime.now(timezone.utc))
+    )
+    reactivate = AsyncMock()
+    # Advisory lock held by an in-flight cycle → pg_try_advisory_lock False.
+    pool = _FakePool(_FakeConn(fetchval_returns=False))
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "reactivate_credential", reactivate):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_new", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 409
+    assert "currently running" in resp.json()["detail"].lower()
+    reactivate.assert_not_awaited()  # never reactivate under a running cycle
+
+
 def test_connect_concurrent_reconnect_race_returns_409(client):
     """A reconnect double-submit: store UNIQUE-fails, status read sees the
     row archived, but reactivate races a concurrent reconnect that already

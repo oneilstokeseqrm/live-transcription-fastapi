@@ -585,36 +585,70 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                 ),
             )
         # Archived row → reconnect: reactivate UPDATEs in place (preserving
-        # the credential UUID so EncryptionContext stays consistent).
-        try:
-            credential_id = await reactivate_credential(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                provider=_PROVIDER,
-                new_api_key=body.api_key,
-                new_config=config,
-                caller_module=_CALLER_MODULE,
-                pool=pool,
-                trace_id=ctx.trace_id,
-            )
-        except VaultError as react_exc:
-            if react_exc.code in (
-                VaultErrorCode.VAULT_DB_INSERT_FAILED,
-                VaultErrorCode.VAULT_DB_NOT_FOUND,
+        # the credential UUID so EncryptionContext stays consistent), resetting
+        # last_polled_at=NULL so the new folder is fully re-scanned.
+        #
+        # Gate the reactivate on the SAME per-credential advisory lock the
+        # scheduler uses (Codex R7 P1): reactivate reuses credential_id, so if
+        # a STALE scheduler cycle is still in flight for this credential, its
+        # terminal last_polled_at write-back would clobber the reset and skip
+        # notes in the newly-selected folder. pg_try_advisory_lock is
+        # non-blocking — if a cycle holds it we 409 ("retry shortly") rather
+        # than reactivate underneath a running cycle or block the request for
+        # the cycle's whole duration. Acquiring it proves no stale cycle is
+        # mid-run, so the reset can't be clobbered.
+        reconnect_lock_key = _advisory_lock_key(existing.id)
+        async with pool.acquire() as lock_conn:
+            if not await lock_conn.fetchval(
+                "SELECT pg_try_advisory_lock($1)", reconnect_lock_key
             ):
-                # Concurrent reconnect race (double-submit / retry): between
-                # our status read and this UPDATE another request reactivated
-                # the row. reactivate then sees it active (INSERT_FAILED='is
-                # active') or already-cleared (NOT_FOUND). Either way the
-                # credential is connected now — 409, not a 500 (Codex R3 P2).
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Granola is already connected. Use /rotate to change "
-                        "the key, or /disconnect first to reconnect a new one."
+                        "A Granola sync is currently running for this "
+                        "connection; please retry in a moment."
                     ),
                 )
-            raise _http_from_vault_error(react_exc)
+            try:
+                credential_id = await reactivate_credential(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    provider=_PROVIDER,
+                    new_api_key=body.api_key,
+                    new_config=config,
+                    caller_module=_CALLER_MODULE,
+                    pool=pool,
+                    trace_id=ctx.trace_id,
+                )
+            except VaultError as react_exc:
+                if react_exc.code in (
+                    VaultErrorCode.VAULT_DB_INSERT_FAILED,
+                    VaultErrorCode.VAULT_DB_NOT_FOUND,
+                ):
+                    # Concurrent reconnect race (double-submit / retry): another
+                    # request reactivated the row first → it's active
+                    # (INSERT_FAILED='is active') or already-cleared (NOT_FOUND).
+                    # Either way the credential is connected now — 409, not 500
+                    # (Codex R3 P2).
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Granola is already connected. Use /rotate to change "
+                            "the key, or /disconnect first to reconnect a new one."
+                        ),
+                    )
+                raise _http_from_vault_error(react_exc)
+            finally:
+                try:
+                    await lock_conn.execute(
+                        "SELECT pg_advisory_unlock($1)", reconnect_lock_key
+                    )
+                except Exception:  # noqa: BLE001 — unlock must not mask the result
+                    logger.exception(
+                        "granola /connect: reconnect advisory unlock failed for "
+                        "credential %s",
+                        existing.id,
+                    )
 
     # --- Save & test (LOCKED-31): one synchronous poll, serialized against
     # the scheduler via the shared per-credential advisory lock. Every failure
