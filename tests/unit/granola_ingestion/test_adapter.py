@@ -1671,6 +1671,81 @@ async def test_run_one_cycle_scenario_c_writes_nothing_when_disconnected_mid_not
 
 
 @pytest.mark.asyncio
+async def test_run_one_cycle_error_path_writes_nothing_when_disconnected_mid_fetch():
+    """Edge #12 (Codex R4 [P2]): if get_note_detail RAISES while the credential
+    is being disconnected, the error handler must NOT record a skipped/failed
+    row for the archived credential — the single post-fetch gate covers the
+    error path too, not just successful fetches."""
+    credential = _build_credential()
+    note = _make_note_summary("not_err_1")
+
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    state = {"active": True}
+
+    async def _raise_and_disconnect(_note_id):
+        state["active"] = False  # /disconnect lands during the failing fetch
+        raise GranolaError(GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND, "gone")
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[note])
+    client.get_note_detail = AsyncMock(side_effect=_raise_and_disconnect)
+    client.aclose = AsyncMock()
+
+    with patch.object(adapter, "_credential_is_active", new=_liveness_gate(state)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())):
+        result = await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    assert result.notes_processed == 0
+    # No skipped/failed row recorded for the disconnected credential.
+    eir_writes = [c for c in conn.execute_calls if "external_integration_runs" in c[0]]
+    assert eir_writes == []
+
+
+@pytest.mark.asyncio
+async def test_reprocess_failed_row_writes_nothing_when_disconnected_mid_fetch():
+    """Edge #12 (Codex R4 [P2]): the reprocess error path is gated too — a
+    /disconnect during a failed-row re-fetch must not record skipped/failed
+    retry state for the archived credential."""
+    credential = _build_credential()
+    failed_row = {
+        "id": uuid4(),
+        "external_id": "not_failed_1",
+        "status": "failed",
+        "granola_note_snapshot": None,
+        "retry_count": 1,
+        "eq_interaction_id": None,
+    }
+    conn = _FakeConn(fetch_returns=[failed_row])
+    pool = _FakePool(conn)
+
+    state = {"active": True}
+
+    async def _raise_and_disconnect(_external_id):
+        state["active"] = False
+        raise GranolaError(GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND, "gone")
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.get_note_detail = AsyncMock(side_effect=_raise_and_disconnect)
+
+    with patch.object(adapter, "_credential_is_active", new=_liveness_gate(state)):
+        await adapter.reprocess_pending_notes(
+            credential=credential,  # type: ignore[arg-type]
+            client=client,
+            pool=pool,  # type: ignore[arg-type]
+            internal_domains=set(),
+        )
+
+    eir_writes = [c for c in conn.execute_calls if "external_integration_runs" in c[0]]
+    assert eir_writes == []
+
+
+@pytest.mark.asyncio
 async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
     """Regression guard for edge #12: credential active the whole cycle → every
     note is processed + published (no behavior change from the guards)."""

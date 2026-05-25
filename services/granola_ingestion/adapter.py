@@ -375,32 +375,27 @@ async def process_note(
             except ValueError:
                 existing_interaction_id = None
 
+    # Fetch the note detail (the one slow external call in the per-note path),
+    # capturing any GranolaError instead of returning immediately — so the
+    # SINGLE Edge #12 liveness gate below covers BOTH the success and error
+    # paths.
+    fetch_error: Optional[GranolaError] = None
+    detail: Optional[GranolaNoteDetail] = None
     try:
         detail = await client.get_note_detail(note_summary.id)
     except GranolaError as exc:
-        return await _handle_note_level_granola_error(
-            exc=exc,
-            credential=credential,
-            note_summary=note_summary,
-            pool=pool,
-            existing=existing,
-        )
+        fetch_error = exc
 
-    decision = await _classify_and_resolve(
-        attendees=detail.attendees,
-        tenant_id=credential.tenant_id,
-        internal_domains=internal_domains,
-    )
-
-    # Edge #12 (Codex R3 [P2]): gate ALL outcome branches, not just the
-    # Scenario A publish. A /disconnect landing during this note's
-    # fetch/classify must prevent EVERY state mutation: the Scenario C
-    # deferred row + pending-approval signals and the Scenario D skip row,
-    # not only the downstream emit. Checking here — after classify, before
-    # the branch — is the single point that precedes all of them (and also
-    # avoids writing the Scenario A ``in_progress`` anchor on abort). The
-    # tighter pre-publish gate in ``_ingest_scenario_a`` remains as the final
-    # guard immediately before the Lane 1/Lane 2 side effect.
+    # Edge #12 (Codex R1/R3/R4): ONE liveness gate right after the note's only
+    # slow external call. get_note_detail is where a /disconnect realistically
+    # lands mid-note; EVERYTHING below it mutates state — the error handler
+    # (skipped/failed rows), the Scenario C deferred row + pending-approval
+    # signals, the Scenario D skip row, and the Scenario A publish. A single
+    # check here gates them all, on BOTH the success and error paths, so an
+    # archived credential records nothing (and the Scenario A in_progress
+    # anchor is never written on abort). The tighter pre-publish gate inside
+    # _ingest_scenario_a remains as the final guard immediately before the
+    # Lane 1/Lane 2 emit; the residual classify window is local, sub-ms work.
     if not await _credential_is_active(
         pool=pool,
         credential_id=credential.id,
@@ -408,11 +403,28 @@ async def process_note(
         user_id=credential.user_id,
     ):
         logger.info(
-            "granola_adapter: credential %s deactivated before classifying "
-            "note %s into an outcome; aborting cycle (no state mutation)",
+            "granola_adapter: credential %s deactivated during note %s fetch; "
+            "aborting cycle (no state mutation)",
             credential.id, note_summary.id,
         )
         raise _CredentialDeactivated(credential.id)
+
+    if fetch_error is not None:
+        return await _handle_note_level_granola_error(
+            exc=fetch_error,
+            credential=credential,
+            note_summary=note_summary,
+            pool=pool,
+            existing=existing,
+        )
+
+    assert detail is not None  # set on the success path (no fetch_error)
+
+    decision = await _classify_and_resolve(
+        attendees=detail.attendees,
+        tenant_id=credential.tenant_id,
+        internal_domains=internal_domains,
+    )
 
     if decision.scenario is Scenario.D_NO_BUSINESS:
         await _record_skipped(
@@ -810,6 +822,21 @@ async def reprocess_pending_notes(
             try:
                 detail = await client.get_note_detail(external_id)
             except GranolaError as exc:
+                # Edge #12 (Codex R4 [P2]): gate the reprocess error path too —
+                # a /disconnect during this re-fetch must not record skipped/
+                # failed retry state for an archived credential.
+                if not await _credential_is_active(
+                    pool=pool,
+                    credential_id=credential.id,
+                    tenant_id=credential.tenant_id,
+                    user_id=credential.user_id,
+                ):
+                    logger.info(
+                        "granola_adapter: credential %s deactivated during "
+                        "reprocess re-fetch; aborting (%d re-processed this cycle)",
+                        credential.id, reprocessed,
+                    )
+                    break
                 if exc.code is GranolaErrorCode.GRANOLA_NOTE_NOT_FOUND:
                     await _record_skipped(
                         pool=pool,
