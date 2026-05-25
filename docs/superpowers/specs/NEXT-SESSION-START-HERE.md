@@ -4,6 +4,8 @@
 **Last session:** 2026-05-25 (Phase 2f — admin endpoints: `routers/granola.py` /validate,/connect,/rotate,/status,/disconnect + vault `get_credential_status`/`archive_credential`. One PR (#29), **9 Codex rounds** all folded; shared `_credential_poll_lock` serializes mutations vs the scheduler; the `/validate`-auth oscillation resolved by SPLITTING bearer-token-vs-pg_user_id).
 **Status:** ✅ **PHASE_2F_SHIPPED + CRON_PINGER_DEFERRED** — admin endpoints merged PR #29 `260b863`, Railway deploy `eb2d4c81` SUCCESS, prod-verified (all 5 routes live + auth-gated; `/health` 200; cron-tick still 401 without the secret; `/text/clean` no regression). The endpoints are LIVE but DORMANT: no credentials connected yet, AND the 5-min cron pinger is NOT wired (user held it for a focused next session).
 
+**Paste-ready opening prompt for the next session:** `docs/superpowers/specs/2026-05-25-next-session-prompt.md` — self-contained: /context-restore checkpoint to load, mandatory reads, verify-state commands, execution order (edge #12 → wire trigger → first /connect E2E → edge #13 → Phase 2g), disciplines, KEY STATE (SHAs/IDs), the 9-round Codex trajectory, and known issues.
+
 ## What's next (this session's scope was endpoints; pinger + E2E deferred)
 
 1. **Wire the 5-min cron trigger** (the "flip the switch" step). User chose Railway cron service originally but it's fiddly (curl-image entrypoint + shell env-expansion + dashboard-only `cronSchedule`); **recommended alt: a GitHub Actions scheduled workflow** (`.github/workflows/granola-cron.yml`, `*/5 * * * *`) POSTing `/internal/granola/cron-tick` with `INTERNAL_CRON_SECRET` (already set in Railway; add it to GitHub Actions secrets). Decide approach WITH the user.
