@@ -321,8 +321,8 @@ async def test_get_note_detail_happy_path():
                 "transcript": [
                     {
                         "text": "Hello.",
-                        "start_time": 0.0,
-                        "end_time": 1.2,
+                        "start_time": "2026-05-24T07:05:00.000Z",
+                        "end_time": "2026-05-24T07:05:01.200Z",
                         "speaker": {"source": "microphone"},
                     }
                 ],
@@ -349,6 +349,53 @@ async def test_get_note_detail_happy_path():
     assert detail.calendar_event.id == "evt_xyz"
     assert detail.transcript[0].speaker == {"source": "microphone"}
     assert detail.web_url == "https://granola.ai/notes/not_1"
+
+
+@pytest.mark.asyncio
+async def test_get_note_detail_parses_iso_string_transcript_times():
+    """Regression (first real /connect E2E, 2026-05-25): Granola's public API
+    returns transcript-turn ``start_time``/``end_time`` as ISO-8601 datetime
+    STRINGS, not floats. A real 445-turn note produced exactly 890
+    ``GRANOLA_PARSE_ERROR`` validation errors (2 per turn) because
+    ``TranscriptTurn`` modeled them as ``Optional[float]``. The fields are
+    typed ``Optional[str]`` so the real shape parses cleanly; they are not
+    consumed downstream (only ``text`` + ``speaker`` are rendered)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "not_iso",
+                "created_at": "2026-04-02T20:31:58Z",
+                "transcript": [
+                    {
+                        "text": "What up?",
+                        "start_time": "2026-04-02T20:31:58.289Z",
+                        "end_time": "2026-04-02T20:31:58.609Z",
+                        "speaker": {"source": "microphone"},
+                    },
+                    {
+                        "text": "Not much.",
+                        "start_time": "2026-04-02T20:32:01.100Z",
+                        "end_time": "2026-04-02T20:32:02.000Z",
+                        "speaker": {"source": "speaker"},
+                    },
+                ],
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        detail = await client.get_note_detail("not_iso")
+    finally:
+        await client.aclose()
+
+    assert isinstance(detail, GranolaNoteDetail)
+    assert len(detail.transcript) == 2
+    assert detail.transcript[0].text == "What up?"
+    assert detail.transcript[0].start_time == "2026-04-02T20:31:58.289Z"
+    assert detail.transcript[0].end_time == "2026-04-02T20:31:58.609Z"
+    assert detail.transcript[1].speaker == {"source": "speaker"}
 
 
 # ---------------------------------------------------------------------------
