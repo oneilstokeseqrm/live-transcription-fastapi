@@ -426,6 +426,26 @@ async def process_note(
         internal_domains=internal_domains,
     )
 
+    # Edge #12 (Codex R5 [P2]): SECOND gate after classification. The post-fetch
+    # gate above covers get_note_detail, but _classify_and_resolve itself awaits
+    # per-domain account lookups — a real DB window. A /disconnect landing there
+    # must still abort before the outcome writes (Scenario C → _defer_pending_account
+    # writes a deferred row + pending-approval signals; Scenario D → a skip row).
+    # The two gates cover the two distinct async awaits in this path; the
+    # reprocess path keeps the same post-classify gate.
+    if not await _credential_is_active(
+        pool=pool,
+        credential_id=credential.id,
+        tenant_id=credential.tenant_id,
+        user_id=credential.user_id,
+    ):
+        logger.info(
+            "granola_adapter: credential %s deactivated during classification of "
+            "note %s; aborting cycle (no state mutation)",
+            credential.id, note_summary.id,
+        )
+        raise _CredentialDeactivated(credential.id)
+
     if decision.scenario is Scenario.D_NO_BUSINESS:
         await _record_skipped(
             pool=pool,

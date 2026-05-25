@@ -1671,6 +1671,55 @@ async def test_run_one_cycle_scenario_c_writes_nothing_when_disconnected_mid_not
 
 
 @pytest.mark.asyncio
+async def test_run_one_cycle_scenario_c_writes_nothing_when_disconnected_during_classify():
+    """Edge #12 (Codex R5 [P2]): a /disconnect during the account-lookup step of
+    classification (AFTER a successful detail fetch) on a Scenario C note must
+    still abort before _defer_pending_account writes. The post-classify gate
+    covers the classify window, which the post-fetch gate alone does not."""
+    credential = _build_credential()
+    note = _make_note_summary("not_c2_1")
+    detail = _make_note_detail(note_id="not_c2_1", attendees=[Attendee(email="zoe@unknown-biz.com")])
+
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    state = {"active": True}
+
+    async def _lookup_then_disconnect(*, session, tenant_id, domain):
+        state["active"] = False  # /disconnect lands during the account lookup
+        return None  # unknown domain → Scenario C
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[note])
+    client.get_note_detail = AsyncMock(return_value=detail)
+    client.aclose = AsyncMock()
+
+    queue_mock = AsyncMock(return_value=[])  # must NOT be called
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "_credential_is_active", new=_liveness_gate(state)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(side_effect=_lookup_then_disconnect)), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_queue_unknown_domain_signals", new=queue_mock):
+        result = await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    assert result.notes_processed == 0
+    queue_mock.assert_not_called()
+    deferred_upserts = [
+        c for c in conn.execute_calls
+        if "external_integration_runs" in c[0] and "deferred_pending_account" in c[1]
+    ]
+    assert deferred_upserts == []
+
+
+@pytest.mark.asyncio
 async def test_run_one_cycle_error_path_writes_nothing_when_disconnected_mid_fetch():
     """Edge #12 (Codex R4 [P2]): if get_note_detail RAISES while the credential
     is being disconnected, the error handler must NOT record a skipped/failed
