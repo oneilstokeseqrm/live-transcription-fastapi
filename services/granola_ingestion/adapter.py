@@ -392,6 +392,28 @@ async def process_note(
         internal_domains=internal_domains,
     )
 
+    # Edge #12 (Codex R3 [P2]): gate ALL outcome branches, not just the
+    # Scenario A publish. A /disconnect landing during this note's
+    # fetch/classify must prevent EVERY state mutation: the Scenario C
+    # deferred row + pending-approval signals and the Scenario D skip row,
+    # not only the downstream emit. Checking here — after classify, before
+    # the branch — is the single point that precedes all of them (and also
+    # avoids writing the Scenario A ``in_progress`` anchor on abort). The
+    # tighter pre-publish gate in ``_ingest_scenario_a`` remains as the final
+    # guard immediately before the Lane 1/Lane 2 side effect.
+    if not await _credential_is_active(
+        pool=pool,
+        credential_id=credential.id,
+        tenant_id=credential.tenant_id,
+        user_id=credential.user_id,
+    ):
+        logger.info(
+            "granola_adapter: credential %s deactivated before classifying "
+            "note %s into an outcome; aborting cycle (no state mutation)",
+            credential.id, note_summary.id,
+        )
+        raise _CredentialDeactivated(credential.id)
+
     if decision.scenario is Scenario.D_NO_BUSINESS:
         await _record_skipped(
             pool=pool,
@@ -828,6 +850,23 @@ async def reprocess_pending_notes(
             tenant_id=credential.tenant_id,
             internal_domains=internal_domains,
         )
+
+        # Edge #12 (Codex R3 [P2]): gate all reprocess outcome branches too
+        # (Scenario C re-defer + signals, Scenario D skip, Scenario A
+        # re-promotion) — a /disconnect during this row's re-fetch/classify
+        # must not mutate state.
+        if not await _credential_is_active(
+            pool=pool,
+            credential_id=credential.id,
+            tenant_id=credential.tenant_id,
+            user_id=credential.user_id,
+        ):
+            logger.info(
+                "granola_adapter: credential %s deactivated during reprocess "
+                "classify; aborting (%d re-processed this cycle)",
+                credential.id, reprocessed,
+            )
+            break
 
         if decision.scenario is Scenario.A_KNOWN_ANCHOR:
             # Reuse the prior interaction_id (if present) so a retry of
