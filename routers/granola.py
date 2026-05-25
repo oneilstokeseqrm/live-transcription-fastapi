@@ -44,6 +44,8 @@ import asyncpg
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from middleware.jwt_auth import extract_bearer_token
+
 from services.asyncpg_pool import get_asyncpg_pool
 from services.granola_ingestion.adapter import run_one_cycle
 from services.granola_ingestion.api_client import GranolaAPIClient
@@ -179,7 +181,13 @@ def _http_from_vault_error(exc: VaultError) -> HTTPException:
         return HTTPException(
             status_code=502, detail="Credential encryption service error; please retry."
         )
-    if code is VaultErrorCode.VAULT_DB_QUERY_FAILED:
+    if code in (
+        VaultErrorCode.VAULT_DB_QUERY_FAILED,
+        # The audit insert / audit-connection acquire failed; the credential
+        # write transaction was rolled back, so retrying is the right move —
+        # 503, not a permanent-looking 500 (Codex R6 P2).
+        VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED,
+    ):
         return HTTPException(
             status_code=503, detail="Temporary storage error; please retry."
         )
@@ -465,20 +473,24 @@ async def validate_granola_key(body: ValidateRequest, request: Request) -> dict:
     the wizard can render inline messaging without treating a bad key as a
     transport error.
     """
-    # Auth gate: get_auth_context_polling requires a verified JWT in
-    # production (ALLOW_LEGACY_HEADER_AUTH is off), which is the right bar for
-    # this stateless route. We deliberately do NOT call _resolve_identity:
-    # /validate never touches vault.user_credentials, and pg_user_id is an
-    # OPTIONAL JWT claim (middleware/jwt_auth.py) — requiring it would reject
-    # valid production JWTs that omit it.
+    # Auth: /validate must be reached only with a VERIFIED JWT — it proxies a
+    # call to Granola with a caller-supplied key, so it can't be an
+    # unauthenticated probe surface. But it is STATELESS (never touches
+    # vault.user_credentials), so it must NOT require the optional pg_user_id
+    # claim the mutation routes need. We resolve that by requiring a bearer
+    # token explicitly: with a token present, get_auth_context_polling
+    # verifies the JWT; with none, we 401 here BEFORE the legacy-header
+    # fallback can run — so /validate is JWT-only even when
+    # ALLOW_LEGACY_HEADER_AUTH=true, without depending on pg_user_id.
     #
-    # (Codex review trajectory: R4 flagged that /validate could be reached via
-    # legacy headers and added a _resolve_identity gate; R5 flagged that
-    # gate rejects valid pg_user_id-less JWTs in prod. Frozen here on plain
-    # JWT auth — prod requires a JWT, and a stateless key-check doesn't need
-    # the DB-only pg_user_id claim. The MUTATION routes below DO require
-    # pg_user_id via _resolve_identity, which is where JWT-only enforcement
-    # actually protects credential writes.)
+    # (Codex trajectory: R4 wanted legacy blocked → added _resolve_identity;
+    # R5 flagged that rejects valid pg_user_id-less JWTs; R6 re-flagged the
+    # legacy surface. This bearer-token gate resolves all three at once —
+    # JWT required, pg_user_id not — rather than freezing on one side.)
+    if not extract_bearer_token(request.headers.get("Authorization")):
+        raise HTTPException(
+            status_code=401, detail="Authorization required: Bearer token expected"
+        )
     get_auth_context_polling(request)
 
     client = GranolaAPIClient(api_key=body.api_key)

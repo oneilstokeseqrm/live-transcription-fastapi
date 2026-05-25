@@ -51,6 +51,18 @@ _BASE = "/integrations/granola"
 
 @pytest.fixture
 def client():
+    """Carries a default bearer token so /validate's JWT gate passes; the
+    happy-path tests patch get_auth_context_polling so the token isn't
+    actually verified."""
+    app = FastAPI()
+    app.include_router(granola.router)
+    return TestClient(app, headers={"Authorization": "Bearer test-token"})
+
+
+@pytest.fixture
+def noauth_client():
+    """No default Authorization header — for exercising the unauthenticated
+    401 paths (missing-JWT / legacy-without-bearer)."""
     app = FastAPI()
     app.include_router(granola.router)
     return TestClient(app)
@@ -234,11 +246,23 @@ def test_validate_empty_api_key_rejected_422(client):
     assert resp.status_code == 422
 
 
-def test_validate_requires_auth_401(client, monkeypatch):
-    """No JWT + legacy header auth disabled → 401 (route is gated)."""
+def test_validate_requires_auth_401(noauth_client, monkeypatch):
+    """No bearer token → 401 (route is gated)."""
     monkeypatch.delenv("ALLOW_LEGACY_HEADER_AUTH", raising=False)
     # Do NOT patch get_auth_context_polling — exercise the real gate.
-    resp = client.post(f"{_BASE}/validate", json={"api_key": "grn_test"})
+    resp = noauth_client.post(f"{_BASE}/validate", json={"api_key": "grn_test"})
+    assert resp.status_code == 401
+
+
+def test_validate_rejects_legacy_header_request_without_bearer(noauth_client):
+    """Even if legacy header auth WOULD resolve, /validate requires a bearer
+    token (JWT), so it can't be reached via X-Tenant-ID/X-User-ID headers when
+    ALLOW_LEGACY_HEADER_AUTH=true (Codex R4/R6). The bearer gate fires BEFORE
+    get_auth_context_polling, so even a patched (would-succeed) auth helper is
+    never reached."""
+    auth = patch.object(granola, "get_auth_context_polling", MagicMock(return_value=_ctx()))
+    with auth:
+        resp = noauth_client.post(f"{_BASE}/validate", json={"api_key": "grn_test"})
     assert resp.status_code == 401
 
 
@@ -718,6 +742,20 @@ def test_rotate_archived_credential_returns_404(client):
     rotate.assert_not_awaited()
 
 
+def test_http_from_vault_error_maps_audit_failure_to_503():
+    """A vault audit-log write failure is transient (write txn rolled back) →
+    503, not a generic 500 (Codex R6 P2)."""
+    http = granola._http_from_vault_error(
+        VaultError(VaultErrorCode.VAULT_AUDIT_LOG_WRITE_FAILED, "audit down")
+    )
+    assert http.status_code == 503
+    # The query-failed code keeps mapping to 503 too.
+    http2 = granola._http_from_vault_error(
+        VaultError(VaultErrorCode.VAULT_DB_QUERY_FAILED, "db down")
+    )
+    assert http2.status_code == 503
+
+
 def test_rotate_status_read_failure_maps_to_503(client):
     """A transient vault read failure on the status lookup → 503 (retryable),
     not a generic 500 (Codex P2 consistency)."""
@@ -907,7 +945,7 @@ def test_disconnect_archive_failure_maps_to_http(client):
     assert resp.status_code == 503
 
 
-def test_disconnect_requires_auth_401(client, monkeypatch):
+def test_disconnect_requires_auth_401(noauth_client, monkeypatch):
     monkeypatch.delenv("ALLOW_LEGACY_HEADER_AUTH", raising=False)
-    resp = client.delete(_BASE)
+    resp = noauth_client.delete(_BASE)
     assert resp.status_code == 401
