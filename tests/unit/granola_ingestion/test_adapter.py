@@ -1850,6 +1850,60 @@ async def test_run_one_cycle_skips_success_bookkeeping_on_mid_cycle_deactivation
 
 
 @pytest.mark.asyncio
+async def test_run_one_cycle_skips_success_bookkeeping_when_deactivated_during_reprocess():
+    """Edge #12 (Codex R7 [P2]): if the credential deactivates DURING the
+    reprocess pass (not the main note loop), the cycle must still skip the
+    success UPDATE. reprocess breaks internally without signalling abort, so
+    run_one_cycle re-checks liveness right before the success bookkeeping."""
+    credential = _build_credential()
+    failed_row = {
+        "id": uuid4(),
+        "external_id": "not_rp_1",
+        "status": "failed",
+        "granola_note_snapshot": None,
+        "retry_count": 1,
+        "eq_interaction_id": None,
+    }
+    detail = _make_note_detail(note_id="not_rp_1", attendees=[Attendee(email="bob@bigco.com")])
+
+    # No main-loop notes; one pending (failed) row to reprocess.
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[failed_row])
+    pool = _FakePool(conn)
+
+    state = {"active": True}
+
+    async def _fetch_then_deactivate(_external_id):
+        state["active"] = False  # deactivation lands during the reprocess re-fetch
+        return detail
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[])
+    client.get_note_detail = AsyncMock(side_effect=_fetch_then_deactivate)
+    client.aclose = AsyncMock()
+
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "_credential_is_active", new=_liveness_gate(state)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "process", new=AsyncMock()):
+        await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    success_marks = [
+        c for c in conn.execute_calls
+        if "last_polled_at = $4" in c[0] and "consecutive_failures = 0" in c[0]
+    ]
+    assert success_marks == []
+
+
+@pytest.mark.asyncio
 async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
     """Regression guard for edge #12: credential active the whole cycle → every
     note is processed + published (no behavior change from the guards)."""

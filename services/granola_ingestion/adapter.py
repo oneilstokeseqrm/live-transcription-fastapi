@@ -329,9 +329,28 @@ async def run_one_cycle(
                 internal_domains=internal_domains,
             )
 
-            await _mark_credential_polled_success(
-                credential=credential, pool=pool, last_polled_at=cycle_start_at
-            )
+            # Edge #12 (Codex R7 [P2]): the reprocess pass can itself abort on a
+            # mid-pass deactivation (it breaks internally + returns a count, not
+            # an abort signal). Re-check liveness immediately before the success
+            # UPDATE — the cycle's last mutation — so a credential deactivated
+            # DURING reprocess (or between the note loop and here) does not get
+            # last_error cleared / consecutive_failures reset / last_polled_at
+            # advanced.
+            if await _credential_is_active(
+                pool=pool,
+                credential_id=credential.id,
+                tenant_id=credential.tenant_id,
+                user_id=credential.user_id,
+            ):
+                await _mark_credential_polled_success(
+                    credential=credential, pool=pool, last_polled_at=cycle_start_at
+                )
+            else:
+                logger.info(
+                    "granola_adapter: credential %s deactivated by end of cycle; "
+                    "skipping success bookkeeping",
+                    credential.id,
+                )
     finally:
         if owned_client:
             await client.aclose()
