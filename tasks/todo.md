@@ -60,8 +60,12 @@ NOTE: closing #12 means the per-endpoint `_credential_poll_lock` gates become be
       recheck in run_one_cycle main loop + reprocess pass. 5 new tests. Full unit suite 496 pass /
       1 pre-existing failure / 0 regressions. 0 envelope contract drift (script exit-1 is pre-existing
       stale-rule-registry noise, proven via stash test — unrelated to this change).
-- [ ] §1 Codex pre-merge gate (next)
-- [ ] §1 open PR (user authorizes merge)
-- [ ] §2 wire EventBridge Scheduler trigger + infra manifest
+- [x] §1 Codex pre-merge gate — 8 rounds. R1-R7 folded (each a real narrowing bug; gate passed/no-P1 from R2 on);
+      R6#2 declined (reconnect-generation race is lock-prevented — both run_one_cycle callers hold the advisory
+      lock, reactivate is gated on it); R8 residual (sub-ms window inside _defer_pending_account) ship+ticketed by
+      user. 11 new tests; 504 unit pass / 1 pre-existing failure / 0 regressions; 0 envelope contract drift.
+      Final gate state: PASS. Deferred items ticketed as plan §2.1 #14 (defer-path atomicity) + #15 (generation token).
+- [~] §1 push branch + open PR (user-authorized 2026-05-25; in progress — NOT merge, that's separate per-action auth)
+- [ ] §2 wire EventBridge Scheduler trigger + infra manifest (docs/infrastructure/granola-eventbridge-scheduler.md)
 - [ ] §3 first real /connect E2E
 - [ ] §4 edge #13

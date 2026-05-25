@@ -3081,4 +3081,80 @@ unresolvable ambiguity. Same trigger (repeated flips), opposite fix — diagnose
 which before acting. [[feedback-codex-pre-merge-gate]] — both bound the soft cap.
 
 
+## "Gate before every mutation" converges by exhausting sites; STOP at the benign-sub-window floor (2026-05-25)
+
+### Lesson
+
+When the fix is "add a liveness/precondition check before a side effect," Codex
+review will walk you through EVERY site that side-effect class can occur, one
+round at a time — and the findings narrow in blast radius each round. This is
+healthy convergence (not oscillation: the reviewer is consistent, you're adding
+coverage). But it has a FLOOR: eventually the only remaining windows are
+sub-millisecond gaps between a check and an awaited write *inside* a mutation
+function, producing benign/self-healing local rows. Closing those needs the
+check and the write to be ATOMIC (one transaction conditioned on the
+precondition), which is often a disproportionate refactor. At that floor: STOP,
+ship, and ticket the atomic version as hardening.
+
+### Why
+
+2026-05-25 edge #12 (granola adapter `archived_at`-awareness) ran 8 Codex rounds.
+The gate PASSED (no P1) from R2 onward; every round found a real, reachable, but
+progressively smaller bug as I added a `_credential_is_active` gate at each async
+window:
+- R1 downstream publish (serious) → R2 `list_notes` upstream call (moderate) →
+  R3 Scenario C/D local writes (minor) → R4 error-path rows (trivial) →
+  R6#1 revoked fall-through clearing `last_error` (real) → R7 reprocess-pass
+  success bookkeeping (real) → R8 sub-ms window INSIDE `_defer_pending_account`'s
+  own awaited writes (benign, self-healing).
+- R8 is the floor: between the gate and the defer-function's `await`s a
+  disconnect can land, but the writes are local + self-healing, and closing it
+  needs transactional gate+write atomicity across a table shared with another
+  service. Shipped + ticketed (plan §2.1 #14) rather than chase the infinite
+  regress (the next finding would be "but during `_record_deferred`'s await…").
+
+Two sub-lessons surfaced:
+
+1. **An "elegant consolidation" that REMOVES a guard is a regression if the
+   removed guard covered a distinct window.** R4 replaced the post-classify gate
+   with a single post-fetch gate ("cleaner"). R5 caught that
+   `_classify_and_resolve` itself `await`s account-lookup DB queries — a separate
+   window the post-fetch gate doesn't cover. Two distinct `await`s
+   (`get_note_detail`, classify lookups) need two gates. Restored it. Consolidate
+   only when the removed gate's window is genuinely a subset of the kept one's.
+
+2. **Codex reviews the diff in isolation and can't see cross-file invariants.**
+   R6#2 flagged a reconnect-generation race that is structurally PREVENTED by the
+   per-credential advisory lock both `run_one_cycle` callers hold (and that
+   `reactivate_credential` is gated on). Declined + documented in the code so the
+   next reviewer/run sees it's deliberate — same posture as the dead-code-pooler
+   FREEZE lesson.
+
+### How to apply
+
+1. **Recognize the pattern early:** if round N+1 finds "the same class of write,
+   one site over," you're walking sites, not chasing a moving bug. Keep folding
+   while blast radius is non-trivial; the gate is doing real work.
+2. **Name the floor:** the first finding whose fix is "make a check+write atomic
+   for a benign/self-healing local mutation in a sub-ms window" is the
+   ship+ticket point. Surface to the user with the trajectory table + blast-radius
+   column; recommend ship.
+3. **Before consolidating gates, prove the removed gate's window ⊆ the kept
+   gate's window.** Each distinct `await` between a gate and a mutation is its own
+   window. Removing a gate that sits after a distinct `await` reopens that window.
+4. **When Codex flags a race prevented by a cross-file lock/invariant it can't
+   see, decline + document in-code** (cite the lock + the caller that holds it),
+   and ticket a generation/defense-in-depth token only if a future caller could
+   bypass the lock.
+
+### Related
+
+[[codex-oscillates-on-dead-code-edge-cases]] + [[codex-oscillation-from-conflated-concerns]]
+— those are about FLIPPING reviews (freeze / split). This is about NON-flipping,
+genuinely-narrowing reviews that converge by site-exhaustion — keep folding until
+the benign-sub-window floor, then ship+ticket. [[feedback-codex-pre-merge-gate]]
+— the soft cap EXTENDS while blast radius stays non-trivial; the floor (not a
+round count) is the real stop signal here (8 rounds, all real).
+
+
 
