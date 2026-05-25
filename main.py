@@ -33,6 +33,7 @@ from routers import text
 from routers import upload
 from routers import queue_actions
 from routers import granola_cron
+from routers import granola
 from routers.upload import reap_stuck_jobs
 from services.asyncpg_pool import close_asyncpg_pool
 
@@ -193,6 +194,7 @@ app.include_router(text.router, prefix="/text", tags=["text"])
 app.include_router(upload.router)
 app.include_router(queue_actions.router)
 app.include_router(granola_cron.router)
+app.include_router(granola.router)
 
 dg_client = Deepgram(os.getenv('DEEPGRAM_API_KEY'))
 event_publisher = EventPublisher()
