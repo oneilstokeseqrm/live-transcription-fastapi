@@ -65,7 +65,8 @@ NOTE: closing #12 means the per-endpoint `_credential_poll_lock` gates become be
       lock, reactivate is gated on it); R8 residual (sub-ms window inside _defer_pending_account) ship+ticketed by
       user. 11 new tests; 504 unit pass / 1 pre-existing failure / 0 regressions; 0 envelope contract drift.
       Final gate state: PASS. Deferred items ticketed as plan §2.1 #14 (defer-path atomicity) + #15 (generation token).
-- [~] §1 push branch + open PR (user-authorized 2026-05-25; in progress — NOT merge, that's separate per-action auth)
-- [ ] §2 wire EventBridge Scheduler trigger + infra manifest (docs/infrastructure/granola-eventbridge-scheduler.md)
-- [ ] §3 first real /connect E2E
+- [x] §1 PR #30 opened, user-authorized merge → squash-merged `06415fa`, Railway `c252ddda` SUCCESS, prod-verified
+      (/health 200, /validate 401, /status 400, cron-tick 401, /text/clean 422 — no regression). EDGE #12 DONE.
+- [ ] §2 wire EventBridge Scheduler trigger + infra manifest (docs/infrastructure/granola-eventbridge-scheduler.md) — NEXT
+- [ ] §3 first real /connect E2E (interactive — needs Peter's Granola key)
 - [ ] §4 edge #13
