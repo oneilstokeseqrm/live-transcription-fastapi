@@ -1621,6 +1621,44 @@ async def test_run_one_cycle_skips_granola_api_when_disconnected_before_listing(
 
 
 @pytest.mark.asyncio
+async def test_run_one_cycle_skips_detail_fetch_when_disconnected_during_idempotency_lookup():
+    """Edge #12 (Codex R9 [P2]): a /disconnect landing during process_note's
+    idempotency lookup (_get_integration_run) — after the loop-top check but
+    before get_note_detail — must NOT fire the per-note Granola detail API call."""
+    credential = _build_credential()
+    note = _make_note_summary("not_idem_1")
+
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    state = {"active": True}
+
+    async def _idempotency_then_disconnect(**_kwargs):
+        state["active"] = False  # /disconnect lands during the idempotency lookup
+        return None
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[note])
+    client.get_note_detail = AsyncMock()  # must NOT be called
+    client.aclose = AsyncMock()
+
+    process_mock = AsyncMock()
+    with patch.object(adapter, "_credential_is_active", new=_liveness_gate(state)), \
+         patch.object(adapter, "_get_integration_run", new=AsyncMock(side_effect=_idempotency_then_disconnect)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(text_clean_service, "process", new=process_mock):
+        result = await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    assert result.notes_processed == 0
+    client.get_note_detail.assert_not_called()
+    process_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_run_one_cycle_scenario_c_writes_nothing_when_disconnected_mid_note():
     """Edge #12 (Codex R3 [P2]): a /disconnect during a note that classifies to
     Scenario C (unknown business domain) must NOT write the deferred row or

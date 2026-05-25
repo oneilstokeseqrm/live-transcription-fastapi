@@ -413,6 +413,25 @@ async def process_note(
             except ValueError:
                 existing_interaction_id = None
 
+    # Edge #12 (Codex R9 [P2]): gate BEFORE the per-note Granola API call. The
+    # cycle's loop-top check ran before this function, but `_get_integration_run`
+    # above is an awaited DB lookup — a /disconnect landing in that window would
+    # otherwise let `get_note_detail` fire a Granola request with the
+    # just-disconnected key. Re-check here so a disconnected credential makes no
+    # per-note API call either (mirrors the pre-`list_notes` gate in run_one_cycle).
+    if not await _credential_is_active(
+        pool=pool,
+        credential_id=credential.id,
+        tenant_id=credential.tenant_id,
+        user_id=credential.user_id,
+    ):
+        logger.info(
+            "granola_adapter: credential %s deactivated before note %s detail "
+            "fetch; aborting cycle (no Granola API call)",
+            credential.id, note_summary.id,
+        )
+        raise _CredentialDeactivated(credential.id)
+
     # Fetch the note detail (the one slow external call in the per-note path),
     # capturing any GranolaError instead of returning immediately — so the
     # SINGLE Edge #12 liveness gate below covers BOTH the success and error
