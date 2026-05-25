@@ -75,15 +75,21 @@ class TranscriptTurn(BaseModel):
     Returned by ``GET /v1/notes/{id}?include=transcript``. ``speaker``
     is the audio-source label (``microphone`` for the API key holder;
     ``speaker`` for everything else) — Granola does not name-resolve
-    turns. ``start_time`` / ``end_time`` are seconds from the start of
-    the recording.
+    turns. ``start_time`` / ``end_time`` are ISO-8601 wall-clock
+    timestamp STRINGS (e.g. ``"2026-04-02T20:31:58.289Z"``), NOT floats
+    — verified against the live public API during the first real
+    ``/connect`` E2E (2026-05-25): a 445-turn note produced exactly 890
+    ``GRANOLA_PARSE_ERROR`` validation errors (2 per turn) when these
+    were typed ``Optional[float]``. They are kept as ``Optional[str]``
+    (the raw upstream value) and are NOT consumed downstream — only
+    ``text`` + ``speaker`` are rendered (see ``adapter._render_transcript_turns``).
     """
 
     model_config = ConfigDict(extra="allow")
 
     text: str
-    start_time: Optional[float] = None
-    end_time: Optional[float] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
     speaker: Optional[dict] = None  # {"source": "microphone" | "speaker"}
 
 
