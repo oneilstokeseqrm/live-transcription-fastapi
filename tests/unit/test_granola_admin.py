@@ -410,6 +410,59 @@ def test_connect_first_poll_folder_error_reports_error_status(client):
     assert body["error_code"] == "granola_folder_not_found"
 
 
+def test_connect_first_poll_transient_error_stays_connected(client):
+    """A transient first-poll error (429/5xx/timeout) leaves the credential
+    'active' in the adapter (retries until the threshold); the connection
+    must report 'connected', not a broken 'error' (Codex R3 P2)."""
+    store = AsyncMock()
+    load = AsyncMock(return_value=MagicMock())
+    run = AsyncMock(return_value=_cycle(credential_error_code="granola_5xx"))
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "run_one_cycle", run):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_test", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "connected"  # NOT "error"
+    assert body["ok"] is False  # the poll itself didn't fully succeed
+    assert body["error_code"] == "granola_5xx"
+    assert body["first_poll"]["errors"] == 1
+
+
+def test_connect_concurrent_reconnect_race_returns_409(client):
+    """A reconnect double-submit: store UNIQUE-fails, status read sees the
+    row archived, but reactivate races a concurrent reconnect that already
+    flipped it active → 409, not a 500 (Codex R3 P2)."""
+    store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
+    get_status = AsyncMock(
+        return_value=_cred_status(status="archived", archived_at=datetime.now(timezone.utc))
+    )
+    # The other request won the race: reactivate's own check sees it active.
+    reactivate = AsyncMock(
+        side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "is active")
+    )
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "reactivate_credential", reactivate):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_new", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 409
+    assert "already connected" in resp.json()["detail"].lower()
+
+
 def test_connect_first_poll_raise_is_graceful(client):
     """If run_one_cycle raises (infra error), the credential is still saved;
     connect returns ok:false + first_poll_failed rather than a 500."""
@@ -462,6 +515,24 @@ def test_connect_non_uuid_pg_user_returns_400(client):
             json={"api_key": "grn_test", "folder_id": "fol_eq"},
         )
     assert resp.status_code == 400
+
+
+def test_connect_does_not_fall_back_to_auth0_user_id(client):
+    """Even when user_id is UUID-shaped, a missing pg_user_id must 400 — we
+    never bind a credential to the Auth0 subject (Codex R3 P1)."""
+    store = AsyncMock()
+    # pg_user_id absent; user_id is a valid UUID string (the dangerous case
+    # the old `pg_user_id or user_id` fallback would have silently accepted).
+    bad_ctx = _ctx(pg_user=None, user_id=str(uuid4()))
+    auth = patch.object(granola, "get_auth_context_polling", MagicMock(return_value=bad_ctx))
+    pool = patch.object(granola, "get_asyncpg_pool", AsyncMock(return_value=_FakePool()))
+    with auth, pool, patch.object(granola, "store_credential", store):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_test", "folder_id": "fol_eq"},
+        )
+    assert resp.status_code == 400
+    store.assert_not_awaited()  # rejected before any mutation
 
 
 # ---------------------------------------------------------------------------

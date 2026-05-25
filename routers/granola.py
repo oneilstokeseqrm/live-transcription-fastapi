@@ -132,14 +132,24 @@ def _resolve_identity(ctx) -> tuple[UUID, UUID]:
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(status_code=400, detail="tenant_id is not a valid UUID")
 
-    candidate = ctx.pg_user_id or ctx.user_id
-    try:
-        user_uuid = UUID(candidate)
-    except (ValueError, AttributeError, TypeError):
+    # Bind to the JWT's Postgres UUID (pg_user_id). Do NOT fall back to
+    # ctx.user_id (the Auth0 subject): vault.user_credentials.user_id is a FK
+    # to users.id, so binding a credential to anything but the real Postgres
+    # user id is a tenant-safety hazard (Codex R3 P1). Only the verified-JWT
+    # path populates pg_user_id, so REQUIRING it also enforces the Phase 2f
+    # "JWT-authed" contract even where ALLOW_LEGACY_HEADER_AUTH is enabled —
+    # a legacy-header request carries no pg_user_id and is rejected here with
+    # 400 before any credential mutation runs.
+    pg_user_id = getattr(ctx, "pg_user_id", None)
+    if not pg_user_id:
         raise HTTPException(
             status_code=400,
-            detail="this endpoint requires a UUID-shaped user identifier (pg_user_id)",
+            detail="this endpoint requires a verified JWT carrying pg_user_id",
         )
+    try:
+        user_uuid = UUID(pg_user_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="pg_user_id is not a valid UUID")
     return tenant_uuid, user_uuid
 
 
@@ -358,6 +368,22 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                 trace_id=ctx.trace_id,
             )
         except VaultError as react_exc:
+            if react_exc.code in (
+                VaultErrorCode.VAULT_DB_INSERT_FAILED,
+                VaultErrorCode.VAULT_DB_NOT_FOUND,
+            ):
+                # Concurrent reconnect race (double-submit / retry): between
+                # our status read and this UPDATE another request reactivated
+                # the row. reactivate then sees it active (INSERT_FAILED='is
+                # active') or already-cleared (NOT_FOUND). Either way the
+                # credential is connected now — 409, not a 500 (Codex R3 P2).
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Granola is already connected. Use /rotate to change "
+                        "the key, or /disconnect first to reconnect a new one."
+                    ),
+                )
             raise _http_from_vault_error(react_exc)
 
     # --- Save & test: load (decrypt round-trip) + one synchronous cycle ----
@@ -433,17 +459,21 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
             + (1 if cycle.credential_error_code else 0)
         ),
     }
-    # A credential-level error in the first poll (bad key slipped past
-    # validate, deleted folder, sustained outage) flips the credential
-    # inside run_one_cycle. Mirror the adapter's lifecycle mapping so the
-    # response reports the REAL state (auth failure → 'revoked', everything
-    # else → 'error') rather than collapsing all errors to 'error' and
-    # driving the wrong reconnect banner (Codex P3).
-    if cycle.credential_error_code == GranolaErrorCode.GRANOLA_AUTH_FAILED.value:
+    # Report the credential's REAL post-poll lifecycle by mirroring the
+    # adapter's credential-level branch table (Codex P3 + R3 P2). The adapter
+    # marks the credential terminally ONLY for auth failure ('revoked') and
+    # folder-not-found ('error'); every OTHER credential error (429, 5xx,
+    # timeout, parse, http) is TRANSIENT — it bumps consecutive_failures but
+    # leaves status='active' until the 3-cycle threshold, and the scheduler
+    # keeps retrying. So a transient first-poll blip must report the
+    # connection as still 'connected', not a broken 'error'.
+    err = cycle.credential_error_code
+    if err == GranolaErrorCode.GRANOLA_AUTH_FAILED.value:
         connected_status = "revoked"
-    elif cycle.credential_error_code:
+    elif err == GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND.value:
         connected_status = "error"
     else:
+        # None (clean) OR a transient credential error → credential is active.
         connected_status = "connected"
     return {
         "ok": cycle.credential_error_code is None,
