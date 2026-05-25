@@ -119,6 +119,19 @@ _PER_NOTE_RETRY_LIMIT = 5
 _STATUS_IN_PROGRESS = "in_progress"
 
 
+class _CredentialDeactivated(Exception):
+    """Raised mid-cycle when the credential is found archived/deactivated.
+
+    Edge #12 (plan §2.1 #12 / Phase 2f Codex R9 + this PR's R1): the final
+    liveness gate in :func:`_ingest_scenario_a` raises this immediately before
+    the downstream publish if the credential was disconnected since the cycle
+    began. :func:`run_one_cycle` and :func:`reprocess_pending_notes` catch it
+    to abort the cycle cleanly — no Lane 1/Lane 2 event is emitted for a
+    credential the user just disconnected. It carries the credential id for
+    logging only; it never escapes the adapter.
+    """
+
+
 @dataclass(frozen=True)
 class CycleResult:
     """Summary of one ``run_one_cycle`` invocation. Surfaced to the scheduler.
@@ -243,13 +256,25 @@ async def run_one_cycle(
                     credential.id, notes_processed,
                 )
                 break
-            outcome = await process_note(
-                credential=credential,
-                note_summary=note_summary,
-                client=client,
-                pool=pool,
-                internal_domains=internal_domains,
-            )
+            try:
+                outcome = await process_note(
+                    credential=credential,
+                    note_summary=note_summary,
+                    client=client,
+                    pool=pool,
+                    internal_domains=internal_domains,
+                )
+            except _CredentialDeactivated:
+                # /disconnect landed during this note's fetch/classify; the
+                # final pre-publish gate aborted before any downstream emit.
+                # Stop the cycle (the SQL guards make the end-of-cycle
+                # write-back a no-op on the now-archived row).
+                logger.info(
+                    "granola_adapter: credential %s deactivated mid-note; "
+                    "aborting cycle (%d processed this cycle)",
+                    credential.id, notes_processed,
+                )
+                break
             outcomes[outcome.value] = outcomes.get(outcome.value, 0) + 1
             notes_processed += 1
 
@@ -516,6 +541,30 @@ async def _ingest_scenario_a(
             granola_updated_at=note_summary.updated_at,
         )
 
+        # Edge #12 (Codex R1 [P1]): FINAL liveness gate, immediately before the
+        # downstream publish. The cycle's per-note recheck runs before
+        # ``process_note`` fetches the note detail + classifies it; a
+        # /disconnect (the DELETE endpoint takes no advisory lock) landing
+        # during that fetch/classify window would pass the earlier check yet
+        # still reach here. Re-checking right before ``text_clean_service.process``
+        # closes that window so we never emit a Lane 1/Lane 2 event for a
+        # credential the user just disconnected. The ``in_progress`` row written
+        # above is a benign, self-healing idempotency anchor: a later reconnect
+        # resets ``last_polled_at`` → re-scans → re-publishes under the SAME
+        # ``eq_interaction_id`` (downstream dedups), so no duplicate entity.
+        if not await _credential_is_active(
+            pool=pool,
+            credential_id=credential.id,
+            tenant_id=credential.tenant_id,
+            user_id=credential.user_id,
+        ):
+            logger.info(
+                "granola_adapter: credential %s deactivated before publishing "
+                "note %s; aborting cycle (no downstream emit)",
+                credential.id, note_summary.id,
+            )
+            raise _CredentialDeactivated(credential.id)
+
         try:
             try:
                 await text_clean_service.process(
@@ -768,15 +817,27 @@ async def reprocess_pending_notes(
             # PR-X2 R1 P2 fix.
             prior_iid = _coerce_uuid(row.get("eq_interaction_id"))
             existing_retry_count = int(row.get("retry_count") or 0)
-            await _ingest_scenario_a(
-                credential=credential,
-                note_summary=synth_summary,
-                detail=detail,
-                decision=decision,
-                pool=pool,
-                existing_interaction_id=prior_iid,
-                existing_retry_count=existing_retry_count,
-            )
+            try:
+                await _ingest_scenario_a(
+                    credential=credential,
+                    note_summary=synth_summary,
+                    detail=detail,
+                    decision=decision,
+                    pool=pool,
+                    existing_interaction_id=prior_iid,
+                    existing_retry_count=existing_retry_count,
+                )
+            except _CredentialDeactivated:
+                # Edge #12: /disconnect landed during this reprocess
+                # promotion's publish; abort the reprocess pass (the
+                # promotion path is the only reprocess branch that emits
+                # downstream).
+                logger.info(
+                    "granola_adapter: credential %s deactivated during reprocess "
+                    "publish; aborting reprocess (%d re-processed this cycle)",
+                    credential.id, reprocessed,
+                )
+                break
         elif decision.scenario is Scenario.D_NO_BUSINESS:
             await _record_skipped(
                 pool=pool,

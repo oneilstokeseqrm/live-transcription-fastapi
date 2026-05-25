@@ -1492,8 +1492,11 @@ async def test_run_one_cycle_aborts_remaining_notes_when_archived_mid_cycle():
     detail2 = _make_note_detail(note_id="not_mid_2", attendees=[Attendee(email="carol@bigco.com")])
 
     # fetchrow=None → no existing runs; fetch=[] → no pending rows.
-    # fetchval_seq drives the per-note recheck: active for note1, archived for note2.
-    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, False])
+    # There are TWO active-rechecks per published note (the cheap loop-top
+    # guard + the final pre-publish guard inside _ingest_scenario_a). So the
+    # fetchval sequence is: note1 loop=True, note1 pre-publish=True (publishes),
+    # note2 loop=False (break before fetching/publishing note2).
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, True, False])
     pool = _FakePool(conn)
 
     client = MagicMock(spec=GranolaAPIClient)
@@ -1528,6 +1531,52 @@ async def test_run_one_cycle_aborts_remaining_notes_when_archived_mid_cycle():
 
 
 @pytest.mark.asyncio
+async def test_run_one_cycle_does_not_publish_when_disconnected_during_note():
+    """Edge #12 (Codex R1 [P1]): a /disconnect landing DURING a note — after
+    the loop-top recheck but before the publish — must still NOT emit
+    downstream. The final pre-publish gate inside _ingest_scenario_a catches
+    it: loop-top recheck=active, pre-publish recheck=archived → no publish."""
+    credential = _build_credential()
+    note1 = _make_note_summary("not_dur_1")
+    detail1 = _make_note_detail(note_id="not_dur_1", attendees=[Attendee(email="bob@bigco.com")])
+
+    # One note. Loop-top recheck=True (note looks active when the cycle reaches
+    # it); pre-publish recheck=False (a /disconnect landed during the
+    # fetch/classify). The publish must NOT fire.
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, False])
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[note1])
+    client.get_note_detail = AsyncMock(return_value=detail1)
+    client.aclose = AsyncMock()
+
+    process_mock = AsyncMock(return_value=text_clean_service.ProcessResult(
+        interaction_id="00000000-0000-4000-8000-00000000ad01",
+        lane1_published=True, lane2_dispatched=True))
+
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="33333333-aaaa-4111-8111-333333333333")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(text_clean_service, "process", new=process_mock):
+        result = await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    # The downstream publish must NOT have fired for the disconnected credential.
+    assert process_mock.await_count == 0
+    assert result.notes_processed == 0
+    # The Lane 2 slot reserved before the gate must be released (no leak).
+    assert text_clean_service.get_lane2_in_flight() == 0
+
+
+@pytest.mark.asyncio
 async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
     """Regression guard for edge #12: when the credential stays active the
     whole cycle, every note is processed + published (no behavior change)."""
@@ -1537,7 +1586,9 @@ async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
     detail1 = _make_note_detail(note_id="not_act_1", attendees=[Attendee(email="bob@bigco.com")])
     detail2 = _make_note_detail(note_id="not_act_2", attendees=[Attendee(email="carol@bigco.com")])
 
-    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, True])
+    # Two active-rechecks per published note (loop-top + pre-publish), both
+    # True for both notes → both publish.
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, True, True, True])
     pool = _FakePool(conn)
 
     client = MagicMock(spec=GranolaAPIClient)
