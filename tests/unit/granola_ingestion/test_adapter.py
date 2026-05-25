@@ -1481,22 +1481,29 @@ async def test_credential_is_active_queries_active_and_not_archived():
     assert is_active2 is False
 
 
+def _liveness_gate(state):
+    """Patch target for ``adapter._credential_is_active``: returns the current
+    value of ``state['active']`` on every call, regardless of how many internal
+    recheck sites exist. Lets a test flip the credential inactive at a precise
+    moment (on publish, on detail-fetch, etc.) and assert the cycle's response —
+    robust to where the liveness gates are placed."""
+    async def _check(**_kwargs):
+        return state["active"]
+    return _check
+
+
 @pytest.mark.asyncio
-async def test_run_one_cycle_aborts_remaining_notes_when_archived_mid_cycle():
-    """Edge #12 core: if the credential is archived between notes, the cycle
-    stops — subsequent notes are NOT fetched or published downstream."""
+async def test_run_one_cycle_aborts_remaining_notes_when_disconnected_after_a_note():
+    """Edge #12 core: once the credential is disconnected mid-cycle, the cycle
+    stops — later notes are NOT fetched or published. Here the disconnect lands
+    right after note1 publishes; note2 must be skipped entirely."""
     credential = _build_credential()
     note1 = _make_note_summary("not_mid_1")
     note2 = _make_note_summary("not_mid_2")
     detail1 = _make_note_detail(note_id="not_mid_1", attendees=[Attendee(email="bob@bigco.com")])
     detail2 = _make_note_detail(note_id="not_mid_2", attendees=[Attendee(email="carol@bigco.com")])
 
-    # fetchrow=None → no existing runs; fetch=[] → no pending rows.
-    # There are TWO active-rechecks per published note (the cheap loop-top
-    # guard + the final pre-publish guard inside _ingest_scenario_a). So the
-    # fetchval sequence is: note1 loop=True, note1 pre-publish=True (publishes),
-    # note2 loop=False (break before fetching/publishing note2).
-    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, True, False])
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
     pool = _FakePool(conn)
 
     client = MagicMock(spec=GranolaAPIClient)
@@ -1504,15 +1511,23 @@ async def test_run_one_cycle_aborts_remaining_notes_when_archived_mid_cycle():
     client.get_note_detail = AsyncMock(side_effect=[detail1, detail2])
     client.aclose = AsyncMock()
 
-    process_mock = AsyncMock(return_value=text_clean_service.ProcessResult(
-        interaction_id="00000000-0000-4000-8000-00000000ab01",
-        lane1_published=True, lane2_dispatched=True))
+    # Active until note1's publish completes, then /disconnect lands.
+    state = {"active": True}
+
+    async def _publish_then_disconnect(**_kwargs):
+        state["active"] = False
+        return text_clean_service.ProcessResult(
+            interaction_id="00000000-0000-4000-8000-00000000ab01",
+            lane1_published=True, lane2_dispatched=True)
+
+    process_mock = AsyncMock(side_effect=_publish_then_disconnect)
 
     sess_cm = MagicMock()
     sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
     sess_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+    with patch.object(adapter, "_credential_is_active", new=_liveness_gate(state)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
          patch.object(text_clean_service, "process", new=process_mock):
@@ -1522,33 +1537,33 @@ async def test_run_one_cycle_aborts_remaining_notes_when_archived_mid_cycle():
             api_client=client,
         )
 
-    # Only the FIRST note published; the second was skipped because the
-    # credential was archived between notes.
-    assert process_mock.await_count == 1
+    assert process_mock.await_count == 1            # only note1 published
     assert result.notes_processed == 1
-    # The second note's detail must never have been fetched.
-    assert client.get_note_detail.await_count == 1
+    assert client.get_note_detail.await_count == 1  # note2 never fetched
 
 
 @pytest.mark.asyncio
-async def test_run_one_cycle_does_not_publish_when_disconnected_during_note():
-    """Edge #12 (Codex R1 [P1]): a /disconnect landing DURING a note — after
-    the loop-top recheck but before the publish — must still NOT emit
-    downstream. The final pre-publish gate inside _ingest_scenario_a catches
-    it: loop-top recheck=active, pre-publish recheck=archived → no publish."""
+async def test_run_one_cycle_does_not_publish_when_disconnected_during_a_note():
+    """Edge #12 (Codex R1 [P1]): a /disconnect landing DURING a note — after the
+    cycle starts the note but before the publish — must NOT emit downstream.
+    Modeled by flipping the credential inactive when the note detail is fetched
+    (mid-process_note), so the final pre-publish gate trips."""
     credential = _build_credential()
     note1 = _make_note_summary("not_dur_1")
     detail1 = _make_note_detail(note_id="not_dur_1", attendees=[Attendee(email="bob@bigco.com")])
 
-    # One note. Loop-top recheck=True (note looks active when the cycle reaches
-    # it); pre-publish recheck=False (a /disconnect landed during the
-    # fetch/classify). The publish must NOT fire.
-    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, False])
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
     pool = _FakePool(conn)
+
+    state = {"active": True}
+
+    async def _fetch_then_disconnect(_note_id):
+        state["active"] = False  # /disconnect lands during the detail fetch
+        return detail1
 
     client = MagicMock(spec=GranolaAPIClient)
     client.list_notes = AsyncMock(return_value=[note1])
-    client.get_note_detail = AsyncMock(return_value=detail1)
+    client.get_note_detail = AsyncMock(side_effect=_fetch_then_disconnect)
     client.aclose = AsyncMock()
 
     process_mock = AsyncMock(return_value=text_clean_service.ProcessResult(
@@ -1559,7 +1574,8 @@ async def test_run_one_cycle_does_not_publish_when_disconnected_during_note():
     sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
     sess_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+    with patch.object(adapter, "_credential_is_active", new=_liveness_gate(state)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="33333333-aaaa-4111-8111-333333333333")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
          patch.object(text_clean_service, "process", new=process_mock):
@@ -1569,26 +1585,52 @@ async def test_run_one_cycle_does_not_publish_when_disconnected_during_note():
             api_client=client,
         )
 
-    # The downstream publish must NOT have fired for the disconnected credential.
-    assert process_mock.await_count == 0
+    assert process_mock.await_count == 0           # publish never fired
     assert result.notes_processed == 0
-    # The Lane 2 slot reserved before the gate must be released (no leak).
-    assert text_clean_service.get_lane2_in_flight() == 0
+    assert text_clean_service.get_lane2_in_flight() == 0  # reserved slot released
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_skips_granola_api_when_disconnected_before_listing():
+    """Edge #12 (Codex R2 [P2]): a credential disconnected before the cycle's
+    first Granola call aborts BEFORE list_notes — no upstream API request with a
+    just-disconnected key."""
+    credential = _build_credential()
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[])   # must NOT be called
+    client.get_note_detail = AsyncMock()
+    client.aclose = AsyncMock()
+
+    process_mock = AsyncMock()
+
+    with patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=False)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(text_clean_service, "process", new=process_mock):
+        result = await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    assert result.credential_skipped is True
+    client.list_notes.assert_not_called()
+    process_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
-    """Regression guard for edge #12: when the credential stays active the
-    whole cycle, every note is processed + published (no behavior change)."""
+    """Regression guard for edge #12: credential active the whole cycle → every
+    note is processed + published (no behavior change from the guards)."""
     credential = _build_credential()
     note1 = _make_note_summary("not_act_1")
     note2 = _make_note_summary("not_act_2")
     detail1 = _make_note_detail(note_id="not_act_1", attendees=[Attendee(email="bob@bigco.com")])
     detail2 = _make_note_detail(note_id="not_act_2", attendees=[Attendee(email="carol@bigco.com")])
 
-    # Two active-rechecks per published note (loop-top + pre-publish), both
-    # True for both notes → both publish.
-    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[], fetchval_seq=[True, True, True, True])
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
     pool = _FakePool(conn)
 
     client = MagicMock(spec=GranolaAPIClient)
@@ -1604,7 +1646,8 @@ async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
     sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
     sess_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+    with patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=True)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
          patch.object(text_clean_service, "process", new=process_mock):

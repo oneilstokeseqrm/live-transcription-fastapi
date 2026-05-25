@@ -227,6 +227,25 @@ async def run_one_cycle(
             )
             internal_domains = set()
 
+        # Edge #12 (Codex R2 [P2]): gate the FIRST Granola API call too. The
+        # credential snapshot was decrypted at cycle start; a /disconnect
+        # landing before list_notes should abort before we use the
+        # now-disconnected API key to page Granola at all — not just before the
+        # downstream publish. For a large folder this avoids a full pagination
+        # of upstream reads after the user disconnected.
+        if not await _credential_is_active(
+            pool=pool,
+            credential_id=credential.id,
+            tenant_id=credential.tenant_id,
+            user_id=credential.user_id,
+        ):
+            logger.info(
+                "granola_adapter: credential %s deactivated before cycle's first "
+                "Granola call; skipping (no API request)",
+                credential.id,
+            )
+            return CycleResult(credential_skipped=True)
+
         try:
             note_summaries = await client.list_notes(
                 folder_id=credential.config.get("folder_id", ""),
