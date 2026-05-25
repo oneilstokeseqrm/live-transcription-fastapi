@@ -784,6 +784,25 @@ def test_http_from_vault_error_maps_audit_failure_to_503():
     assert http2.status_code == 503
 
 
+def test_rotate_blocked_while_cycle_in_flight(client):
+    """Rotate while a scheduler cycle holds the per-credential advisory lock →
+    409. Rotating underneath a stale cycle (polling the old key) would let that
+    cycle write revoked/error back over the fresh status='active' (Codex R8 P1)."""
+    get_status = AsyncMock(return_value=_cred_status(status="revoked"))
+    rotate = AsyncMock()
+    pool = _FakePool(_FakeConn(fetchval_returns=False))  # lock held by a cycle
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "rotate_credential_key", rotate):
+        resp = client.post(f"{_BASE}/rotate", json={"new_api_key": "grn_rotated"})
+
+    assert resp.status_code == 409
+    assert "currently running" in resp.json()["detail"].lower()
+    rotate.assert_not_awaited()
+
+
 def test_rotate_status_read_failure_maps_to_503(client):
     """A transient vault read failure on the status lookup → 503 (retryable),
     not a generic 500 (Codex P2 consistency)."""

@@ -38,6 +38,7 @@ next 5-min cron tick — no extra wiring here beyond writing the row.
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 import asyncpg
@@ -258,6 +259,40 @@ async def _activity_counts_7d(*, pool, tenant_id: UUID, user_id: UUID) -> dict:
 
 def _empty_activity() -> dict:
     return {"ingested_7d": 0, "deferred_7d": 0, "errors_7d": 0}
+
+
+@asynccontextmanager
+async def _credential_poll_lock(pool, credential_id: UUID):
+    """Acquire the per-credential scheduler advisory lock (non-blocking).
+
+    Yields ``True`` if the lock was acquired (no in-flight scheduler cycle for
+    this credential — the caller may proceed) or ``False`` if a cycle holds it
+    (the caller should 409). Releases on exit.
+
+    This is the shared serialization primitive for credential MUTATIONS that
+    reuse a credential_id (reconnect/reactivate, rotate). A stale scheduler
+    cycle still polling the credential writes its terminal state back through
+    ``run_one_cycle`` (last_polled_at / status / last_error), which would
+    clobber a reactivation reset or a rotation's ``status='active'`` /
+    ``last_error=NULL`` (Codex R7/R8 P1). Holding this lock around the mutation
+    guarantees no cycle is mid-run; ``pg_try_advisory_lock`` is non-blocking so
+    a request never waits a cycle's whole duration — it 409s and the user
+    retries once the cycle finishes (≤ one 5-min tick).
+    """
+    lock_key = _advisory_lock_key(credential_id)
+    async with pool.acquire() as conn:
+        got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_key)
+        try:
+            yield got
+        finally:
+            if got:
+                try:
+                    await conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
+                except Exception:  # noqa: BLE001 — unlock must not mask the result
+                    logger.exception(
+                        "granola: advisory unlock failed for credential %s",
+                        credential_id,
+                    )
 
 
 def _first_poll_zero() -> dict:
@@ -584,24 +619,14 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                     "the key, or /disconnect first to reconnect a new one."
                 ),
             )
-        # Archived row → reconnect: reactivate UPDATEs in place (preserving
-        # the credential UUID so EncryptionContext stays consistent), resetting
-        # last_polled_at=NULL so the new folder is fully re-scanned.
-        #
-        # Gate the reactivate on the SAME per-credential advisory lock the
-        # scheduler uses (Codex R7 P1): reactivate reuses credential_id, so if
-        # a STALE scheduler cycle is still in flight for this credential, its
-        # terminal last_polled_at write-back would clobber the reset and skip
-        # notes in the newly-selected folder. pg_try_advisory_lock is
-        # non-blocking — if a cycle holds it we 409 ("retry shortly") rather
-        # than reactivate underneath a running cycle or block the request for
-        # the cycle's whole duration. Acquiring it proves no stale cycle is
-        # mid-run, so the reset can't be clobbered.
-        reconnect_lock_key = _advisory_lock_key(existing.id)
-        async with pool.acquire() as lock_conn:
-            if not await lock_conn.fetchval(
-                "SELECT pg_try_advisory_lock($1)", reconnect_lock_key
-            ):
+        # Archived row → reconnect: reactivate UPDATEs in place (preserving the
+        # credential UUID so EncryptionContext stays consistent), resetting
+        # last_polled_at=NULL so the new folder is fully re-scanned. Serialize
+        # against any in-flight scheduler cycle (Codex R7 P1): reactivate
+        # reuses credential_id, so a stale cycle's terminal write-back would
+        # clobber the reset and skip notes in the new folder.
+        async with _credential_poll_lock(pool, existing.id) as got_lock:
+            if not got_lock:
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -638,17 +663,6 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                         ),
                     )
                 raise _http_from_vault_error(react_exc)
-            finally:
-                try:
-                    await lock_conn.execute(
-                        "SELECT pg_advisory_unlock($1)", reconnect_lock_key
-                    )
-                except Exception:  # noqa: BLE001 — unlock must not mask the result
-                    logger.exception(
-                        "granola /connect: reconnect advisory unlock failed for "
-                        "credential %s",
-                        existing.id,
-                    )
 
     # --- Save & test (LOCKED-31): one synchronous poll, serialized against
     # the scheduler via the shared per-credential advisory lock. Every failure
@@ -686,24 +700,38 @@ async def rotate_granola_key(body: RotateRequest, request: Request) -> dict:
             detail="No connected Granola credential to rotate. Connect first.",
         )
 
-    try:
-        await rotate_credential_key(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            credential_id=status_row.id,
-            new_api_key=body.new_api_key,
-            caller_module=_CALLER_MODULE,
-            pool=pool,
-            trace_id=ctx.trace_id,
-        )
-    except VaultError as exc:
-        if exc.code is VaultErrorCode.VAULT_DB_NOT_FOUND:
-            # Raced with a concurrent disconnect between status read + rotate.
+    # Serialize against any in-flight scheduler cycle (Codex R8 P1): rotate
+    # resets status='active' + last_error=NULL, but a stale cycle polling with
+    # the OLD key would write its terminal status (revoked/error) back
+    # afterward — bouncing a just-rotated credential straight back to revoked.
+    # Gate on the same advisory lock as reconnect.
+    async with _credential_poll_lock(pool, status_row.id) as got_lock:
+        if not got_lock:
             raise HTTPException(
-                status_code=404,
-                detail="Credential was disconnected; reconnect to add a new key.",
+                status_code=409,
+                detail=(
+                    "A Granola sync is currently running for this connection; "
+                    "please retry the rotation in a moment."
+                ),
             )
-        raise _http_from_vault_error(exc)
+        try:
+            await rotate_credential_key(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                credential_id=status_row.id,
+                new_api_key=body.new_api_key,
+                caller_module=_CALLER_MODULE,
+                pool=pool,
+                trace_id=ctx.trace_id,
+            )
+        except VaultError as exc:
+            if exc.code is VaultErrorCode.VAULT_DB_NOT_FOUND:
+                # Raced with a concurrent disconnect between status read + rotate.
+                raise HTTPException(
+                    status_code=404,
+                    detail="Credential was disconnected; reconnect to add a new key.",
+                )
+            raise _http_from_vault_error(exc)
 
     return {"ok": True}
 
