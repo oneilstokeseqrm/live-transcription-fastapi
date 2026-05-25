@@ -3010,4 +3010,75 @@ bugs); contrast with the pathological version (reviewer reversing
 itself) documented here.
 
 
+## Codex oscillation from CONFLATED concerns — split them, don't freeze (2026-05-25)
+
+### Lesson
+
+There are TWO kinds of Codex oscillation, needing opposite responses:
+
+1. **Unresolvable-ambiguity oscillation** (the 2026-05-24 dead-code pooler
+   case): no rule can decide the contested point, so the reviewer flip-flops
+   forever. Response: FREEZE on the safe side + STOP (the prior lesson).
+
+2. **Conflated-concern oscillation** (this case): the reviewer flips because
+   ONE fix bundled TWO distinct concerns, and each round defends a different
+   one. Response: SPLIT the concerns and address each separately — that
+   RESOLVES the oscillation permanently (no side left to flip back to),
+   strictly better than freezing.
+
+Before declaring "the reviewer is oscillating," diagnose which kind: is the
+contested point genuinely undecidable (freeze), or are two separable
+requirements tangled in one mechanism (split)?
+
+### Why
+
+2026-05-25 Phase 2f PR #29, the `/validate` auth thread flipped 3× over 9 rounds:
+- R4 [P2]: "/validate reachable via legacy headers — add `_resolve_identity`."
+  (I did — `_resolve_identity` requires the JWT's `pg_user_id`.)
+- R5 [P1]: "requiring `pg_user_id` rejects valid prod JWTs that omit the
+  optional claim." (reverses R4)
+- R6 [P2]: "/validate still reachable via legacy headers." (re-raises R4)
+
+Root cause: my R4 fix CONFLATED "require a verified JWT" with "require a
+`pg_user_id` claim" — `_resolve_identity` did both. R5 objected to the second;
+R6 objected to dropping the first. They were never in conflict; the conflation
+made them LOOK like a flip-flop.
+
+Resolution (R6 fold): SPLIT them. Require a bearer token explicitly
+(`extract_bearer_token(...)` → 401) to enforce "verified JWT" WITHOUT requiring
+`pg_user_id`, since `/validate` is stateless and never writes the vault
+`user_id` FK. Satisfied every round at once, and no later round could re-flip
+it (no single knob trading the two off anymore). Freezing on either side would
+have left the other round's valid concern unaddressed.
+
+### How to apply
+
+1. **When a thread flips ≥2× on one surface, diagnose the KIND first.** Are the
+   rounds defending DIFFERENT concerns (→ SPLIT) or re-litigating the SAME
+   undecidable point (→ FREEZE + STOP)?
+2. **Tell for conflated-concern: each flip cites a DIFFERENT failure mode** on
+   the same line (R5 "rejects valid JWTs"; R6 "reachable via legacy") = two
+   requirements tangled in one fix.
+3. **Split by finding the mechanism that satisfies each concern independently**
+   (here: bearer-token presence ⟂ pg_user_id claim — one line each, no tradeoff).
+4. **A split RESOLVES; a freeze MITIGATES.** Prefer split when concerns are
+   separable; freeze only when the point is genuinely undecidable.
+
+### Bonus finding: legacy header auth is ON in production (2026-05-25)
+
+Verified post-deploy: an unauthenticated mutation returns 400 (legacy path:
+missing X-Tenant-ID) not 401, i.e. `ALLOW_LEGACY_HEADER_AUTH=true` in the
+live-transcription-fastapi production env (system-wide — affects /text/clean +
+/queue/* too). Implication for any NEW endpoint: `get_auth_context_*` does NOT
+enforce JWT in prod (it falls back to header auth). JWT-only endpoints need an
+explicit bearer-token gate (stateless routes) or a `pg_user_id` requirement
+(routes writing a UUID user_id), as Phase 2f's Granola endpoints do.
+
+### Related
+
+[[codex-oscillates-on-dead-code-edge-cases]] — the sibling FREEZE response for
+unresolvable ambiguity. Same trigger (repeated flips), opposite fix — diagnose
+which before acting. [[feedback-codex-pre-merge-gate]] — both bound the soft cap.
+
+
 

@@ -41,9 +41,14 @@ Auth: `get_auth_context_polling` (no X-Account-ID). tenant_id=UUID(ctx.tenant_id
 - [x] §3 main.py register — DONE
 - [x] §4 tests (93 granola+vault; full unit suite green, 1 pre-existing unrelated failure) — DONE
 - [x] §5 verify_consumer_contracts.py 0 drift — DONE
-- [x] §5 Codex pre-merge review — IN PROGRESS (see trajectory below)
-- [ ] §5 PR opened (awaiting user auth)
-- [ ] §6 cron pinger — DECISION PENDING with user
+- [x] §5 Codex pre-merge review — 9 rounds, all folded (see trajectory below)
+- [x] §5 PR #29 opened + MERGED (squash) as `260b863`
+- [x] §6 deploy verified — Railway `eb2d4c81` SUCCESS; prod endpoints live + auth-gated
+- [ ] §6 cron pinger — DEFERRED by user to a focused next session (see NEXT-SESSION-START-HERE.md)
+
+## PHASE 2f COMPLETE (2026-05-25)
+Admin endpoints shipped + deployed + prod-verified. Cron pinger held for next session.
+2 edges ticketed (plan §2.1 #12/#13). Next: wire trigger + first real /connect E2E + Phase 2g.
 
 ## Codex review trajectory (branch phase-2f/granola-admin)
 R1: 2 P2 + 1 P3 — /connect insert disambiguation, post-store load wrap, status mapping → folded

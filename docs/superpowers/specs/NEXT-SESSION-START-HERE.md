@@ -1,15 +1,21 @@
 # Next Session — Start Here
 
 **Project:** Phase 2 — Granola.ai transcript ingestion integration.
-**Last session:** 2026-05-24 (Phase 2e — the scheduler: `services/granola_ingestion/scheduler.py` DBOS workflow + steps, `routers/granola_cron.py` cron endpoint, `services/asyncpg_pool.py` direct-connection pool. One PR, **11 Codex rounds** — R1-R5 real bugs folded, R8-R11 oscillation frozen + loop stopped).
-**Status:** ✅ **PHASE_2E_SHIPPED + PHASE_2F_NEXT** — scheduler merged PR #28 `4e81bb6`, Railway deploy SUCCESS, verified DORMANT end-to-end in production (authenticated `POST /internal/granola/cron-tick` → 202 `{"enqueued":0}`). `INTERNAL_CRON_SECRET` set in Railway. The scheduler is wired but ships dormant — until Phase 2f's `/connect` lands a credential, there's nothing to poll. The 5-min cron PINGER is deferred to Phase 2f (load-bearing then; the endpoint is verified ready).
+**Last session:** 2026-05-25 (Phase 2f — admin endpoints: `routers/granola.py` /validate,/connect,/rotate,/status,/disconnect + vault `get_credential_status`/`archive_credential`. One PR (#29), **9 Codex rounds** all folded; shared `_credential_poll_lock` serializes mutations vs the scheduler; the `/validate`-auth oscillation resolved by SPLITTING bearer-token-vs-pg_user_id).
+**Status:** ✅ **PHASE_2F_SHIPPED + CRON_PINGER_DEFERRED** — admin endpoints merged PR #29 `260b863`, Railway deploy `eb2d4c81` SUCCESS, prod-verified (all 5 routes live + auth-gated; `/health` 200; cron-tick still 401 without the secret; `/text/clean` no regression). The endpoints are LIVE but DORMANT: no credentials connected yet, AND the 5-min cron pinger is NOT wired (user held it for a focused next session).
 
-**Paste-ready opening prompt for the next session:**
-`docs/superpowers/specs/2026-05-24-phase-2f-session-prompt.md`
+## What's next (this session's scope was endpoints; pinger + E2E deferred)
 
-That prompt is self-contained. It walks the new agent through verify-state → mandatory reads → Phase 2f implementation (`routers/granola.py` admin endpoints: /validate, /connect, /rotate, /status, /disconnect + wire the cron pinger) → Codex pre-merge review → ship. Phase 2f flips the switch: connect → poll → ingest comes alive.
+1. **Wire the 5-min cron trigger** (the "flip the switch" step). User chose Railway cron service originally but it's fiddly (curl-image entrypoint + shell env-expansion + dashboard-only `cronSchedule`); **recommended alt: a GitHub Actions scheduled workflow** (`.github/workflows/granola-cron.yml`, `*/5 * * * *`) POSTing `/internal/granola/cron-tick` with `INTERNAL_CRON_SECRET` (already set in Railway; add it to GitHub Actions secrets). Decide approach WITH the user.
+2. **First real `/connect` E2E** with Peter's Granola account (design partner #0) — connect → poll → ingest, verify a real meeting lands. Run the §Phase 4c steps + LOCKED-11 cleanup.
+3. **2 ticketed fast-follow edges** (plan §Phase 2.1 follow-ups #12/#13, user chose ship-now in Phase 2f):
+   - #12 **adapter archived_at-awareness** — an in-flight cycle keeps ingesting a few notes after `/disconnect` (root fix: guard the 3 adapter credential-UPDATE SQLs on `archived_at IS NULL` + re-check before publish; would let the per-endpoint `_credential_poll_lock` gates be removed). Do this BEFORE or WITH wiring the pinger (the pinger makes the race live).
+   - #13 **/connect bad-folder recovery** — a bad `folder_id` leaves a stuck non-archived row (must `/disconnect` to retry; no PATCH /folder shipped).
+4. **Phase 2g** — transactional email on credential breakage (LOCKED-32). Then Phase 3 (frontend Connect page + Pending Approvals) + Phase 4 (full E2E).
 
-**Prior session (Phase 2d, superseded):** `docs/superpowers/specs/2026-05-24-phase-2e-session-prompt.md`.
+**⚠️ Prod config note (load-bearing):** `ALLOW_LEGACY_HEADER_AUTH=true` in production. `get_auth_context_*` does NOT enforce JWT in prod (falls back to header auth). Any NEW JWT-only endpoint needs an explicit bearer-token gate (stateless) or `pg_user_id` requirement (writes user_id) — see `tasks/lessons.md` bottom.
+
+**Superseded prompts:** `docs/superpowers/specs/2026-05-24-phase-2f-session-prompt.md` (Phase 2f opener, now done); `docs/superpowers/specs/2026-05-24-phase-2e-session-prompt.md` (Phase 2d).
 
 ---
 
