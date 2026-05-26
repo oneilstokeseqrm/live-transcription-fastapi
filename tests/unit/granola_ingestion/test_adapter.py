@@ -265,6 +265,14 @@ def test_build_envelope_matches_locked_35_36():
     assert envelope.tenant_id == credential.tenant_id
     assert envelope.user_id == str(credential.user_id)
     assert envelope.interaction_id is not None
+    # trace_id MUST be a valid UUID string: the shared Lane 2 path does
+    # UUID(trace_id) in intelligence_service._persist_intelligence (via
+    # text_clean_service passing ``envelope.trace_id or ""``). A None/empty
+    # trace_id crashed Lane 2 persistence for the first real Granola ingest
+    # (2026-05-26 E2E). Granola has no request-scoped trace_id, so the adapter
+    # mints one. (/text/clean passes its own context.trace_id, unaffected.)
+    assert envelope.trace_id is not None
+    UUID(envelope.trace_id)  # raises if not a valid UUID
 
     expected_extras_keys = {
         "granola_note_id",
