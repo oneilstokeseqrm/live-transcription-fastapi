@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from services import text_clean_service
+from services.contact_resolution import ResolvedContactRow
 from services.domain_classification import DomainClass
 from services.granola_ingestion import adapter
 from services.granola_ingestion.api_client import GranolaAPIClient
@@ -36,7 +37,11 @@ from services.granola_ingestion.models import (
     TranscriptTurn,
 )
 from services.granola_ingestion.outcomes import IngestionOutcome
-from services.granola_ingestion.path2 import AttendeeClassification, Scenario
+from services.granola_ingestion.path2 import (
+    AttendeeClassification,
+    PathTwoDecision,
+    Scenario,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +211,24 @@ def _make_note_detail(
         web_url=web_url,
         folder_membership=[],
     )
+
+
+# A canned resolved contact for Scenario-A-path tests that exercise
+# _ingest_scenario_a's OTHER behaviors (success row, retry, cycle abort,
+# reprocess) and don't care about contact-resolution internals (those are
+# covered by the dedicated tests at the bottom of this file). These tests
+# patch _resolve_known_account_contacts to return this, so the path doesn't
+# hit real DB work via the bare-MagicMock session. account_id matches the
+# lookup_account_by_domain patch return used across these tests.
+_FAKE_RESOLVED_CONTACTS = [
+    ResolvedContactRow(
+        contact_id="11111111-cccc-4111-8111-cccccccccccc",
+        email="alice@bigco.com",
+        name="Alice",
+        account_id="11111111-aaaa-4111-8111-111111111111",
+        account_matched=True,
+    )
+]
 
 
 @pytest.fixture(autouse=True)
@@ -408,6 +431,7 @@ async def test_scenario_a_calls_text_clean_with_credential_tenant_id():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session") as get_sess, \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
 
         # get_async_session is used in _classify_and_resolve for the
@@ -430,9 +454,13 @@ async def test_scenario_a_calls_text_clean_with_credential_tenant_id():
     assert captured["tenant_id"] == tenant_a
     assert captured["user_id"] == str(credential.user_id)
     assert captured["account_id"] == "11111111-aaaa-4111-8111-111111111111"
-    # Lane 2 extras stays None (Granola path; envelope.content.text is the
-    # source of truth — no BatchCleaner override).
-    assert captured["lane2_extras"] is None
+    # Lane 2 extras now carries the resolved contact_ids (the fix): this is
+    # what drives _persist_contact_links to write raw_interactions +
+    # interaction_contact_links. cleaned_transcript stays unset (Granola is
+    # pre-clean; envelope.content.text is the source of truth).
+    assert captured["lane2_extras"] is not None
+    assert captured["lane2_extras"].contact_ids == ["11111111-cccc-4111-8111-cccccccccccc"]
+    assert captured["lane2_extras"].cleaned_transcript is None
 
 
 @pytest.mark.asyncio
@@ -453,6 +481,7 @@ async def test_scenario_a_records_success_row_in_external_integration_runs():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session") as get_sess, \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(return_value=text_clean_service.ProcessResult(
              interaction_id="00000000-0000-4000-8000-000000000002",
              lane1_published=True, lane2_dispatched=True))):
@@ -528,6 +557,7 @@ async def test_scenario_a_with_mixed_attendees_queues_signals_for_unknowns():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(side_effect=_lookup)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "reopen_archived_entry", new=AsyncMock(side_effect=_reopen)), \
          patch.object(adapter, "upsert_queue_entry", new=AsyncMock(side_effect=_upsert)), \
          patch.object(adapter, "insert_signal", new=AsyncMock(side_effect=_insert_signal)), \
@@ -587,6 +617,7 @@ async def test_scenario_c_records_deferred_with_snapshot():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "reopen_archived_entry", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "upsert_queue_entry", new=AsyncMock(return_value="11111111-bbbb-4111-8111-111111111111")), \
          patch.object(adapter, "insert_signal", new=AsyncMock(return_value=None)), \
@@ -645,6 +676,7 @@ async def test_scenario_d_no_business_attendees_returns_skipped():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "get_async_session") as get_sess, \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock()) as proc:
         sess_cm = MagicMock()
         sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
@@ -975,6 +1007,7 @@ async def test_reprocess_deferred_note_recovers_from_snapshot_when_404():
     # Now the domain unknown-co.com IS known.
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="55555555-aaaa-4111-8111-555555555555")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
         count = await adapter.reprocess_deferred_notes(
             credential=credential,  # type: ignore[arg-type]
@@ -1106,6 +1139,7 @@ async def test_reprocess_pending_notes_retries_failed_rows():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="44444444-aaaa-4111-8111-444444444444")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(return_value=text_clean_service.ProcessResult(
              interaction_id="00000000-0000-4000-8000-0000000000bb",
              lane1_published=True, lane2_dispatched=True))):
@@ -1198,6 +1232,7 @@ async def test_scenario_a_writes_in_progress_row_before_publish():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
         outcome = await adapter.process_note(
             credential=credential,  # type: ignore[arg-type]
@@ -1267,6 +1302,7 @@ async def test_scenario_a_retry_reuses_existing_interaction_id():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
         await adapter.process_note(
             credential=credential,  # type: ignore[arg-type]
@@ -1324,6 +1360,7 @@ async def test_scenario_a_backpressure_failures_converge_to_failed_permanent():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "try_reserve_lane2_slot", return_value=False):
 
         outcome = await adapter.process_note(
@@ -1374,6 +1411,7 @@ async def test_reprocess_pending_failed_row_classifies_to_scenario_c_defers():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "reopen_archived_entry", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "upsert_queue_entry", new=AsyncMock(return_value="11111111-bbbb-4111-8111-111111111111")), \
          patch.object(adapter, "insert_signal", new=AsyncMock(return_value=None)):
@@ -1419,6 +1457,7 @@ async def test_scenario_a_lane2_backpressure_records_failed_not_success():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "try_reserve_lane2_slot", return_value=False), \
          patch.object(text_clean_service, "process", new=AsyncMock()) as proc:
 
@@ -1538,6 +1577,7 @@ async def test_run_one_cycle_aborts_remaining_notes_when_disconnected_after_a_no
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
         result = await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
@@ -1586,6 +1626,7 @@ async def test_run_one_cycle_does_not_publish_when_disconnected_during_a_note():
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="33333333-aaaa-4111-8111-333333333333")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
         result = await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
@@ -1699,6 +1740,7 @@ async def test_run_one_cycle_scenario_c_writes_nothing_when_disconnected_mid_not
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "_queue_unknown_domain_signals", new=queue_mock):
         result = await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
@@ -1749,6 +1791,7 @@ async def test_run_one_cycle_scenario_c_writes_nothing_when_disconnected_during_
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(side_effect=_lookup_then_disconnect)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "_queue_unknown_domain_signals", new=queue_mock):
         result = await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
@@ -1879,6 +1922,7 @@ async def test_run_one_cycle_skips_success_bookkeeping_on_mid_cycle_deactivation
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
         await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
@@ -1935,6 +1979,7 @@ async def test_run_one_cycle_skips_success_bookkeeping_when_deactivated_during_r
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock()):
         await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
@@ -1979,6 +2024,7 @@ async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
         result = await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
@@ -2021,3 +2067,208 @@ async def test_reprocess_pending_notes_aborts_when_credential_archived():
     assert count == 0
     client.get_note_detail.assert_not_called()
     process_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Contact resolution + linking (phase-2.1/granola-contact-resolution)
+# ---------------------------------------------------------------------------
+
+_ACCT_PAL = "22222222-2222-4222-8222-222222222222"
+_ACCT_SNO = "33333333-3333-4333-8333-333333333333"
+
+
+def _known_att(email: str, name: Optional[str], account_id: Optional[str]) -> AttendeeClassification:
+    return AttendeeClassification(
+        email=email,
+        name=name,
+        domain=email.split("@")[1],
+        klass=DomainClass.BUSINESS,
+        account_id=account_id,
+    )
+
+
+def _decision_a(
+    known: list[AttendeeClassification],
+    unknown: Optional[list[AttendeeClassification]] = None,
+) -> PathTwoDecision:
+    return PathTwoDecision(
+        scenario=Scenario.A_KNOWN_ANCHOR,
+        anchor_account_id=known[0].account_id,
+        known_account_attendees=known,
+        unknown_business_attendees=unknown or [],
+    )
+
+
+def _resolved(contact_id: str, email: str, name: Optional[str] = "X",
+              account_id: str = _ACCT_PAL, matched: bool = True) -> ResolvedContactRow:
+    return ResolvedContactRow(
+        contact_id=contact_id, email=email, name=name,
+        account_id=account_id, account_matched=matched,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_known_account_contacts_dedupes_and_binds_per_attendee_account():
+    """One contact per unique email, each bound to its OWN account (not anchor)."""
+    cred: Any = _build_credential()  # _FakeCredential duck-types GranolaCredential
+    known = [
+        _known_att("matt@palantir.com", "Matt Scanlan", _ACCT_PAL),
+        _known_att("matt@palantir.com", "Matt Scanlan", _ACCT_PAL),  # duplicate email
+        _known_att("amy@snowflake.com", "Amy R", _ACCT_SNO),
+    ]
+    decision = _decision_a(known)
+
+    session = MagicMock()
+    session.commit = AsyncMock()
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=session)
+    sess_cm.__aexit__ = AsyncMock(return_value=False)
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_focc(*, session, tenant_id, email, account_id, display_name):
+        calls.append((email, account_id))
+        return _resolved(f"cid-{email}", email, display_name, account_id)
+
+    with patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "find_or_create_contact", side_effect=fake_focc):
+        resolved = await adapter._resolve_known_account_contacts(decision=decision, credential=cred)
+
+    assert [r.email for r in resolved] == ["matt@palantir.com", "amy@snowflake.com"]  # deduped, ordered
+    assert calls == [("matt@palantir.com", _ACCT_PAL), ("amy@snowflake.com", _ACCT_SNO)]  # per-attendee acct
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_known_account_contacts_empty_when_no_known():
+    """No known attendees → no session opened, no find-or-create, empty list."""
+    cred: Any = _build_credential()  # _FakeCredential duck-types GranolaCredential
+    decision = PathTwoDecision(
+        scenario=Scenario.C_DEFER_PENDING_ACCOUNT,
+        anchor_account_id=None,
+        known_account_attendees=[],
+        unknown_business_attendees=[_known_att("x@unknown.com", "X", None)],
+    )
+    with patch.object(adapter, "get_async_session") as gs, \
+         patch.object(adapter, "find_or_create_contact") as focc:
+        resolved = await adapter._resolve_known_account_contacts(decision=decision, credential=cred)
+    assert resolved == []
+    gs.assert_not_called()
+    focc.assert_not_called()
+
+
+def test_build_envelope_includes_contact_ids_and_contacts_when_resolved():
+    cred: Any = _build_credential()  # _FakeCredential duck-types GranolaCredential
+    detail = _make_note_detail(attendees=[Attendee(email="matt@palantir.com", name="Matt Scanlan")])
+    decision = _decision_a([_known_att("matt@palantir.com", "Matt Scanlan", _ACCT_PAL)])
+    resolved = [_resolved("cid-1", "matt@palantir.com", "Matt Scanlan", _ACCT_PAL)]
+
+    env = adapter._build_envelope(
+        credential=cred, detail=detail, anchor_account_id=_ACCT_PAL,
+        decision=decision, interaction_id=uuid4(), resolved_contacts=resolved,
+    )
+    assert env.extras["contact_ids"] == ["cid-1"]
+    assert env.extras["contacts"] == [
+        {"contact_id": "cid-1", "email": "matt@palantir.com", "name": "Matt Scanlan", "role": "attendee"}
+    ]
+    # the six granola_* keys are still present (no regression)
+    for k in ("granola_note_id", "granola_web_url", "granola_folder_name",
+              "granola_summary_text", "granola_calendar_event_id", "granola_attendees_raw"):
+        assert k in env.extras
+
+
+def test_build_envelope_omits_contact_keys_when_none_resolved():
+    cred: Any = _build_credential()  # _FakeCredential duck-types GranolaCredential
+    detail = _make_note_detail(attendees=[Attendee(email="m@palantir.com", name="M")])
+    decision = _decision_a([_known_att("m@palantir.com", "M", _ACCT_PAL)])
+    env = adapter._build_envelope(
+        credential=cred, detail=detail, anchor_account_id=_ACCT_PAL,
+        decision=decision, interaction_id=uuid4(), resolved_contacts=[],
+    )
+    assert "contact_ids" not in env.extras
+    assert "contacts" not in env.extras
+
+
+@pytest.mark.asyncio
+async def test_scenario_a_feeds_contact_ids_to_lane2_and_envelope():
+    """The fix: contact_ids reach BOTH Lane2Extras (Postgres FK) and envelope.extras (Neo4j)."""
+    cred: Any = _build_credential()  # _FakeCredential duck-types GranolaCredential
+    note = _make_note_summary("not_ca")
+    detail = _make_note_detail(note_id="not_ca",
+                               attendees=[Attendee(email="matt@palantir.com", name="Matt Scanlan")])
+    decision = _decision_a([_known_att("matt@palantir.com", "Matt Scanlan", _ACCT_PAL)])
+    resolved = [_resolved("c-1", "matt@palantir.com", "Matt Scanlan", _ACCT_PAL)]
+    captured: dict = {}
+
+    async def fake_process(*, tenant_id, user_id, account_id, envelope, lane2_extras):
+        captured["lane2_extras"] = lane2_extras
+        captured["envelope_extras"] = envelope.extras
+
+    with patch.object(text_clean_service, "try_reserve_lane2_slot", return_value=True), \
+         patch.object(text_clean_service, "process", new=AsyncMock(side_effect=fake_process)), \
+         patch.object(text_clean_service, "release_lane2_slot"), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=resolved)), \
+         patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=True)), \
+         patch.object(adapter, "_record_in_progress", new=AsyncMock()), \
+         patch.object(adapter, "_record_success", new=AsyncMock()), \
+         patch.object(adapter, "_queue_unknown_domain_signals", new=AsyncMock(return_value=[])):
+        out = await adapter._ingest_scenario_a(
+            credential=cred, note_summary=note, detail=detail, decision=decision, pool=MagicMock(),
+        )
+
+    assert out is IngestionOutcome.SUCCESS
+    assert captured["lane2_extras"] is not None
+    assert captured["lane2_extras"].contact_ids == ["c-1"]
+    assert captured["lane2_extras"].calendar_event_id is None
+    assert captured["envelope_extras"]["contact_ids"] == ["c-1"]  # both channels, single source
+
+
+@pytest.mark.asyncio
+async def test_scenario_a_zero_resolved_contacts_retries_without_publishing():
+    """Invariant violation (0 contacts in Scenario A) → transient failure, no publish."""
+    cred: Any = _build_credential()  # _FakeCredential duck-types GranolaCredential
+    note = _make_note_summary("not_zero")
+    detail = _make_note_detail(note_id="not_zero", attendees=[Attendee(email="m@palantir.com", name="M")])
+    decision = _decision_a([_known_att("m@palantir.com", "M", _ACCT_PAL)])
+    process_mock = AsyncMock()
+
+    with patch.object(text_clean_service, "try_reserve_lane2_slot", return_value=True), \
+         patch.object(text_clean_service, "process", new=process_mock), \
+         patch.object(text_clean_service, "release_lane2_slot"), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=[])), \
+         patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=True)), \
+         patch.object(adapter, "_record_in_progress", new=AsyncMock()), \
+         patch.object(adapter, "_record_scenario_a_failure",
+                      new=AsyncMock(return_value=IngestionOutcome.FAILED)) as fail:
+        out = await adapter._ingest_scenario_a(
+            credential=cred, note_summary=note, detail=detail, decision=decision, pool=MagicMock(),
+        )
+
+    process_mock.assert_not_called()  # never published a half-broken meeting
+    fail.assert_awaited_once()
+    assert fail.call_args.kwargs["error_code"] == "contact_resolution_empty"
+    assert out is IngestionOutcome.FAILED
+
+
+@pytest.mark.asyncio
+async def test_scenario_a_gate2_aborts_if_disconnected_during_resolution():
+    """Gate #2: a disconnect during contact resolution aborts before publish."""
+    cred: Any = _build_credential()  # _FakeCredential duck-types GranolaCredential
+    note = _make_note_summary("not_g2")
+    detail = _make_note_detail(note_id="not_g2", attendees=[Attendee(email="m@palantir.com", name="M")])
+    decision = _decision_a([_known_att("m@palantir.com", "M", _ACCT_PAL)])
+    resolved = [_resolved("c-1", "m@palantir.com", "M", _ACCT_PAL)]
+    process_mock = AsyncMock()
+
+    with patch.object(text_clean_service, "try_reserve_lane2_slot", return_value=True), \
+         patch.object(text_clean_service, "process", new=process_mock), \
+         patch.object(text_clean_service, "release_lane2_slot"), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=resolved)), \
+         patch.object(adapter, "_record_in_progress", new=AsyncMock()), \
+         patch.object(adapter, "_credential_is_active",
+                      new=AsyncMock(side_effect=[True, False])):  # gate1 ok, gate2 disconnected
+        with pytest.raises(adapter._CredentialDeactivated):
+            await adapter._ingest_scenario_a(
+                credential=cred, note_summary=note, detail=detail, decision=decision, pool=MagicMock(),
+            )
+    process_mock.assert_not_called()  # gate #2 stopped the publish
