@@ -196,7 +196,7 @@ def _make_note_detail(
         created_at=datetime(2026, 5, 24, 10, 0, tzinfo=timezone.utc),
         updated_at=datetime(2026, 5, 24, 10, 30, tzinfo=timezone.utc),
         attendees=attendees if attendees is not None else [Attendee(email="alice@bigco.com", name="Alice")],
-        calendar_event=CalendarEvent(id=calendar_event_id) if calendar_event_id else None,
+        calendar_event=CalendarEvent(calendar_event_id=calendar_event_id) if calendar_event_id else None,
         transcript=transcript if transcript is not None else [
             TranscriptTurn(text="Hello.", speaker={"source": "microphone"}),
             TranscriptTurn(text="Hi there.", speaker={"source": "speaker"}),

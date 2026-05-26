@@ -778,7 +778,7 @@ async def _defer_pending_account(
         "web_url": detail.web_url,
         "attendees": [att.model_dump() for att in detail.attendees],
         "transcript_turns": [turn.model_dump() for turn in detail.transcript],
-        "calendar_event_id": detail.calendar_event.id if detail.calendar_event else None,
+        "calendar_event_id": detail.calendar_event.calendar_event_id if detail.calendar_event else None,
         "created_at": detail.created_at.isoformat(),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1070,7 +1070,7 @@ def _rebuild_detail_from_snapshot(
     calendar_event = None
     cal_id = snapshot.get("calendar_event_id")
     if cal_id:
-        calendar_event = CalendarEvent(id=cal_id)
+        calendar_event = CalendarEvent(calendar_event_id=cal_id)
 
     created_at_str = snapshot.get("created_at")
     if isinstance(created_at_str, str):
@@ -1133,7 +1133,7 @@ def _build_envelope(
         "granola_folder_name": credential.config.get("folder_name"),
         "granola_summary_text": detail.summary_text,
         "granola_calendar_event_id": (
-            detail.calendar_event.id if detail.calendar_event else None
+            detail.calendar_event.calendar_event_id if detail.calendar_event else None
         ),
         "granola_attendees_raw": [att.model_dump() for att in detail.attendees],
     }

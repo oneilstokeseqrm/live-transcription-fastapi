@@ -317,7 +317,7 @@ async def test_get_note_detail_happy_path():
                     {"name": "Peter ONeil", "email": "peter@eq.example"},
                     {"name": "Acme Rep", "email": "rep@acme.example"},
                 ],
-                "calendar_event": {"id": "evt_xyz"},
+                "calendar_event": {"calendar_event_id": "evt_xyz"},
                 "transcript": [
                     {
                         "text": "Hello.",
@@ -346,7 +346,7 @@ async def test_get_note_detail_happy_path():
     assert len(detail.attendees) == 2
     assert detail.attendees[1].email == "rep@acme.example"
     assert detail.calendar_event is not None
-    assert detail.calendar_event.id == "evt_xyz"
+    assert detail.calendar_event.calendar_event_id == "evt_xyz"
     assert detail.transcript[0].speaker == {"source": "microphone"}
     assert detail.web_url == "https://granola.ai/notes/not_1"
 
@@ -396,6 +396,55 @@ async def test_get_note_detail_parses_iso_string_transcript_times():
     assert detail.transcript[0].start_time == "2026-04-02T20:31:58.289Z"
     assert detail.transcript[0].end_time == "2026-04-02T20:31:58.609Z"
     assert detail.transcript[1].speaker == {"source": "speaker"}
+
+
+@pytest.mark.asyncio
+async def test_get_note_detail_parses_calendar_event_id_field():
+    """Regression (first real /connect E2E, 2026-05-26): Granola's calendar
+    event object uses ``calendar_event_id``, NOT ``id``. A real meeting WITH a
+    calendar event produced 1 ``GRANOLA_PARSE_ERROR`` (calendar_event.id
+    missing) because ``CalendarEvent`` required ``id``. The field is aliased
+    to ``calendar_event_id`` + optional so the real shape parses and the
+    downstream ``extras.granola_calendar_event_id`` (LOCKED-36) is populated
+    from the real value (the raw Google event-id string)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "not_cal",
+                "created_at": "2026-05-26T10:04:13Z",
+                "transcript": [{"text": "Hi.", "speaker": {"source": "microphone"}}],
+                "calendar_event": {
+                    "event_title": "EQ Test",
+                    "calendar_event_id": "1i33jkmfii0dmi1mllhjs42f6h",
+                    "organiser": "owner@example.com",
+                    "invitees": [{"email": "a@example.com"}],
+                    "scheduled_start_time": "2026-05-26T06:00:00-04:00",
+                },
+            },
+        )
+
+    client = _client_with_handler(handler)
+    try:
+        detail = await client.get_note_detail("not_cal")
+    finally:
+        await client.aclose()
+
+    assert isinstance(detail, GranolaNoteDetail)
+    assert detail.calendar_event is not None
+    assert detail.calendar_event.calendar_event_id == "1i33jkmfii0dmi1mllhjs42f6h"
+
+
+def test_calendar_event_models_real_field_and_is_optional():
+    """The model uses Granola's real field name ``calendar_event_id`` and is
+    optional — so the snapshot-rebuild path (adapter._rebuild_detail_from_snapshot
+    does ``CalendarEvent(calendar_event_id=cal_id)``) works, and a calendar event
+    missing the id never fails the parse (extra='allow' resilience)."""
+    from services.granola_ingestion.models import CalendarEvent
+
+    assert CalendarEvent(calendar_event_id="evt_y").calendar_event_id == "evt_y"
+    assert CalendarEvent().calendar_event_id is None  # optional — missing id not fatal
 
 
 # ---------------------------------------------------------------------------
