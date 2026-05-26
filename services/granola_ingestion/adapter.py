@@ -1147,7 +1147,15 @@ def _build_envelope(
         source="generic",  # LOCKED-35
         extras=extras,  # LOCKED-36
         interaction_id=interaction_id or uuid4(),
-        trace_id=None,
+        # Mint a trace_id: Granola has no request-scoped trace context, but the
+        # shared Lane 2 path (text_clean_service → intelligence_service) does
+        # ``UUID(envelope.trace_id or "")`` to persist enrichment, so a
+        # None/empty trace_id crashes Lane 2 persistence (first real Granola
+        # ingest, 2026-05-26 E2E). A per-interaction uuid4 gives the interaction
+        # a real trace id without touching the shared service (/text/clean
+        # passes its own context.trace_id, unaffected). Idempotent: trace_id is
+        # not a dedup key (interaction_id is), so a fresh value on retry is fine.
+        trace_id=str(uuid4()),
         account_id=anchor_account_id,
         pg_user_id=str(credential.user_id),
     )
