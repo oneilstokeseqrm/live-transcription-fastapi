@@ -55,6 +55,7 @@ import asyncpg
 from models.envelope import ContentModel, EnvelopeV1
 from services import text_clean_service
 from services.account_lookup import lookup_account_by_domain
+from services.contact_resolution import ResolvedContactRow, find_or_create_contact
 from services.database import get_async_session
 from services.granola_ingestion.api_client import GranolaAPIClient
 from services.granola_ingestion.errors import GranolaError, GranolaErrorCode
@@ -647,13 +648,6 @@ async def _ingest_scenario_a(
 
     try:
         interaction_id = existing_interaction_id or uuid4()
-        envelope = _build_envelope(
-            credential=credential,
-            detail=detail,
-            anchor_account_id=anchor_account_id,
-            decision=decision,
-            interaction_id=interaction_id,
-        )
 
         # Pre-write 'in_progress' BEFORE publish so a crash between Lane 1
         # success and the success UPSERT can't lose our idempotency
@@ -671,17 +665,14 @@ async def _ingest_scenario_a(
             granola_updated_at=note_summary.updated_at,
         )
 
-        # Edge #12 (Codex R1 [P1]): FINAL liveness gate, immediately before the
-        # downstream publish. The cycle's per-note recheck runs before
-        # ``process_note`` fetches the note detail + classifies it; a
-        # /disconnect (the DELETE endpoint takes no advisory lock) landing
-        # during that fetch/classify window would pass the earlier check yet
-        # still reach here. Re-checking right before ``text_clean_service.process``
-        # closes that window so we never emit a Lane 1/Lane 2 event for a
-        # credential the user just disconnected. The ``in_progress`` row written
-        # above is a benign, self-healing idempotency anchor: a later reconnect
-        # resets ``last_polled_at`` → re-scans → re-publishes under the SAME
-        # ``eq_interaction_id`` (downstream dedups), so no duplicate entity.
+        # Gate #1 (edge #12): liveness check BEFORE contact-resolution writes or
+        # publish. The per-note recheck runs before process_note fetches+classifies
+        # the note; a /disconnect (the DELETE endpoint takes no advisory lock)
+        # during that window would pass the earlier check yet still reach here.
+        # A SECOND gate runs after contact resolution (below), immediately before
+        # publish. The ``in_progress`` row above is a benign, self-healing
+        # idempotency anchor: a later reconnect resets ``last_polled_at`` →
+        # re-scans → re-publishes under the SAME ``eq_interaction_id``.
         if not await _credential_is_active(
             pool=pool,
             credential_id=credential.id,
@@ -689,8 +680,63 @@ async def _ingest_scenario_a(
             user_id=credential.user_id,
         ):
             logger.info(
-                "granola_adapter: credential %s deactivated before publishing "
-                "note %s; aborting cycle (no downstream emit)",
+                "granola_adapter: credential %s deactivated before resolving "
+                "contacts for note %s; aborting cycle (no downstream emit)",
+                credential.id, note_summary.id,
+            )
+            raise _CredentialDeactivated(credential.id)
+
+        # Resolve known-account attendees to contacts (find-or-create). SINGLE
+        # source: the same resolved_contacts feeds the envelope extras (Lane 1 →
+        # downstream Neo4j) AND Lane2Extras (Lane 2 → raw_interactions +
+        # interaction_contact_links). Scenario A guarantees >=1 known attendee,
+        # but DB resolution can still yield zero (invalid UUID, FK gone, blank
+        # email). Treat zero as an INVARIANT VIOLATION: retry rather than publish
+        # a meeting whose co-occurring unknown-domain approval would later fail on
+        # a missing raw_interactions row (the latent mixed-meeting bug this change
+        # closes). Find-or-create is idempotent, so the retry is safe.
+        resolved_contacts = await _resolve_known_account_contacts(
+            decision=decision, credential=credential
+        )
+        if not resolved_contacts:
+            logger.error(
+                "granola_adapter: Scenario A resolved 0 contacts for note %s "
+                "(invariant violation); recording transient failure to retry",
+                note_summary.id,
+            )
+            return await _record_scenario_a_failure(
+                pool=pool,
+                credential=credential,
+                note_summary=note_summary,
+                error_code="contact_resolution_empty",
+                error_detail={"note_id": note_summary.id},
+                existing_retry_count=existing_retry_count,
+            )
+        contact_ids = [c.contact_id for c in resolved_contacts]
+
+        # Build the envelope WITH the resolved contacts so extras carries
+        # contact_ids/contacts[] (downstream Neo4j channel).
+        envelope = _build_envelope(
+            credential=credential,
+            detail=detail,
+            anchor_account_id=anchor_account_id,
+            decision=decision,
+            interaction_id=interaction_id,
+            resolved_contacts=resolved_contacts,
+        )
+
+        # Gate #2 (Codex consult): contact resolution above is an async window;
+        # re-check liveness immediately before the publish so a /disconnect that
+        # landed during resolution does not emit a Lane 1/Lane 2 event.
+        if not await _credential_is_active(
+            pool=pool,
+            credential_id=credential.id,
+            tenant_id=credential.tenant_id,
+            user_id=credential.user_id,
+        ):
+            logger.info(
+                "granola_adapter: credential %s deactivated during contact "
+                "resolution for note %s; aborting before publish",
                 credential.id, note_summary.id,
             )
             raise _CredentialDeactivated(credential.id)
@@ -704,9 +750,16 @@ async def _ingest_scenario_a(
                     envelope=envelope,
                     # Granola transcripts come pre-clean; do NOT override
                     # cleaned_transcript so Lane 2 analyzes envelope.content.text
-                    # (the front-matter + speaker-tagged turns). Skipping
-                    # the override is critical per the Phase 2d design.
-                    lane2_extras=None,
+                    # (front-matter + speaker-tagged turns). contact_ids drives
+                    # the Lane 2 FK chain (raw_interactions → interaction_summaries
+                    # → interaction_contact_links); the SAME resolved_contacts
+                    # populated envelope.extras above (single source). No
+                    # calendar_event_id — Granola's calendar id is a Google id,
+                    # not an internal calendar_events UUID.
+                    lane2_extras=text_clean_service.Lane2Extras(
+                        contact_ids=contact_ids,
+                        calendar_event_id=None,
+                    ),
                 )
             finally:
                 # text_clean_service.process() owns slot lifecycle on every
@@ -1102,6 +1155,7 @@ def _build_envelope(
     anchor_account_id: str,
     decision: PathTwoDecision,
     interaction_id: Optional[UUID] = None,
+    resolved_contacts: Optional[list[ResolvedContactRow]] = None,
 ) -> EnvelopeV1:
     """Construct the EnvelopeV1 per LOCKED-35/36.
 
@@ -1137,6 +1191,26 @@ def _build_envelope(
         ),
         "granola_attendees_raw": [att.model_dump() for att in detail.attendees],
     }
+
+    # Contact enrichment (Lane 1 → downstream Neo4j). eq-structured-graph-core
+    # iterates extras.contact_ids to MERGE Contact nodes + [:ATTENDED] edges;
+    # contacts[] is the metadata lookup keyed by contact_id (email/name/role).
+    # Shape mirrors models/enrichment_models.py EnrichmentResult.to_extras_dict
+    # so Granola matches the transcript path exactly. The SAME resolved_contacts
+    # object also feeds Lane2Extras in _ingest_scenario_a (single source — no
+    # recompute, so Postgres + Neo4j never diverge). Additive to extras
+    # (Dict[str, Any]); verified 0-drift via scripts/verify_consumer_contracts.py.
+    if resolved_contacts:
+        extras["contact_ids"] = [c.contact_id for c in resolved_contacts]
+        extras["contacts"] = [
+            {
+                "contact_id": c.contact_id,
+                "email": c.email,
+                "name": c.name,
+                "role": "attendee",
+            }
+            for c in resolved_contacts
+        ]
 
     return EnvelopeV1(
         tenant_id=credential.tenant_id,
@@ -1368,6 +1442,69 @@ async def _handle_note_level_granola_error(
         granola_updated_at=note_summary.updated_at,
     )
     return IngestionOutcome.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Known-account contact resolution (mirrors transcript_enrichment's
+# per-attendee find-or-create, but WITHOUT calendar matching / Tavily)
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_known_account_contacts(
+    *,
+    decision: PathTwoDecision,
+    credential: GranolaCredential,
+) -> list[ResolvedContactRow]:
+    """Find-or-create a contact for each known-account attendee.
+
+    Dedupes by normalized email (Granola may list an attendee twice). Each
+    contact binds to that attendee's OWN resolved ``account_id`` (NOT the meeting
+    anchor) — a multi-company meeting links contacts from several accounts, just
+    like the transcript path. Resolves all attendees in ONE session/transaction;
+    tenant-scoped throughout.
+
+    The returned rows are the SINGLE source for both downstream channels in
+    :func:`_ingest_scenario_a`: (1) ``envelope.extras.contact_ids``/``contacts[]``
+    (Lane 1 → downstream Neo4j) and (2) ``Lane2Extras.contact_ids`` (Lane 2 →
+    the raw_interactions → interaction_summaries → interaction_contact_links FK
+    chain). Deriving both from one list avoids Postgres/Neo4j divergence.
+    """
+    known = decision.known_account_attendees
+    if not known:
+        return []
+    seen: set[str] = set()
+    resolved: list[ResolvedContactRow] = []
+    async with get_async_session() as session:
+        for att in known:
+            email_norm = (att.email or "").strip().lower()
+            if not email_norm or email_norm in seen:
+                continue
+            if not att.account_id:
+                # decide_scenario only places BUSINESS attendees with a resolved
+                # account_id into known_account_attendees, so this is non-None in
+                # practice; the defensive skip keeps the invariant explicit.
+                logger.warning(
+                    "granola_adapter: known attendee %s missing account_id; skipping",
+                    email_norm,
+                )
+                continue
+            seen.add(email_norm)
+            row = await find_or_create_contact(
+                session=session,
+                tenant_id=str(credential.tenant_id),
+                email=email_norm,
+                account_id=att.account_id,
+                display_name=att.name,
+            )
+            if not row.account_matched:
+                logger.warning(
+                    "granola_adapter: contact %s already bound to account %s, not "
+                    "the meeting-resolved account %s; kept existing (no reassignment)",
+                    email_norm, row.account_id, att.account_id,
+                )
+            resolved.append(row)
+        await session.commit()
+    return resolved
 
 
 # ---------------------------------------------------------------------------
