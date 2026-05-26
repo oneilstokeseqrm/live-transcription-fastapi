@@ -59,14 +59,24 @@ class CalendarEvent(BaseModel):
     """A Google Calendar event Granola linked the meeting to.
 
     Present when Granola successfully matched the captured meeting to a
-    calendar entry; ``None`` on the parent model otherwise. Only ``id``
-    is currently relied on downstream (LOCKED-36 emits it as
-    ``extras.granola_calendar_event_id``).
+    calendar entry; ``None`` on the parent model otherwise. Only the id
+    is relied on downstream (LOCKED-36 emits it as
+    ``extras.granola_calendar_event_id`` — the raw Google event-id string,
+    NOT an internal calendar_events UUID).
+
+    Granola's public API names this field ``calendar_event_id`` (verified
+    against a live account during the first ``/connect`` E2E, 2026-05-26 — a
+    meeting WITH a calendar event produced 1 GRANOLA_PARSE_ERROR when this was
+    modeled as a required ``id`` that Granola never sends). We model the real
+    field name and keep it optional so a missing id never fails the parse
+    (extra="allow" resilience). This is the raw Google event-id STRING emitted
+    as ``extras.granola_calendar_event_id`` (LOCKED-36) — NOT the internal
+    ``calendar_events`` UUID used by the Lane 2 enrichment path.
     """
 
     model_config = ConfigDict(extra="allow")
 
-    id: str
+    calendar_event_id: Optional[str] = None
 
 
 class TranscriptTurn(BaseModel):
