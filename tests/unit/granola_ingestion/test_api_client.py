@@ -294,6 +294,44 @@ async def test_list_notes_omits_created_after_when_none():
     assert captured["params"]["limit"] == "100"  # default
 
 
+@pytest.mark.asyncio
+async def test_list_notes_omits_folder_id_when_empty_string():
+    """B2/C10: mode='all' resolves to an empty folder_id. Sending folder_id=""
+    makes Granola 400 (VALIDATION_ERROR: Invalid folder ID format); the param
+    MUST be OMITTED so the request means 'all notes in the key's scope'."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"notes": [], "hasMore": False, "cursor": ""})
+
+    client = _client_with_handler(handler)
+    try:
+        await client.list_notes(folder_id="")
+    finally:
+        await client.aclose()
+
+    assert "folder_id" not in captured["params"]  # MUST omit, not send ""
+
+
+@pytest.mark.asyncio
+async def test_list_notes_omits_folder_id_when_none():
+    """folder_id=None (explicit 'watch everything') also omits the param."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"notes": [], "hasMore": False, "cursor": ""})
+
+    client = _client_with_handler(handler)
+    try:
+        await client.list_notes(folder_id=None)
+    finally:
+        await client.aclose()
+
+    assert "folder_id" not in captured["params"]
+
+
 # ---------------------------------------------------------------------------
 # get_note_detail
 # ---------------------------------------------------------------------------

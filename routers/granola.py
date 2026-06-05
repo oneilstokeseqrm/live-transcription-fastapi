@@ -69,6 +69,7 @@ from services.vault import (
     reactivate_credential,
     rotate_credential_key,
     store_credential,
+    update_credential_config,
 )
 from utils.context_utils import get_auth_context_polling
 
@@ -686,13 +687,84 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                 detail="Could not store the Granola credential; please retry.",
             )
         if existing.archived_at is None:
-            # An active (or revoked/error) row already exists.
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Granola is already connected. Use /rotate to change "
-                    "the key, or /disconnect first to reconnect a new one."
-                ),
+            if existing.status != "active":
+                # A revoked/error row exists (key bad, or credential broken) →
+                # 409; the user fixes it via /rotate (new key) or /disconnect.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Granola is already connected. Use /rotate to change "
+                        "the key, or /disconnect first to reconnect a new one."
+                    ),
+                )
+            # C5: an ACTIVE row → folder RECONFIGURE (NOT 409, and NOT
+            # reactivate_credential — that only handles ARCHIVED rows). Under the
+            # per-credential advisory lock so a concurrent poll cycle can't
+            # clobber the config write (and vice versa): load the decrypted key;
+            # if the submitted key DIFFERS it's a key change → /rotate's job
+            # (reject — don't rotate keys silently through /connect); if it
+            # MATCHES, update the watched folders + import_scope in place, then
+            # save-and-test over the new folder set. (Backfill of newly-added
+            # folders is B3 — this does not move the global watermark.)
+            async with _credential_poll_lock(pool, existing.id) as got_lock:
+                if not got_lock:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "A Granola sync is currently running for this "
+                            "connection; please retry in a moment."
+                        ),
+                    )
+                try:
+                    current = await get_granola_credential_for_user(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        caller_module=_CALLER_MODULE,
+                        pool=pool,
+                        trace_id=ctx.trace_id,
+                    )
+                except VaultError as exc:
+                    raise _http_from_vault_error(exc)
+                if current is None:
+                    # Flipped (revoked/error) or archived between the status read
+                    # and the lock → no active row to reconfigure.
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Granola is already connected. Use /rotate to change "
+                            "the key, or /disconnect first to reconnect a new one."
+                        ),
+                    )
+                if body.api_key != current.api_key:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "That Granola key is different from the connected "
+                            "one. Use /rotate to change the key, or /disconnect "
+                            "first to reconnect with a new key."
+                        ),
+                    )
+                try:
+                    await update_credential_config(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        provider=_PROVIDER,
+                        credential_id=existing.id,
+                        new_config=config,
+                        caller_module=_CALLER_MODULE,
+                        pool=pool,
+                        trace_id=ctx.trace_id,
+                    )
+                except VaultError as exc:
+                    raise _http_from_vault_error(exc)
+            # Lock released → save-and-test re-acquires it for the poll, now over
+            # the reconfigured folder set.
+            return await _run_save_and_test(
+                credential_id=existing.id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                pool=pool,
+                trace_id=ctx.trace_id,
             )
         # Archived row → reconnect: reactivate UPDATEs in place (preserving the
         # credential UUID so EncryptionContext stays consistent), resetting

@@ -247,20 +247,73 @@ async def run_one_cycle(
             )
             return CycleResult(credential_skipped=True)
 
-        # B1: read the folder-LIST config (folders[0]) with the legacy singular
-        # folder_id as a one-release fallback. The multi-folder poll LOOP is B2.
-        _cfg_folders = (credential.config or {}).get("folders") or []
-        _poll_folder_id = (
-            _cfg_folders[0].get("id") if _cfg_folders else None
-        ) or credential.config.get("folder_id", "")
-        try:
-            note_summaries = await client.list_notes(
-                folder_id=_poll_folder_id,
-                created_after=credential.last_polled_at,
-            )
-        except GranolaError as exc:
+        # B2: multi-folder poll loop. Read the watched-folder LIST (legacy
+        # singular folder_id as a one-release fallback). mode='all' polls
+        # everything in ONE call (folder_id omitted). A per-folder
+        # FOLDER_NOT_FOUND is recorded in folder_statuses (persisted to
+        # config.folders[].status at end-of-cycle, C6) and SKIPPED so one deleted
+        # folder doesn't fail the whole cycle; any OTHER Granola error is
+        # credential-wide (auth / 5xx / rate-limit / timeout) and aborts the
+        # cycle exactly as the single-folder path did.
+        cfg = credential.config or {}
+        mode = cfg.get("mode", "folders")
+        cfg_folders = cfg.get("folders") or (
+            [{"id": cfg["folder_id"], "name": cfg.get("folder_name")}]
+            if cfg.get("folder_id")
+            else []
+        )
+        if mode == "all":
+            poll_targets: list[Optional[str]] = [None]  # omit folder_id → all notes
+        else:
+            poll_targets = [f["id"] for f in cfg_folders if f.get("id")]
+
+        folder_statuses: dict[str, str] = {}
+        seen_note_ids: set[str] = set()
+        note_summaries: list[GranolaNoteSummary] = []
+        for target in poll_targets:
+            try:
+                folder_notes = await client.list_notes(
+                    folder_id=target, created_after=credential.last_polled_at
+                )
+            except GranolaError as exc:
+                if exc.code is GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND and target:
+                    # One deleted/inaccessible folder: record its status (C6) and
+                    # keep polling the others — don't fail the whole cycle.
+                    folder_statuses[target] = "not_found"
+                    continue
+                outcome_code = await _handle_credential_level_granola_error(
+                    exc=exc, credential=credential, pool=pool
+                )
+                return CycleResult(credential_error_code=outcome_code, outcomes={})
+            if target:
+                folder_statuses[target] = "ok"
+            # In-cycle dedup: a note in two watched folders appears twice; process
+            # it ONCE. The seen-set skips the redundant get_note_detail — re-ingest
+            # is already safe via the external_integration_runs UNIQUE anchor, so
+            # this is a cost optimization, not a correctness requirement.
+            for ns in folder_notes:
+                if ns.id in seen_note_ids:
+                    continue
+                seen_note_ids.add(ns.id)
+                note_summaries.append(ns)
+
+        # If EVERY watched folder is gone, the credential has nothing to poll —
+        # surface it as a credential-level error (preserves the pre-B2
+        # single-folder/legacy signal) instead of silently completing a clean
+        # cycle. PARTIAL not_found (some folders gone, ≥1 still ok) falls through
+        # and ingests the surviving folders.
+        if (
+            mode != "all"
+            and poll_targets
+            and all(folder_statuses.get(t) == "not_found" for t in poll_targets if t)
+        ):
             outcome_code = await _handle_credential_level_granola_error(
-                exc=exc, credential=credential, pool=pool
+                exc=GranolaError(
+                    GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND,
+                    "all watched folders not found",
+                ),
+                credential=credential,
+                pool=pool,
             )
             return CycleResult(credential_error_code=outcome_code, outcomes={})
 
@@ -349,8 +402,43 @@ async def run_one_cycle(
                 tenant_id=credential.tenant_id,
                 user_id=credential.user_id,
             ):
+                # Codex P1: do NOT advance the SHARED watermark when any folder
+                # was skipped (not_found). last_polled_at is a single per-
+                # credential cursor; advancing it past a folder that was missing
+                # THIS cycle would permanently skip notes created in that folder
+                # while it was gone, once it recovers. Keep the old watermark so
+                # the surviving folders are simply re-listed next cycle (dedup
+                # short-circuits re-ingest) and the missing folder is fully
+                # re-covered on recovery. A permanently-deleted folder self-
+                # resolves when the user removes it (reconfigure → all ok →
+                # the watermark advances). True per-folder watermarks are the
+                # future optimization (deferred).
+                folders_skipped = any(
+                    s == "not_found" for s in folder_statuses.values()
+                )
+                success_watermark = (
+                    credential.last_polled_at if folders_skipped else cycle_start_at
+                )
+                # C6: persist per-folder status in config.folders[].status. Only
+                # for the new folders[] shape (not all-mode, not a legacy
+                # folder_id-only config — a poll cycle must not silently migrate
+                # a legacy row's config shape). Recovered folders flip back to
+                # 'ok'; still-missing ones stay 'not_found'. Written in the same
+                # success UPDATE, under the advisory lock that wraps every cycle.
+                updated_config: Optional[dict] = None
+                if mode != "all" and cfg.get("folders"):
+                    updated_config = {
+                        **cfg,
+                        "folders": [
+                            {**f, "status": folder_statuses.get(f.get("id"), "ok")}
+                            for f in cfg["folders"]
+                        ],
+                    }
                 await _mark_credential_polled_success(
-                    credential=credential, pool=pool, last_polled_at=cycle_start_at
+                    credential=credential,
+                    pool=pool,
+                    last_polled_at=success_watermark,
+                    updated_config=updated_config,
                 )
             else:
                 logger.info(
@@ -1187,13 +1275,32 @@ def _build_envelope(
         detail=detail, decision=decision, credential=credential
     )
 
-    # B1: folder name from folders[0] with the legacy folder_name fallback (one
-    # release); B2/C16 makes this membership-aware while keeping the single
-    # downstream string (LOCKED-36).
-    _env_folders = (credential.config or {}).get("folders") or []
-    _folder_name = (
-        _env_folders[0].get("name") if _env_folders else None
-    ) or credential.config.get("folder_name")
+    # C16: derive granola_folder_name from the note's folder membership ∩ the
+    # WATCHED folders (watched order), keeping the single downstream string
+    # (LOCKED-36). Fall back to the note's own first membership (mode='all', or a
+    # note moved between list and detail) so a note is never mislabeled as
+    # folders[0]; then to the legacy singular config for back-compat.
+    _cfg = credential.config or {}
+    _watched = _cfg.get("folders") or (
+        [{"id": _cfg["folder_id"], "name": _cfg.get("folder_name")}]
+        if _cfg.get("folder_id")
+        else []
+    )
+    _membership = {m.id: m.name for m in (detail.folder_membership or [])}
+    _folder_name = next(
+        (
+            _membership.get(f["id"]) or f.get("name")
+            for f in _watched
+            if f.get("id") in _membership
+        ),
+        None,
+    )
+    if _folder_name is None and detail.folder_membership:
+        _folder_name = detail.folder_membership[0].name
+    if _folder_name is None:
+        _folder_name = (
+            _watched[0].get("name") if _watched else None
+        ) or _cfg.get("folder_name")
 
     extras: dict[str, Any] = {
         "granola_note_id": detail.id,
@@ -1707,6 +1814,29 @@ SET last_polled_at = $4,
 WHERE id = $1
   AND tenant_id = $2
   AND user_id = $3
+  AND status = 'active'
+  AND archived_at IS NULL
+"""
+
+# B2/C6: success-update variant that ALSO writes config (per-folder statuses) in
+# the SAME UPDATE, so a recovered folder flips back to 'ok' and a still-missing
+# one stays 'not_found' (last_error is wiped each cycle, so per-folder status
+# can't live there). The status='active' guard — added to BOTH variants on the
+# Codex consult — is the DB-level backstop: a revoked/error/disconnected
+# credential can never be resurrected to a clean polled state by a stray cycle
+# write, even past the adapter's runtime liveness gates (edge #12).
+_UPDATE_CREDENTIAL_POLL_SUCCESS_WITH_CONFIG_SQL = """
+UPDATE vault.user_credentials
+SET last_polled_at = $4,
+    consecutive_failures = 0,
+    last_error = NULL,
+    config = $5::jsonb,
+    status = CASE WHEN status = 'active' THEN 'active' ELSE status END,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1
+  AND tenant_id = $2
+  AND user_id = $3
+  AND status = 'active'
   AND archived_at IS NULL
 """
 
@@ -2136,7 +2266,11 @@ async def _upsert_integration_run(
 
 
 async def _mark_credential_polled_success(
-    *, credential: GranolaCredential, pool: asyncpg.Pool, last_polled_at: datetime
+    *,
+    credential: GranolaCredential,
+    pool: asyncpg.Pool,
+    last_polled_at: Optional[datetime],
+    updated_config: Optional[dict] = None,
 ) -> None:
     """End-of-cycle: reset consecutive_failures, stamp last_polled_at.
 
@@ -2146,15 +2280,29 @@ async def _mark_credential_polled_success(
     PR-X2 R1 P1 flagged: a note created between ``list_notes`` and the
     end-of-cycle UPDATE would not be in the result set, and next
     cycle's ``created_after=cycle_end`` filter would skip it forever.
+
+    ``updated_config`` (B2/C6), when provided, is written in the SAME UPDATE so
+    per-folder statuses (config.folders[].status) persist — the success update
+    wipes last_error every cycle, so per-folder status cannot live there.
     """
     async with pool.acquire() as conn:
-        await conn.execute(
-            _UPDATE_CREDENTIAL_POLL_SUCCESS_SQL,
-            credential.id,
-            credential.tenant_id,
-            credential.user_id,
-            last_polled_at,
-        )
+        if updated_config is not None:
+            await conn.execute(
+                _UPDATE_CREDENTIAL_POLL_SUCCESS_WITH_CONFIG_SQL,
+                credential.id,
+                credential.tenant_id,
+                credential.user_id,
+                last_polled_at,
+                json.dumps(updated_config),
+            )
+        else:
+            await conn.execute(
+                _UPDATE_CREDENTIAL_POLL_SUCCESS_SQL,
+                credential.id,
+                credential.tenant_id,
+                credential.user_id,
+                last_polled_at,
+            )
 
 
 async def _mark_credential_revoked(

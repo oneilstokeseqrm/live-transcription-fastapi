@@ -43,6 +43,7 @@ from .user_credentials import (
     reactivate_credential,
     rotate_credential_key,
     store_credential,
+    update_credential_config,
 )
 
 __all__ = [
@@ -58,4 +59,5 @@ __all__ = [
     "reactivate_credential",
     "rotate_credential_key",
     "store_credential",
+    "update_credential_config",
 ]

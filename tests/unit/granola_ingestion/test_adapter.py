@@ -32,6 +32,7 @@ from services.granola_ingestion.errors import GranolaError, GranolaErrorCode
 from services.granola_ingestion.models import (
     Attendee,
     CalendarEvent,
+    FolderMembership,
     GranolaNoteDetail,
     GranolaNoteSummary,
     TranscriptTurn,
@@ -2289,7 +2290,7 @@ async def test_run_one_cycle_polls_folder_id_from_folders_list_first():
     credential.config = {
         "mode": "folders",
         "import_scope": "history",
-        "folders": [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}],
+        "folders": [{"id": "fol_a", "name": "A"}],
     }
     conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
     pool = _FakePool(conn)
@@ -2347,3 +2348,217 @@ def test_build_envelope_folder_name_from_folders_list_first():
     )
 
     assert envelope.extras["granola_folder_name"] == "Sales"
+
+
+# ---------------------------------------------------------------------------
+# B2 (EQ-91) — multi-folder poll loop + dedup + per-folder status (C6) +
+# membership-aware folder name (C16)
+# ---------------------------------------------------------------------------
+
+
+def _scenario_a_decision():
+    """A minimal Scenario-A PathTwoDecision stand-in for envelope tests."""
+    return SimpleNamespace(
+        scenario=Scenario.A_KNOWN_ANCHOR,
+        anchor_account_id="11111111-aaaa-4111-8111-111111111111",
+        known_account_attendees=[
+            AttendeeClassification(
+                email="alice@bigco.com",
+                name="Alice Adams",
+                domain="bigco.com",
+                klass=DomainClass.BUSINESS,
+                account_id="11111111-aaaa-4111-8111-111111111111",
+            )
+        ],
+        unknown_business_attendees=[],
+        personal_attendees=[],
+        internal_attendees=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_loops_folders_and_dedups_overlap():
+    """B2: the cycle polls EVERY watched folder and processes a note that lives
+    in two folders only ONCE (in-cycle seen-set; external_integration_runs makes
+    re-ingest safe regardless, the seen-set skips the redundant detail-fetch)."""
+    credential = _build_credential()
+    credential.config = {
+        "mode": "folders", "import_scope": "history",
+        "folders": [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}],
+    }
+    nx, ny, nz = _make_note_summary("nX"), _make_note_summary("nY"), _make_note_summary("nZ")
+
+    async def _list(**kw):
+        fid = kw.get("folder_id")
+        if fid == "fol_a":
+            return [nx, ny]          # A has X, Y
+        if fid == "fol_b":
+            return [nx, nz]          # B has X (overlap), Z
+        return []
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(side_effect=_list)
+    client.aclose = AsyncMock()
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    processed_ids: list[str] = []
+
+    async def _proc(**kw):
+        processed_ids.append(kw["note_summary"].id)
+        return IngestionOutcome.SUCCESS
+
+    with patch.object(adapter, "process_note", new=AsyncMock(side_effect=_proc)), \
+         patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=True)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())):
+        result = await adapter.run_one_cycle(
+            credential=credential, pool=pool, api_client=client,  # type: ignore[arg-type]
+        )
+
+    polled = sorted(c.kwargs["folder_id"] for c in client.list_notes.await_args_list)
+    assert polled == ["fol_a", "fol_b"]            # both folders polled
+    assert sorted(processed_ids) == ["nX", "nY", "nZ"]   # overlap X processed once
+    assert result.notes_processed == 3
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_folder_not_found_continues_and_persists_status():
+    """B2/C6: a deleted folder 404s, but the cycle keeps polling the others and
+    DOES NOT fail; the per-folder status is persisted in config.folders[].status
+    (survives the success update, which wipes last_error)."""
+    credential = _build_credential()
+    credential.config = {
+        "mode": "folders", "import_scope": "history",
+        "folders": [{"id": "fol_ok", "name": "OK"}, {"id": "fol_gone", "name": "Gone"}],
+    }
+    na = _make_note_summary("nA")
+
+    async def _list(**kw):
+        fid = kw.get("folder_id")
+        if fid == "fol_ok":
+            return [na]
+        if fid == "fol_gone":
+            raise GranolaError(GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND, "folder gone")
+        return []
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(side_effect=_list)
+    client.aclose = AsyncMock()
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    with patch.object(adapter, "process_note", new=AsyncMock(return_value=IngestionOutcome.SUCCESS)), \
+         patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=True)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())):
+        result = await adapter.run_one_cycle(
+            credential=credential, pool=pool, api_client=client,  # type: ignore[arg-type]
+        )
+
+    assert result.notes_processed == 1            # the good folder still ingested
+    assert result.credential_error_code is None   # cycle did NOT fail
+
+    # C6: the success update wrote config.folders[].status (fol_ok=ok, fol_gone=not_found)
+    success = [c for c in conn.execute_calls if "config = $5" in c[0]]
+    assert len(success) == 1
+    written = json.loads(success[0][1][4])
+    statuses = {f["id"]: f.get("status") for f in written["folders"]}
+    assert statuses == {"fol_ok": "ok", "fol_gone": "not_found"}
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_partial_not_found_does_not_advance_watermark():
+    """B2 (Codex P1): when one folder is not_found but another succeeds, the
+    SHARED watermark must NOT advance — else notes created in the missing folder
+    before it recovers are permanently skipped (no per-folder watermark in v1).
+    The surviving folders are simply re-listed next cycle (dedup short-circuits
+    re-ingest)."""
+    old_watermark = datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
+    credential = _build_credential(last_polled_at=old_watermark)
+    credential.config = {
+        "mode": "folders", "import_scope": "history",
+        "folders": [{"id": "fol_ok", "name": "OK"}, {"id": "fol_gone", "name": "Gone"}],
+    }
+
+    async def _list(**kw):
+        if kw.get("folder_id") == "fol_gone":
+            raise GranolaError(GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND, "gone")
+        return []
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(side_effect=_list)
+    client.aclose = AsyncMock()
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    with patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=True)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())):
+        await adapter.run_one_cycle(
+            credential=credential, pool=pool, api_client=client,  # type: ignore[arg-type]
+        )
+
+    # success update ran (config = $5) but last_polled_at ($4) stayed the OLD value
+    success = [c for c in conn.execute_calls if "config = $5" in c[0]]
+    assert len(success) == 1
+    assert success[0][1][3] == old_watermark  # $4 = last_polled_at — NOT advanced
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_all_mode_polls_once_without_folder_id():
+    """B2: mode='all' polls everything in ONE call with folder_id omitted."""
+    credential = _build_credential()
+    credential.config = {"mode": "all", "import_scope": "history", "folders": []}
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[])
+    client.aclose = AsyncMock()
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    with patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=True)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())):
+        await adapter.run_one_cycle(
+            credential=credential, pool=pool, api_client=client,  # type: ignore[arg-type]
+        )
+
+    client.list_notes.assert_awaited_once()
+    assert client.list_notes.await_args.kwargs["folder_id"] is None
+
+
+def test_build_envelope_folder_name_from_membership_intersection():
+    """C16: granola_folder_name is the WATCHED folder the note actually belongs
+    to (membership ∩ watched, watched order) — NOT just folders[0]."""
+    credential = _build_credential()
+    credential.config = {
+        "mode": "folders", "import_scope": "history",
+        "folders": [{"id": "fol_a", "name": "Sales"}, {"id": "fol_b", "name": "EQ"}],
+    }
+    detail = _make_note_detail(attendees=[Attendee(email="alice@bigco.com", name="Alice Adams")])
+    detail.folder_membership = [FolderMembership(id="fol_b", name="EQ")]  # in fol_b only
+
+    envelope = adapter._build_envelope(
+        credential=credential,  # type: ignore[arg-type]
+        detail=detail,
+        anchor_account_id="11111111-aaaa-4111-8111-111111111111",
+        decision=_scenario_a_decision(),  # type: ignore[arg-type]
+    )
+
+    assert envelope.extras["granola_folder_name"] == "EQ"   # not "Sales" (folders[0])
+
+
+def test_build_envelope_folder_name_falls_back_to_membership_when_no_watched_match():
+    """C16: with no watched-folder intersection (mode='all' or a moved note),
+    fall back to the note's own first membership name — never mislabel as
+    folders[0]."""
+    credential = _build_credential()
+    credential.config = {"mode": "all", "import_scope": "history", "folders": []}
+    detail = _make_note_detail(attendees=[Attendee(email="alice@bigco.com", name="Alice Adams")])
+    detail.folder_membership = [FolderMembership(id="fol_z", name="Personal")]
+
+    envelope = adapter._build_envelope(
+        credential=credential,  # type: ignore[arg-type]
+        detail=detail,
+        anchor_account_id="11111111-aaaa-4111-8111-111111111111",
+        decision=_scenario_a_decision(),  # type: ignore[arg-type]
+    )
+
+    assert envelope.extras["granola_folder_name"] == "Personal"

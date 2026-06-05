@@ -278,6 +278,24 @@ WHERE id = $1
 RETURNING id
 """
 
+# B2/C5: in-place config update on an ACTIVE credential row (the Granola
+# folder-reconfigure path). Updates ONLY the opaque config JSONB — never the
+# encrypted key, status, or last_polled_at. ``status = 'active'`` so a
+# revoked/error/archived row can't be reconfigured (those route to /rotate or
+# /disconnect). Caller MUST hold the per-credential advisory lock so a poll
+# cycle's end-of-cycle config write can't clobber this (and vice versa).
+_UPDATE_CONFIG_SQL = """
+UPDATE vault.user_credentials
+SET config = $1::jsonb,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $2
+  AND tenant_id = $3
+  AND user_id = $4
+  AND status = 'active'
+  AND archived_at IS NULL
+RETURNING id
+"""
+
 
 def _build_encryption_context(
     *, tenant_id: UUID, user_id: UUID, provider: str, credential_id: UUID
@@ -1090,6 +1108,109 @@ async def reactivate_credential(
             provider=provider,
             caller_module=caller_module,
             operation="reactivate",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
+        )
+        raise wrapped from exc
+
+    return credential_id
+
+
+async def update_credential_config(
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    provider: str,
+    credential_id: UUID,
+    new_config: dict[str, Any],
+    caller_module: str,
+    pool: asyncpg.Pool,
+    trace_id: str | None = None,
+) -> UUID:
+    """Update the opaque ``config`` JSONB on an ACTIVE credential row in place.
+
+    The Granola folder-reconfigure path (B2/C5): change which folders are
+    watched (and re-apply ``import_scope``) WITHOUT rotating the key. Touches
+    ONLY ``config`` — never the encrypted key (use :func:`rotate_credential_key`
+    for that), the ``status``, or ``last_polled_at`` (the watermark/backfill
+    semantics for newly-added folders are handled by the poll cycle / B3).
+
+    The caller MUST hold the per-credential advisory lock: a concurrent poll
+    cycle reads ``config`` at cycle start and writes ``config.folders[].status``
+    at cycle end (C6), so an unsynchronized reconfigure could be clobbered (or
+    clobber the cycle's status write). Audited as a credential ``write``.
+
+    Raises ``VAULT_DB_NOT_FOUND`` if no ACTIVE, non-archived row matches the
+    ``credential_id`` (it was archived/revoked/error between lookup and update).
+    """
+    try:
+        _check_allowlist(caller_module)
+    except VaultPermissionError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="write",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+
+    config_json = _dumps_jsonb(new_config)
+
+    try:
+        async with pool.acquire() as cred_conn:
+            async with cred_conn.transaction():
+                updated = await cred_conn.fetchrow(
+                    _UPDATE_CONFIG_SQL,
+                    config_json,
+                    credential_id,
+                    tenant_id,
+                    user_id,
+                )
+                if updated is None:
+                    raise VaultError(
+                        VaultErrorCode.VAULT_DB_NOT_FOUND,
+                        f"no active credential id={credential_id} to reconfigure "
+                        f"(archived/revoked/error between lookup and update)",
+                    )
+                await audit.write_audit_row_on_conn(
+                    conn=cred_conn,
+                    credential_id=credential_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    provider=provider,
+                    caller_module=caller_module,
+                    operation="write",
+                    success=True,
+                    trace_id=trace_id,
+                )
+    except VaultError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="write",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="update_config DB section")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=provider,
+            caller_module=caller_module,
+            operation="write",
             error_code=wrapped.code.value,
             trace_id=trace_id,
         )

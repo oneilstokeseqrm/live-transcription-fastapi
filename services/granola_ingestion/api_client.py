@@ -244,7 +244,7 @@ class GranolaAPIClient:
     async def list_notes(
         self,
         *,
-        folder_id: str,
+        folder_id: str | None = None,
         created_after: datetime | None = None,
         limit: int = 100,
     ) -> list[GranolaNoteSummary]:
@@ -274,10 +274,13 @@ class GranolaAPIClient:
         loud as :attr:`GranolaErrorCode.GRANOLA_PARSE_ERROR` instead
         of looping forever.
         """
-        base_params: dict[str, str | int] = {
-            "folder_id": folder_id,
-            "limit": limit,
-        }
+        # Omit folder_id when falsy ("" or None): an empty value 400s as
+        # VALIDATION_ERROR ("Invalid folder ID format"), while ABSENCE of the
+        # param means "all notes in the key's scope" — the mode='all' path
+        # (B2/C10). The adapter resolves "" for an all-mode credential.
+        base_params: dict[str, str | int] = {"limit": limit}
+        if folder_id:
+            base_params["folder_id"] = folder_id
         if created_after is not None:
             base_params["created_after"] = _format_created_after(created_after)
 
