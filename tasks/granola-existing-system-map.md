@@ -15,12 +15,14 @@ model), `tasks/granola-integration-plan.md` (the original Phase 2/3 plan + §2.1
 
 ## A. BACKEND — `live-transcription-fastapi` (the Granola engine; SHIPPED + LIVE)
 
-**State:** Functionally complete and live in production. main tip `e0aafbe` (#36 contact resolution)
-+ `fafaee2` (docs). Railway prod deploy `eca82628` SUCCESS; `/health` 200. Prod has
-`ALLOW_LEGACY_HEADER_AUTH=true`.
+**State:** Functionally complete and live in production. **main tip `922660b`** — EQ-91 (multi-folder)
+SHIPPED + MERGED + DEPLOYED: B1 PR #37 `de3b1f3` + B2 PR #38 `922660b`; `/health` 200 (pre-Phase-3
+baseline was `e0aafbe`+`fafaee2`). Prod has `ALLOW_LEGACY_HEADER_AUTH=true`. **NEXT = eq-frontend
+`granola_import_runs` migration → EQ-92 (B3 background import).**
 
 **The end-to-end flow that works today:** connect a Granola account (currently via a hand-minted JWT,
-no UI) → a 5-min EventBridge Rule pings a cron endpoint → the scheduler polls the connected folder →
+no UI) → a 5-min EventBridge Rule pings a cron endpoint → the scheduler polls every watched folder in
+`config.folders[]` (de-duping overlapping notes) →
 new meetings are ingested, cleaned (LLM), summarized, and linked to the right company AND people →
 published downstream to the relationship graph. Proven E2E in prod on a real meeting (`bca60296`).
 
@@ -28,23 +30,25 @@ published downstream to the relationship graph. Proven E2E in prod on a real mee
 
 | File | Role |
 |---|---|
-| `routers/granola.py` | Admin endpoints the UI will consume: `POST /validate` (key→folders), `POST /connect` (store + synchronous "save & test" first poll — LOCKED-31), `POST /rotate`, `GET /status` (7-day activity, no decrypt), `DELETE` (soft-delete). All JWT-authed; require `pg_user_id`. **No `PATCH /folder` exists.** |
+| `routers/granola.py` | Admin endpoints the UI consumes: `POST /validate` (key→folders), `POST /connect` (ARRAY-shaped `folders[]`+`mode`+`import_scope` with legacy singular back-compat; store + synchronous "save & test" first poll — LOCKED-31, retired in B3; an **ACTIVE-row /connect RECONFIGURES** watched folders in place via `update_credential_config`, different key→409 "use /rotate"; rejects `mode="all"` 400 until B3), `POST /rotate`, `GET /status` (array `folders[]`+`mode`+per-folder `status`, plus a legacy `folder` mirror; 7-day activity, no decrypt), `DELETE` (soft-delete). All JWT-authed; require `pg_user_id`. (Folder edit = the active-row /connect reconfigure; no separate `PATCH /folder`.) |
 | `routers/queue_actions.py` | Pending-approvals actions: `POST /queue/{id}/approve`, `/map`, `/ignore`. **No GET/list endpoint** — the UI must read the queue another way (Prisma direct or a new endpoint). First-owner-wins, per-user. |
 | `routers/granola_cron.py` | `POST /internal/granola/cron-tick` (X-Internal-Cron-Secret) — the 5-min EventBridge Rule hits this. |
-| `services/granola_ingestion/adapter.py` | `run_one_cycle` — the per-credential poll. **Polls ONE folder** (`list_notes(folder_id=config["folder_id"])`); processes notes **SEQUENTIALLY** (`for note in notes: await process_note(...)`). Per-note idempotency anchor in `external_integration_runs`. `_resolve_known_account_contacts` + `_build_envelope` (contact resolution, #36). |
+| `services/granola_ingestion/adapter.py` | `run_one_cycle` — the per-credential poll. **Polls EVERY watched folder in a loop** (`mode="all"` polls everything in one call), de-dups overlapping notes via an in-cycle seen-set; a per-folder `FOLDER_NOT_FOUND` → `config.folders[].status='not_found'` + skip (cycle continues; all-folders-gone → credential error); shared `last_polled_at` HELD on any partial skip. Notes still processed **SEQUENTIALLY** (parallelization = EQ-93/B4). Per-note idempotency anchor in `external_integration_runs`. `_resolve_known_account_contacts` + membership-aware `_build_envelope` `granola_folder_name` (C16). |
 | `services/granola_ingestion/scheduler.py` | DBOS workflow + per-credential advisory lock (serializes overlapping cycles). |
 | `services/granola_ingestion/api_client.py` | Granola HTTP client. `public-api.granola.ai/v1`. `list_folders`/`list_notes(folder_id, created_after)`/`get_note_detail`. Cursor pagination, retry/429 handling. |
 | `services/granola_ingestion/path2.py` | Scenario A (known account → ingest) / C (unknown → defer to approval queue) / D (no business attendee → skip). |
 | `services/granola_ingestion/contact_resolution.py` | (#36) race-safe `find_or_create_contact` (`INSERT … ON CONFLICT (tenant,email)`). |
-| `services/vault/` | KMS-envelope-encrypted credential store. `user_credentials.py` — `store_credential`, `get_granola_credential_for_user`, `reactivate_credential` (nulls `last_polled_at` on folder change), `archive_credential`. `config` is opaque JSONB. |
+| `services/vault/` | KMS-envelope-encrypted credential store. `user_credentials.py` — `store_credential`, `get_granola_credential_for_user`, `reactivate_credential` (ARCHIVED rows only; nulls `last_polled_at`), **`update_credential_config`** (B2 — in-place watched-folder/`import_scope` reconfigure on an ACTIVE row; advisory-lock-gated; used by the active-row /connect path), `archive_credential`. `config` is opaque JSONB. |
 | `services/text_clean_service.py` | `process(*, tenant_id, user_id, account_id, envelope, lane2_extras)` — the LLM clean + Lane 1 publish + Lane 2 dispatch. Backpressure cap (`TEXT_CLEAN_MAX_BG_TASKS=50`). |
 | `services/intelligence_service.py` | Lane 2: writes Postgres `raw_interactions`/`interaction_summaries`/`interaction_contact_links`. `_persist_intelligence` has a known re-ingest non-idempotency (§2.1 #16). |
 
 ### Backend data model (Prisma-owned by eq-frontend, written by this service)
 
 - `vault.user_credentials` — one row per `(tenant, user, provider='granola')` (UNIQUE). `config` JSONB
-  currently `{folder_id, folder_name}` (**singular** — multi-folder changes this to a list). Encrypted
-  key + status lifecycle + `last_polled_at` watermark (single, per-credential).
+  is now a **LIST shape**: `{mode, import_scope, folders:[{id,name,status}], …}` with `folders[0]` mirrored
+  into legacy singular `folder_id`/`folder_name` for one release of back-compat (the prod test credential
+  is still a legacy single-folder config, handled via the loop's legacy synthesis). Encrypted key + status
+  lifecycle + `last_polled_at` watermark (single, per-credential; HELD on any partial folder skip).
 - `public.external_integration_runs` — per-note dedup ledger. UNIQUE `(tenant,user,provider,external_id=note_id)`.
   This is what makes overlapping folders / re-ingests safe.
 
@@ -59,7 +63,10 @@ published downstream to the relationship graph. Proven E2E in prod on a real mee
    first backfill *inside the HTTP request* (LOCKED-31) for instant confirmation. Combined with
    Railway's hard ~5-min request cap, a real design partner's existing history (hundreds of meetings)
    would time out. **This is the load-bearing reason Phase 3 must move the first backfill to the
-   background + (fast-follow) parallelize intake.**
+   background + (fast-follow) parallelize intake.** **(EQ-91/B1+B2 shipped the multi-folder loop; the
+   first poll is STILL synchronous — B3/EQ-92, the NEXT step, moves the first backfill to a background
+   history-import and LIFTS the `mode="all"` /connect guard once /connect is async. Intra-cycle intake
+   is still sequential; parallelization is EQ-93/B4.)**
 
 ---
 

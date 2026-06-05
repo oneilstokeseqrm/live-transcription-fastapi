@@ -1,5 +1,13 @@
 # Granola Parallel-Intake — Investigation, Recommendation & De-Risked Design (EQ-93)
 
+> **⚠️ STALENESS NOTE (2026-06-05):** the `adapter.py` line references and the "current intake" snapshot
+> below PREDATE EQ-91 (B1+B2, merged `de3b1f3`/`922660b`) and will shift AGAIN in B3. On current `main`,
+> `run_one_cycle` now gathers notes via a **per-folder loop** (`for target in poll_targets`) with an
+> in-cycle seen-set dedup BEFORE the per-note loop, and B2 already added a **partial-skip watermark
+> guard** (the shared `last_polled_at` is HELD when any folder is skipped — folds into correction #6's
+> resumption reasoning; true per-folder watermarks remain the deferred follow-up). **This is a B4
+> fast-follow doc — re-verify all code-location citations against current `main` before building EQ-93.**
+
 **Date:** 2026-06-04
 **Status:** INVESTIGATION COMPLETE — recommendation = **fast-follow** (NOT v1). Build-ready design sketch
 with the 6 mandatory corrections the adversarial review surfaced.

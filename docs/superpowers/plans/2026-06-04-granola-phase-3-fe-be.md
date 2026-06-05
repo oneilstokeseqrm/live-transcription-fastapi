@@ -1,5 +1,26 @@
 # Granola Phase 3 (Frontend + Backend) Implementation Plan
 
+> ## 🟢 BUILD STATUS (updated 2026-06-05) — EQ-91 (B1+B2) SHIPPED + DEPLOYED
+> **Backend EQ-91 is COMPLETE, MERGED, DEPLOYED, `/health` 200, `main @ 922660b`. EQ-91 = Done in Linear.**
+> - **Phase B1 ✅ SHIPPED** — PR #37, squash `de3b1f3`: folder-LIST model + array `/connect`&`/status` with
+>   legacy back-compat on BOTH request and response (singular `folder_id`/`folder_name` coalesced into
+>   `folders[0]`; `/status` returns a legacy `folder` mirror alongside `folders[]`); `ConnectRequest` gained
+>   `mode`+`folders[]`+`import_scope`; `/connect` REJECTS `mode="all"` (400) until B3; adapter reads
+>   `folders[0]` w/ legacy fallback.
+> - **Phase B2 ✅ SHIPPED** — PR #38, squash `922660b`: multi-folder poll loop + in-cycle seen-set dedup;
+>   `api_client.list_notes` omits `folder_id` when falsy; per-folder `not_found` → `config.folders[].status`
+>   + skip (cycle continues), all-folders-gone → credential error; membership-aware `granola_folder_name`
+>   (C16); active-row `/connect` RECONFIGURE via NEW vault `update_credential_config` (different key → 409
+>   "use /rotate"); success-update guards `status='active'`; **shared `last_polled_at` watermark HELD on any
+>   folder skip**.
+> - **NEXT = eq-frontend `granola_import_runs` Prisma migration → EQ-92 (B3 background history-import).**
+>   B3 LIFTS the `mode="all"` `/connect` guard (once `/connect` is async). Resume checkpoint:
+>   `granola-eq91-shipped-b3-next`; next-session prompt: `docs/superpowers/specs/2026-06-05-granola-b3-next-session-prompt.md`.
+> - **Deferred into B3/later:** per-folder watermarks (B2 holds the shared watermark on any skip); live-API
+>   multi-folder probes (multi-folder doc §6); newly-added-folder backfill on reconfigure (B3 Step 5b, C17).
+> - The **B1/B2 phase sections below are the BUILD RECORD** (shipped — their step checkboxes are left
+>   as-built). The **B3/B4/frontend (F1–F4) sections + §1a/§2/§5 are the forward plan** and remain authoritative.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended)
 > or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 > This is a MULTI-SESSION plan across TWO repos. Each Phase below is a single PR with its own Codex
@@ -13,10 +34,11 @@ existing onboarding "meeting-connect" step and in Settings → Connections. (The
 unknown-account meetings to the per-user account-creation approval queue; the frontend approvals UI is a
 SEPARATE future project, not in this scope.)
 
-**Architecture:** The Granola backend engine is COMPLETE + LIVE (main `e0aafbe`+`fafaee2`; Railway
-`eca82628`; `/health` 200). Phase 3 widens the backend from single-folder + synchronous-first-poll to a
-**folder LIST + array-shaped `/connect`/`/status` + a background history-import with an "importing N of
-M" progress signal**, and builds the **greenfield frontend** over the **existing, production-proven
+**Architecture:** The Granola backend engine is COMPLETE + LIVE (main @ `922660b` after EQ-91/B1+B2;
+`/health` 200; pre-Phase-3 baseline was `e0aafbe`+`fafaee2`). B1+B2 already delivered the **folder-LIST
+model + array-shaped `/connect`/`/status` + the multi-folder poll loop**; Phase 3's REMAINING backend work
+is the **background history-import with an "importing N of M" progress signal** (B3, which retires the
+still-present synchronous first poll), plus the **greenfield frontend** over the **existing, production-proven
 gateway-JWT rail** (`callBackend` + `mintInternalJwt(pg_user_id)` → `BACKEND_SERVICE_TRANSCRIPTION_URL`).
 No OAuth. No downstream envelope changes. No Prisma migration for multi-folder (`config` is opaque JSONB).
 
@@ -269,7 +291,11 @@ project (out of scope; see §0).
 > Branch convention: `phase-3/granola-be-<phase>`; `git branch --show-current` before every commit
 > ([[feature-branch-safety-protocol]]). All work on feature branches; founder authorizes each merge.
 
-### Phase B1 — Folder-LIST data model + array-shaped contracts (EQ-91, ~0.5–1 day)
+### Phase B1 — Folder-LIST data model + array-shaped contracts (EQ-91) — ✅ SHIPPED (PR #37 `de3b1f3`, deployed)
+
+> **✅ All B1 steps below SHIPPED** (boxes left as the build record). Notable as-built detail beyond the
+> steps: `/status` returns a legacy `folder` mirror alongside `folders[]` (one-release back-compat) — B3
+> must preserve it. `/connect` rejects `mode="all"` (400) until B3 lifts the guard.
 
 **Files:**
 - Modify: `routers/granola.py` (ConnectRequest → arrays; `/status` folder→folders; back-compat)
@@ -353,7 +379,13 @@ return { ..., "mode": cfg.get("mode", "folders"),
 
 ---
 
-### Phase B2 — Multi-folder poll loop + "ingest everything" fix + per-folder error state (EQ-91, ~0.5–1 day)
+### Phase B2 — Multi-folder poll loop + "ingest everything" fix + per-folder error state (EQ-91) — ✅ SHIPPED (PR #38 `922660b`, deployed)
+
+> **✅ All B2 steps below SHIPPED** (boxes left as the build record). As-built notes for B3: the active-row
+> folder reconfigure (Step 7 / C5) landed via NEW vault helper `update_credential_config` (same key →
+> reconfigure in place; different key → 409 "use /rotate") — B3 Step 5b builds the watermark/import_scope
+> handling ON TOP of it. B2 also already HOLDS the shared `last_polled_at` watermark on any partial folder
+> skip (does not advance on a per-folder skip); B3 Step 5b only adds add-folder/import_scope handling.
 
 **Files:**
 - Modify: `services/granola_ingestion/adapter.py` (`run_one_cycle` loop over folders; in-cycle seen-set; per-folder error capture)
@@ -807,6 +839,9 @@ reconfigure). Together they cover both the v1 and the fast-follow. No direct con
 default = history [defaulted; founder may flip to "forward" — a UI default, confirmable at build]; D1–D5
 technical calls made; C1–C18 are engineering corrections, now folded into the steps.)
 
-**VERDICT:** ENG + CODEX (4 rounds) REVIEWED — **BUILD-READY.** C1–C18 are folded into the executable
-phase steps (round-4 Codex: 0 remaining P0/P1). Backend-first build order stands; each build phase keeps
-the Codex pre-merge gate. The build is a SEPARATE session (see the build-session kickoff handoff).
+**VERDICT:** ENG + CODEX (4 rounds) REVIEWED — was BUILD-READY; **BUILD IN PROGRESS (2026-06-05):**
+**EQ-91 (B1+B2) SHIPPED + DEPLOYED** (main @ `922660b`, `/health` 200; PR #37 `de3b1f3` + PR #38
+`922660b`, each TDD'd + Codex pre-merge-gated). **NEXT = eq-frontend `granola_import_runs` Prisma
+migration → EQ-92 (B3 background history-import)** (B3 lifts the `mode="all"` `/connect` guard). C1–C18
+are folded into the executable phase steps (round-4 Codex: 0 remaining P0/P1). Backend-first build order
+stands; each remaining build phase keeps the Codex pre-merge gate.

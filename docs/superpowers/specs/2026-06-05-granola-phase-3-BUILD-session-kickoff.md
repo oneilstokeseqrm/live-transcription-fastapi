@@ -1,5 +1,14 @@
 # Build-Session Kickoff — Granola Phase 3 (frontend + backend)
 
+> ## ✅ SUPERSEDED for the NEXT phase (updated 2026-06-05) — EQ-91 (B1+B2) is SHIPPED
+> This doc launched the B1/B2 build and is now the **B1/B2 build record**. EQ-91 (B1 PR #37 `de3b1f3` +
+> B2 PR #38 `922660b`) is **MERGED + DEPLOYED**, `/health` 200, `main @ 922660b`, **EQ-91 = Done in Linear**.
+> **Do NOT follow STEP 1/STEP 3/the build order below for the next session** — they point at the pre-build
+> checkpoint + SHA. **For the next phase (EQ-92 / B3 background import), use
+> `docs/superpowers/specs/2026-06-05-granola-b3-next-session-prompt.md`**, which loads the
+> `granola-eq91-shipped-b3-next` checkpoint and verifies `main @ 922660b`. The synchronous first poll B1
+> kept is interim — B3 replaces it with the background import and LIFTS the `mode="all"` `/connect` guard.
+
 **Written:** 2026-06-05, at the end of the Phase-3 CONSOLIDATED PLANNING session. Planning + review are
 DONE. The plan is build-ready and verified clean by Codex across 4 rounds. **This is the handoff for the
 BUILD — a new session. The build, not more planning.**
@@ -94,8 +103,9 @@ default, confirmable at build/design time — the founder may flip it to "forwar
 
 ## KEY STATE (verified 2026-06-04)
 
-- **Backend** `live-transcription-fastapi` main `fafaee2` (engine tip `e0aafbe`). Railway prod `/health`
-  200. Prod `ALLOW_LEGACY_HEADER_AUTH=true`. The Granola engine is COMPLETE + LIVE.
+- **Backend** `live-transcription-fastapi` main `922660b` (EQ-91 B1 `de3b1f3` + B2 `922660b` shipped;
+  pre-Phase-3 baseline was `fafaee2`/`e0aafbe`). Railway prod `/health` 200. Prod
+  `ALLOW_LEGACY_HEADER_AUTH=true`. The Granola engine is COMPLETE + LIVE, now folder-LIST + multi-folder.
 - **Frontend** `eq-frontend`: SHARED checkout, branch-hops; was `main` @ `202a691f`. Granola = greenfield.
   Prisma owned here. **Re-verify its branch/state at build start.**
 - **CONNECTED test credential KEPT** (founder choice): tenant `11111111-…`, user `061ae392-…`
@@ -107,7 +117,7 @@ default, confirmable at build/design time — the founder may flip it to "forwar
 ## LINEAR (project "Granola Integration", team Eq-core)
 
 - **EQ-90** — planning session — **Done.**
-- **EQ-91** — Backend B1+B2 (multi-folder) — Backlog; carries the §1a corrections.
+- **EQ-91** — Backend B1+B2 (multi-folder) — **Done** (B1 PR #37 `de3b1f3` + B2 PR #38 `922660b`, merged + deployed, /health 200).
 - **EQ-92** — Backend B3 (background import) — Backlog; carries the §1a corrections.
 - **EQ-94** — Frontend F1–F4 — Backlog; carries C11/C12.
 - **EQ-93** — Backend B4 (parallel-intake) — Backlog; investigation done, fast-follow, 6 prerequisites.
