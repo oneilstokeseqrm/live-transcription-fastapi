@@ -32,6 +32,7 @@ from uuid import uuid4
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from routers import granola
 from services.granola_ingestion.errors import GranolaError, GranolaErrorCode
@@ -321,7 +322,14 @@ def test_connect_happy_new_stores_and_first_polls(client):
     assert str(kwargs["tenant_id"]) == _TENANT
     assert str(kwargs["user_id"]) == _PG_USER
     assert kwargs["provider"] == "granola"
-    assert kwargs["config"] == {"folder_id": "fol_eq", "folder_name": "EQ"}
+    # B1: config is now the folder-LIST shape (mode + import_scope + folders[])
+    # with the legacy singular folder_id/folder_name MIRRORED for one release
+    # (so the not-yet-updated adapter + any old client keep working).
+    assert kwargs["config"]["folders"] == [{"id": "fol_eq", "name": "EQ"}]
+    assert kwargs["config"]["mode"] == "folders"
+    assert kwargs["config"]["import_scope"] == "history"
+    assert kwargs["config"]["folder_id"] == "fol_eq"
+    assert kwargs["config"]["folder_name"] == "EQ"
     assert kwargs["caller_module"] == "routers.granola"
     # the test poll ran against the decrypted credential
     run.assert_awaited_once()
@@ -846,6 +854,13 @@ def test_status_connected_with_activity(client):
     assert body["connected"] is True
     assert body["status"] == "active"
     assert body["activity"] == {"ingested_7d": 3, "deferred_7d": 1, "errors_7d": 3}
+    # B1: array-shaped `folders[]` + `mode` (was singular `folder`). Here the
+    # stored config is the LEGACY singular shape, so /status must synthesize the
+    # one-element folders list from folder_id/folder_name (back-compat read).
+    assert body["mode"] == "folders"
+    assert body["folders"] == [{"id": "fol_eq", "name": "EQ", "status": "ok"}]
+    # Expand-contract: the legacy singular `folder` (= folders[0]) is ALSO
+    # returned during the expand window so a pre-B1 /status reader still works.
     assert body["folder"] == {"id": "fol_eq", "name": "EQ"}
 
 
@@ -861,7 +876,8 @@ def test_status_not_connected_when_no_row(client):
     assert body["connected"] is False
     assert body["status"] == "none"
     assert body["activity"] == {"ingested_7d": 0, "deferred_7d": 0, "errors_7d": 0}
-    assert body["folder"] is None
+    assert body["folders"] == []
+    assert body["folder"] is None  # legacy singular mirror, null when disconnected
 
 
 def test_status_not_connected_when_archived(client):
@@ -996,3 +1012,126 @@ def test_disconnect_requires_auth_401(noauth_client, monkeypatch):
     monkeypatch.delenv("ALLOW_LEGACY_HEADER_AUTH", raising=False)
     resp = noauth_client.delete(_BASE)
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# B1 (EQ-91) — folder-LIST data model + array-shaped /connect & /status
+# ---------------------------------------------------------------------------
+
+
+def test_connect_request_accepts_folders_array():
+    body = granola.ConnectRequest(
+        api_key="grn_x", folders=[{"id": "fol_a", "name": "A"}], mode="folders"
+    )
+    assert [f.id for f in body.folders] == ["fol_a"]
+    assert body.import_scope == "history"  # D6 default
+
+
+def test_connect_request_back_compat_singular_folder_id():
+    # a legacy client sends folder_id/folder_name; normalize into folders[0]
+    body = granola.ConnectRequest(api_key="grn_x", folder_id="fol_a", folder_name="A")
+    assert body.normalized_folders() == [{"id": "fol_a", "name": "A"}]
+
+
+def test_connect_request_mode_all_accepted_at_model_level():
+    # the contract field accepts "all" (watch everything); the ENDPOINT gates it
+    # until the multi-folder loop ships (see the rejection test below).
+    body = granola.ConnectRequest(api_key="grn_x", mode="all", folders=[])
+    assert body.mode == "all"
+    assert body.normalized_folders() == []
+
+
+def test_connect_request_mode_folders_requires_a_folder():
+    with pytest.raises(ValidationError):
+        granola.ConnectRequest(api_key="grn_x", mode="folders", folders=[])
+
+
+def test_connect_request_config_has_folders_and_legacy_mirror():
+    body = granola.ConnectRequest(
+        api_key="grn_x",
+        folders=[{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}],
+        import_scope="forward",
+    )
+    cfg = body.config()
+    assert cfg["mode"] == "folders"
+    assert cfg["import_scope"] == "forward"
+    assert cfg["folders"] == [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}]
+    # legacy singular mirror (folders[0]) preserved for one release
+    assert cfg["folder_id"] == "fol_a"
+    assert cfg["folder_name"] == "A"
+
+
+def test_connect_accepts_folders_array_and_stores_list_config(client):
+    store = AsyncMock(return_value=uuid4())
+    load = AsyncMock(return_value=MagicMock())
+    run = AsyncMock(return_value=_cycle(notes_processed=1, outcomes={"success": 1}))
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "run_one_cycle", run):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={
+                "api_key": "grn_test",
+                "mode": "folders",
+                "folders": [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}],
+                "import_scope": "history",
+            },
+        )
+
+    assert resp.status_code == 200
+    cfg = store.await_args.kwargs["config"]
+    assert cfg["folders"] == [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}]
+    assert cfg["mode"] == "folders"
+    assert cfg["import_scope"] == "history"
+    assert cfg["folder_id"] == "fol_a"  # legacy mirror = folders[0]
+
+
+def test_connect_mode_all_rejected_until_loop_ships(client):
+    """C10: B1 accepts mode='all' in the *contract*, but the synchronous
+    save-&-test can't safely backfill 'everything' (Railway ~5-min cap) and the
+    multi-folder loop lands in B2 — so the endpoint rejects mode='all' (4xx)
+    WITHOUT storing, which also prevents a folder_id="" → 400 to Granola."""
+    store = AsyncMock(return_value=uuid4())
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, patch.object(granola, "store_credential", store):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_x", "mode": "all", "folders": []},
+        )
+
+    assert resp.status_code == 400
+    store.assert_not_awaited()
+
+
+def test_status_returns_folders_array_from_new_config(client):
+    # config carries the NEW folders[] list → /status returns it array-shaped,
+    # each folder defaulting to status "ok" (per-folder error fills in B2 / C6).
+    status_row = _cred_status(
+        status="active",
+        config={
+            "mode": "folders",
+            "import_scope": "history",
+            "folders": [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}],
+            "folder_id": "fol_a",
+            "folder_name": "A",
+        },
+    )
+    pool = _FakePool(_FakeConn(fetch_returns=[]))
+    get_status = AsyncMock(return_value=status_row)
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, patch.object(granola, "get_credential_status", get_status):
+        resp = client.get(f"{_BASE}/status")
+
+    body = resp.json()
+    assert body["mode"] == "folders"
+    assert body["folders"] == [
+        {"id": "fol_a", "name": "A", "status": "ok"},
+        {"id": "fol_b", "name": "B", "status": "ok"},
+    ]
+    # legacy singular mirror = folders[0] during the expand window
+    assert body["folder"] == {"id": "fol_a", "name": "A"}

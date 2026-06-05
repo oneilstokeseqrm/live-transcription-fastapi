@@ -39,11 +39,12 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Literal
 from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from middleware.jwt_auth import extract_bearer_token
 
@@ -110,13 +111,70 @@ class ValidateRequest(BaseModel):
     api_key: str = Field(..., min_length=1, description="Granola personal API key (grn_…)")
 
 
+class FolderRef(BaseModel):
+    """A single watched Granola folder. ``name`` is the display label from
+    /validate, stored for the ``granola_folder_name`` envelope extra."""
+
+    id: str = Field(..., min_length=1, description="Granola folder id (fol_…)")
+    name: str | None = None
+
+
 class ConnectRequest(BaseModel):
+    """Connect (or reconnect) a Granola account watching a LIST of folders.
+
+    B1 widens the contract from a single folder to an array (decision #5): the
+    credential stores ``config.folders = [{id, name}, …]`` and the adapter loops
+    over them (the loop itself lands in B2). For one release we ALSO accept the
+    legacy singular ``folder_id``/``folder_name`` and mirror ``folders[0]`` back
+    into them, so an old client and the not-yet-updated adapter keep working
+    through the deploy window (expand-then-contract).
+
+    ``mode`` ("folders" | "all") and ``import_scope`` ("history" | "forward",
+    D6) are part of the wire contract from B1, but the behaviour each unlocks
+    lands later: ``mode='all'`` (watch everything) is rejected by /connect until
+    the B2 loop ships (a synchronous "all" backfill would blow the Railway ~5-min
+    request cap); ``import_scope`` is persisted now and acted on in B3.
+    """
+
     api_key: str = Field(..., min_length=1)
-    folder_id: str = Field(..., min_length=1, description="Granola folder id (fol_…) to poll")
-    folder_name: str | None = Field(
-        default=None,
-        description="Display name of the chosen folder (from /validate); stored in config for envelope extras",
-    )
+    mode: Literal["folders", "all"] = "folders"
+    folders: list[FolderRef] = Field(default_factory=list)
+    import_scope: Literal["history", "forward"] = "history"  # D6
+    # Back-compat (one release): a legacy client may still send the singular
+    # folder_id/folder_name; _coalesce_legacy folds them into folders[0].
+    folder_id: str | None = None
+    folder_name: str | None = None
+
+    @model_validator(mode="after")
+    def _coalesce_legacy(self) -> "ConnectRequest":
+        if not self.folders and self.folder_id:
+            self.folders = [FolderRef(id=self.folder_id, name=self.folder_name)]
+        if self.mode == "folders" and not self.folders:
+            raise ValueError(
+                "folders[] (or a legacy folder_id) is required when mode='folders'"
+            )
+        return self
+
+    def normalized_folders(self) -> list[dict]:
+        """The watched-folder list as plain dicts (``{id[, name]}``)."""
+        return [f.model_dump(exclude_none=True) for f in self.folders]
+
+    def config(self) -> dict:
+        """The JSONB ``config`` to persist on the credential row.
+
+        Stores the array shape (``mode`` + ``import_scope`` + ``folders``) AND
+        mirrors ``folders[0]`` into the legacy singular keys for one release, so
+        the adapter's legacy reads + any old client still resolve a folder.
+        """
+        cfg: dict = {
+            "mode": self.mode,
+            "import_scope": self.import_scope,
+            "folders": self.normalized_folders(),
+        }
+        if self.folders:  # legacy singular mirror (folders[0]) — one release
+            cfg["folder_id"] = self.folders[0].id
+            cfg["folder_name"] = self.folders[0].name
+        return cfg
 
 
 class RotateRequest(BaseModel):
@@ -566,9 +624,26 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
     tenant_id, user_id = _resolve_identity(ctx)
     pool = await get_asyncpg_pool()
 
-    config: dict = {"folder_id": body.folder_id}
-    if body.folder_name is not None:
-        config["folder_name"] = body.folder_name
+    # C10: B1's contract accepts mode="all" (watch everything), but the
+    # synchronous "save & test" first poll below (LOCKED-31 / C13; retired in
+    # B3) would try to backfill the WHOLE account inside this HTTP request and
+    # blow the Railway ~5-min request cap, and the multi-folder/"all" poll loop
+    # only lands in B2. Reject "all" here until B2 — this also stops the adapter
+    # from sending folder_id="" to Granola (a 400). The field stays in the
+    # contract so the wire shape is stable; B2 lifts this guard.
+    if body.mode == "all":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Watching all folders isn't available yet — select one or more "
+                "specific folders to connect."
+            ),
+        )
+
+    # Folder-LIST config (decision #5): stores mode + import_scope + folders[]
+    # AND mirrors folders[0] into the legacy singular folder_id/folder_name for
+    # one release (so the not-yet-updated adapter's legacy reads still resolve).
+    config: dict = body.config()
 
     # --- Store (new) or reactivate (previously archived) -------------------
     # store_credential INSERTs a new row. VAULT_DB_INSERT_FAILED is generic
@@ -759,11 +834,34 @@ async def granola_status(request: Request) -> dict:
             "status": "archived" if status_row is not None else "none",
             "last_polled_at": None,
             "activity": _empty_activity(),
-            "folder": None,
+            "mode": None,
+            "folders": [],
+            "folder": None,  # legacy singular mirror (one release) — null when disconnected
             "last_error": None,
         }
 
     activity = await _activity_counts_7d(pool=pool, tenant_id=tenant_id, user_id=user_id)
+    # Array-shaped folders (B1, decision #5). Read the canonical config.folders;
+    # fall back to the legacy singular folder_id/folder_name (one release) so a
+    # pre-B1 credential still reports a one-element list. Each folder's status
+    # defaults to "ok"; per-folder error state (config.folders[].status) is
+    # populated in B2 (C6) and surfaces here unchanged.
+    cfg = status_row.config or {}
+    folders_cfg = cfg.get("folders") or (
+        [{"id": cfg["folder_id"], "name": cfg.get("folder_name")}]
+        if cfg.get("folder_id")
+        else []
+    )
+    # Legacy singular `folder` (= folders[0]) is mirrored alongside `folders[]`
+    # for one release so a pre-B1 /status reader keeps working through the expand
+    # window (symmetry with /connect's legacy folder_id/folder_name acceptance).
+    # The later "contract" release drops both the request- and response-side
+    # legacy keys together.
+    legacy_folder = (
+        {"id": folders_cfg[0]["id"], "name": folders_cfg[0].get("name")}
+        if folders_cfg
+        else None
+    )
     return {
         "connected": True,
         "status": status_row.status,
@@ -771,10 +869,12 @@ async def granola_status(request: Request) -> dict:
             status_row.last_polled_at.isoformat() if status_row.last_polled_at else None
         ),
         "activity": activity,
-        "folder": {
-            "id": status_row.config.get("folder_id"),
-            "name": status_row.config.get("folder_name"),
-        },
+        "mode": cfg.get("mode", "folders"),
+        "folders": [
+            {"id": f["id"], "name": f.get("name"), "status": f.get("status", "ok")}
+            for f in folders_cfg
+        ],
+        "folder": legacy_folder,
         "last_error": status_row.last_error,
     }
 

@@ -247,9 +247,15 @@ async def run_one_cycle(
             )
             return CycleResult(credential_skipped=True)
 
+        # B1: read the folder-LIST config (folders[0]) with the legacy singular
+        # folder_id as a one-release fallback. The multi-folder poll LOOP is B2.
+        _cfg_folders = (credential.config or {}).get("folders") or []
+        _poll_folder_id = (
+            _cfg_folders[0].get("id") if _cfg_folders else None
+        ) or credential.config.get("folder_id", "")
         try:
             note_summaries = await client.list_notes(
-                folder_id=credential.config.get("folder_id", ""),
+                folder_id=_poll_folder_id,
                 created_after=credential.last_polled_at,
             )
         except GranolaError as exc:
@@ -1181,10 +1187,18 @@ def _build_envelope(
         detail=detail, decision=decision, credential=credential
     )
 
+    # B1: folder name from folders[0] with the legacy folder_name fallback (one
+    # release); B2/C16 makes this membership-aware while keeping the single
+    # downstream string (LOCKED-36).
+    _env_folders = (credential.config or {}).get("folders") or []
+    _folder_name = (
+        _env_folders[0].get("name") if _env_folders else None
+    ) or credential.config.get("folder_name")
+
     extras: dict[str, Any] = {
         "granola_note_id": detail.id,
         "granola_web_url": detail.web_url,
-        "granola_folder_name": credential.config.get("folder_name"),
+        "granola_folder_name": _folder_name,
         "granola_summary_text": detail.summary_text,
         "granola_calendar_event_id": (
             detail.calendar_event.calendar_event_id if detail.calendar_event else None

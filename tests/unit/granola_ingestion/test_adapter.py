@@ -2272,3 +2272,78 @@ async def test_scenario_a_gate2_aborts_if_disconnected_during_resolution():
                 credential=cred, note_summary=note, detail=detail, decision=decision, pool=MagicMock(),
             )
     process_mock.assert_not_called()  # gate #2 stopped the publish
+
+
+# ---------------------------------------------------------------------------
+# B1 (EQ-91) — adapter reads the folder-LIST config (folders[0]) with the
+# legacy singular folder_id/folder_name as a one-release fallback.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_polls_folder_id_from_folders_list_first():
+    """When config carries the NEW folders[] list (no legacy folder_id), the
+    poll reads folders[0].id — not "" — so B1 stays correct after the legacy
+    singular mirror is eventually dropped. (Full multi-folder loop is B2.)"""
+    credential = _build_credential()
+    credential.config = {
+        "mode": "folders",
+        "import_scope": "history",
+        "folders": [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}],
+    }
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[])
+    client.aclose = AsyncMock()
+
+    with patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())):
+        await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+        )
+
+    client.list_notes.assert_awaited_once()
+    assert client.list_notes.await_args.kwargs["folder_id"] == "fol_a"
+
+
+def test_build_envelope_folder_name_from_folders_list_first():
+    """granola_folder_name derives from folders[0].name when config carries the
+    folders[] list (no legacy folder_name), preserving the single-string
+    downstream contract (LOCKED-36). Membership-aware derivation is B2/C16."""
+    credential = _build_credential()
+    credential.config = {
+        "mode": "folders",
+        "import_scope": "history",
+        "folders": [{"id": "fol_a", "name": "Sales"}],
+    }
+    detail = _make_note_detail(
+        attendees=[Attendee(email="alice@bigco.com", name="Alice Adams")],
+    )
+    decision = SimpleNamespace(
+        scenario=Scenario.A_KNOWN_ANCHOR,
+        anchor_account_id="11111111-aaaa-4111-8111-111111111111",
+        known_account_attendees=[
+            AttendeeClassification(
+                email="alice@bigco.com",
+                name="Alice Adams",
+                domain="bigco.com",
+                klass=DomainClass.BUSINESS,
+                account_id="11111111-aaaa-4111-8111-111111111111",
+            )
+        ],
+        unknown_business_attendees=[],
+        personal_attendees=[],
+        internal_attendees=[],
+    )
+
+    envelope = adapter._build_envelope(
+        credential=credential,  # type: ignore[arg-type]
+        detail=detail,
+        anchor_account_id="11111111-aaaa-4111-8111-111111111111",
+        decision=decision,  # type: ignore[arg-type]
+    )
+
+    assert envelope.extras["granola_folder_name"] == "Sales"
