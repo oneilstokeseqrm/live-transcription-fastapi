@@ -364,25 +364,92 @@ def test_connect_reconnect_after_disconnect_uses_reactivate(client):
     assert reactivate.await_args.kwargs["new_api_key"] == "grn_new"
 
 
-def test_connect_already_active_returns_409(client):
-    """store UNIQUE-violation + an ACTIVE row exists → 409 (no reactivate)."""
+def test_connect_active_same_key_reconfigures_folders(client):
+    """C5: ACTIVE row + the SAME key + new folders → in-place folder reconfigure
+    (update_credential_config) + save-and-test over the new set — NOT a 409 and
+    NOT reactivate_credential (which only handles archived rows)."""
     store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
-    get_status = AsyncMock(return_value=_cred_status(status="active", archived_at=None))
+    existing = _cred_status(status="active", archived_at=None)
+    get_status = AsyncMock(return_value=existing)
+    current = MagicMock(api_key="grn_same")          # decrypted stored credential
+    load = AsyncMock(return_value=current)
+    reconfigure = AsyncMock(return_value=existing.id)
     reactivate = AsyncMock()
+    run = AsyncMock(return_value=_cycle(notes_processed=2, outcomes={"success": 2}))
 
     auth, pool = _patch_auth_and_pool()
     with auth, pool, \
          patch.object(granola, "store_credential", store), \
          patch.object(granola, "get_credential_status", get_status), \
-         patch.object(granola, "reactivate_credential", reactivate):
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "update_credential_config", reconfigure), \
+         patch.object(granola, "reactivate_credential", reactivate), \
+         patch.object(granola, "run_one_cycle", run):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={
+                "api_key": "grn_same",
+                "folders": [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "connected"
+    reconfigure.assert_awaited_once()
+    cfg = reconfigure.await_args.kwargs["new_config"]
+    assert cfg["folders"] == [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}]
+    reactivate.assert_not_awaited()   # reconfigure path, NOT reactivate
+    run.assert_awaited_once()         # save-and-test ran over the new folder set
+
+
+def test_connect_active_different_key_returns_409_use_rotate(client):
+    """C5: ACTIVE row but the submitted key DIFFERS from the connected one →
+    409 'use /rotate' — a key change is /rotate's job; never rotate keys silently
+    through /connect. No reconfigure."""
+    store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
+    get_status = AsyncMock(return_value=_cred_status(status="active", archived_at=None))
+    load = AsyncMock(return_value=MagicMock(api_key="grn_original"))
+    reconfigure = AsyncMock()
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "update_credential_config", reconfigure):
         resp = client.post(
             f"{_BASE}/connect",
             json={"api_key": "grn_dup", "folder_id": "fol_eq"},
         )
 
     assert resp.status_code == 409
+    assert "rotate" in resp.json()["detail"].lower()
+    reconfigure.assert_not_awaited()
+
+
+def test_connect_revoked_row_returns_409(client):
+    """A revoked (non-active, non-archived) row → 409; reconfigure is only for
+    ACTIVE rows. The key never even gets loaded for a non-active row."""
+    store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
+    get_status = AsyncMock(return_value=_cred_status(status="revoked", archived_at=None))
+    load = AsyncMock()
+    reconfigure = AsyncMock()
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "get_granola_credential_for_user", load), \
+         patch.object(granola, "update_credential_config", reconfigure):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_x", "folder_id": "fol_eq"},
+        )
+
+    assert resp.status_code == 409
     assert "already connected" in resp.json()["detail"].lower()
-    reactivate.assert_not_awaited()
+    load.assert_not_awaited()          # non-active row → never loads the key
+    reconfigure.assert_not_awaited()
 
 
 def test_connect_non_uniqueness_insert_failure_returns_502(client):
@@ -1135,3 +1202,32 @@ def test_status_returns_folders_array_from_new_config(client):
     ]
     # legacy singular mirror = folders[0] during the expand window
     assert body["folder"] == {"id": "fol_a", "name": "A"}
+
+
+def test_status_surfaces_persisted_per_folder_status(client):
+    """B2/C6: /status surfaces config.folders[].status — a folder the poll cycle
+    marked not_found shows through, not a default 'ok' (the per-folder status is
+    persisted in config and survives the cycle-success update)."""
+    status_row = _cred_status(
+        status="active",
+        config={
+            "mode": "folders",
+            "import_scope": "history",
+            "folders": [
+                {"id": "fol_a", "name": "A", "status": "ok"},
+                {"id": "fol_b", "name": "B", "status": "not_found"},
+            ],
+        },
+    )
+    pool = _FakePool(_FakeConn(fetch_returns=[]))
+    get_status = AsyncMock(return_value=status_row)
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, patch.object(granola, "get_credential_status", get_status):
+        resp = client.get(f"{_BASE}/status")
+
+    body = resp.json()
+    assert body["folders"] == [
+        {"id": "fol_a", "name": "A", "status": "ok"},
+        {"id": "fol_b", "name": "B", "status": "not_found"},
+    ]
