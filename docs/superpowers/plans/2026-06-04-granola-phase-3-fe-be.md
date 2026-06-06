@@ -57,11 +57,11 @@ existing onboarding "meeting-connect" step and in Settings → Connections. (The
 unknown-account meetings to the per-user account-creation approval queue; the frontend approvals UI is a
 SEPARATE future project, not in this scope.)
 
-**Architecture:** The Granola backend engine is COMPLETE + LIVE (main @ `922660b` after EQ-91/B1+B2;
-`/health` 200; pre-Phase-3 baseline was `e0aafbe`+`fafaee2`). B1+B2 already delivered the **folder-LIST
-model + array-shaped `/connect`/`/status` + the multi-folder poll loop**; Phase 3's REMAINING backend work
-is the **background history-import with an "importing N of M" progress signal** (B3, which retires the
-still-present synchronous first poll), plus the **greenfield frontend** over the **existing, production-proven
+**Architecture:** The Granola backend engine is COMPLETE + LIVE (main @ `061ef37` after EQ-91/B1+B2 +
+EQ-92/B3; `/health` 200; pre-Phase-3 baseline was `e0aafbe`+`fafaee2`). B1+B2 delivered the **folder-LIST
+model + array-shaped `/connect`/`/status` + the multi-folder poll loop**; B3 (now SHIPPED) delivered the
+**background history-import with an "importing N of M" progress signal** (retiring the synchronous first
+poll). Phase 3's REMAINING work is the **prod E2E** (then) the **greenfield frontend** over the **existing, production-proven
 gateway-JWT rail** (`callBackend` + `mintInternalJwt(pg_user_id)` → `BACKEND_SERVICE_TRANSCRIPTION_URL`).
 No OAuth. No downstream envelope changes. No Prisma migration for multi-folder (`config` is opaque JSONB).
 
