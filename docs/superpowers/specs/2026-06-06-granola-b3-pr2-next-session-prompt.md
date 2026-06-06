@@ -1,3 +1,9 @@
+> ## ⛔ SUPERSEDED (2026-06-06) — PR 2 backend is now SHIPPED + DEPLOYED.
+> This prompt launched the session that BUILT PR 2; that work is done (PR #39 squash `061ef37` → main, Railway
+> `9cda4b1e` SUCCESS, /health 200, Codex gate 4 rounds → clean). **Use the new prompt instead:**
+> `docs/superpowers/specs/2026-06-06-granola-b3-pr2-shipped-e2e-next-session-prompt.md` (prod import E2E → EQ-94).
+> Kept for history only.
+
 # Next-session opening prompt — Granola EQ-92 / B3, PR 2 (backend) continuation
 
 **Written:** 2026-06-06, end of the session that shipped the `granola_import_runs` migration (PR 1) and

@@ -39,15 +39,23 @@ TDD throughout (AsyncMock, no Docker). Tests: `tests/unit/granola_ingestion/test
 - [x] **`routers/granola_cron.py`** (A2 backstop) — `1ce1da1`: cron tick re-dispatches stale queued imports (window-stamped id); non-fatal; returns `imports_recovered`.
 - [x] **`routers/granola.py`** (C4/C8/C18) — `4b1e4e7`: `/connect` async restructure (forward_anchor_at at route entry C4; mode="all" guard LIFTED; branch on import_scope → history dispatch + ACK / forward anchor + import:null; deleted `_save_and_test_locked`; reconfigure keeps B2 behavior per A4 + doubles as /connect-retry C8 recovery); `/status` import block (C18) + import_scope + C8/A2 best-effort recovery (window-stamped to dedup with cron).
 - [x] DO NOT BUILD (split fast-follows): #21a reconfigure-backfill (active-row reconfigure keeps B2 behavior), #21b exact re-import progress items-table.
-- [x] `scripts/verify_consumer_contracts.py` → **0 drift** (envelope UNCHANGED — LOCKED-38). Full unit suite **578 passed / 0 new failures** (1 pre-existing `account_provisioning` failure, identical on `main`). **0 Pyright errors** on all changed source.
-- [ ] `/codex review` 4-round cap → fold P0/P1 → **founder authorizes merge** → Railway deploy → `/health` 200 → prod E2E → EQ-94 (FE).
+- [x] `scripts/verify_consumer_contracts.py` → **0 drift** (envelope UNCHANGED — LOCKED-38). Full unit suite **603 passed / 0 new failures** (1 pre-existing `account_provisioning` failure, identical on `main`). **0 Pyright errors** on all changed source.
+- [x] `/codex review` — **4 rounds → CLEAN** (7 P1s folded across rounds 1-3; round 4 NO P1s). Founder authorized merge → **PR #39 squash `061ef37` → main** → Railway **`9cda4b1e` SUCCESS** → `/health` **200** → routes live + gated.
+- [ ] **NEXT (fresh session): prod import E2E** (history + forward; shared-infra check; reconnect test cred; mint JWT from Railway env) → then **EQ-94 (frontend)**.
 
 ## Session end
-- [ ] Update Linear EQ-92 + audit handoff docs (repo + Linear + memory) for mutual consistency; grep for stale signatures.
+- [x] Updated memory (project + index), repo docs (plan banner/VERDICT, system-map, this todo), the next-session prompt; filed the residual-P2 ticket + EQ-92 in Linear; ran the stale-signature cross-check.
 
-## Review (filled after implementation)
-All 5 remaining PR-2 components built TDD-first (AsyncMock, no Docker) on `phase-3/granola-be-b3`, 6 commits
-(`0410a53` A7 → `d4c1615` A6 → `7afb0b0` A3/A5 → `5866173` A1/A2 → `1ce1da1` A2-cron → `4b1e4e7` C4/C8/C18).
-Founder decision this session: lock-busy recovery on **both surfaces** (cron backstop + /status), per binding A2.
-Pre-Codex adversarial multi-agent review run over the diff (6 dimensions → verify). Codex pre-merge gate is the
-next step; merge is founder-authorized.
+## Review (filled after implementation) — ✅ SHIPPED + DEPLOYED 2026-06-06
+All 5 remaining PR-2 components built TDD-first (AsyncMock, no Docker), then both review gates folded:
+- **commits:** `0410a53` A7 → `d4c1615` A6 → `7afb0b0` A3/A5 → `5866173` A1/A2 → `1ce1da1` A2-cron → `4b1e4e7`
+  C4/C8/C18 → `e7fddd2` pre-Codex fold → `cea5578` Codex-r1 → `7665c4d` Codex-r2 → `0056024` Codex-r3 → `57c5edd` docs.
+- **Founder decision:** lock-busy recovery on **both surfaces** (cron backstop + /status), per binding A2.
+- **pre-Codex multi-agent review** (6 dimensions → adversarial verify): 7 findings folded.
+- **Codex pre-merge gate: 4 rounds → CLEAN** (R1-R3 folded 7 P1s — anchor-lock docstring, queued-vs-running,
+  RuntimeError-500, forward-watermark-overwrite [LEAST], terminal-import-strand [A1 proceeds-on-terminal],
+  reconnect-lifecycle [forward-bail + cancel-active + /status scope-gate]; R4 NO P1s).
+- **Shipped:** PR #39 squash `061ef37` → main; Railway `9cda4b1e` SUCCESS; `/health` 200; routes live + gated.
+- **Residual P2 (ticketed):** per-activation import-lifecycle scoping (rare crashed-reconnect → poll re-lists
+  dedup-safe without a fresh progress row — data correct, progress UI missing).
+- **Deferred (deliberate, heavy-context):** prod import E2E → fresh session, then EQ-94.

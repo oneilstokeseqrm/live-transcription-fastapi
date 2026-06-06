@@ -1,7 +1,16 @@
 # Granola Phase 3 (Frontend + Backend) Implementation Plan
 
-> ## 🟢 BUILD STATUS (updated 2026-06-05) — EQ-91 (B1+B2) SHIPPED + DEPLOYED
-> **Backend EQ-91 is COMPLETE, MERGED, DEPLOYED, `/health` 200, `main @ 922660b`. EQ-91 = Done in Linear.**
+> ## 🟢 BUILD STATUS (updated 2026-06-06) — EQ-92/B3 BACKEND (PR2) SHIPPED + DEPLOYED; PROD E2E + EQ-94 NEXT
+> **Backend B1+B2+B3 are all COMPLETE, MERGED, DEPLOYED, `/health` 200, `main @ 061ef37`.** The B3
+> background history-import shipped as **PR #39 (squash `061ef37`)**; Railway deploy **`9cda4b1e` SUCCESS**;
+> B3 routes live + auth-gated. **Codex pre-merge gate ran 4 ROUNDS → CLEAN** (7 P1s folded) + a pre-Codex
+> multi-agent review; 603 unit tests / 0 new failures, 0 Pyright errors on changed source, 0 envelope drift.
+> **NEXT (fresh session): the prod import E2E** (deferred from the build session — heavy context; run the
+> shared-infra-collision check, reconnect the test cred as `import_scope=history`, verify the import lifecycle,
+> then E2E forward) **THEN EQ-94 (frontend).** Resume: checkpoint `granola-b3-pr2-shipped-e2e-next` +
+> `docs/superpowers/specs/2026-06-06-granola-b3-pr2-shipped-e2e-next-session-prompt.md`. Residual P2 ticketed
+> (per-activation import-lifecycle scoping). **EQ-91 + EQ-92 backend = shipped.**
+> **Backend EQ-91 is COMPLETE, MERGED, DEPLOYED, `/health` 200, `main @ 922660b` (now `061ef37` after B3). EQ-91 = Done in Linear.**
 > - **Phase B1 ✅ SHIPPED** — PR #37, squash `de3b1f3`: folder-LIST model + array `/connect`&`/status` with
 >   legacy back-compat on BOTH request and response (singular `folder_id`/`folder_name` coalesced into
 >   `folders[0]`; `/status` returns a legacy `folder` mirror alongside `folders[]`); `ConnectRequest` gained
@@ -13,20 +22,23 @@
 >   (C16); active-row `/connect` RECONFIGURE via NEW vault `update_credential_config` (different key → 409
 >   "use /rotate"); success-update guards `status='active'`; **shared `last_polled_at` watermark HELD on any
 >   folder skip**.
-> - **EQ-92 / B3 IN PROGRESS (updated 2026-06-06):**
+> - **EQ-92 / B3 ✅ BACKEND SHIPPED + DEPLOYED (updated 2026-06-06):**
 >   - **PR 1 ✅ SHIPPED** — eq-frontend `granola_import_runs` migration: PR #454, squash `54b9dbc8`, merged +
 >     Vercel-deployed; table LIVE in Neon `super-glitter-11265514` (`eq-dev`) `production` branch (partial-unique
 >     + CHECK + 3 FKs verified). Codex gate PASS.
->   - **PR 2 IN PROGRESS** — backend on branch `phase-3/granola-be-b3` @ `4e4346d`. Component 1/6 done:
->     `services/granola_ingestion/import_runs.py` (lifecycle + DERIVED progress, 11 tests green). 5 components +
->     Codex review gate remain. **The B3 design was Codex-consult-vetted → corrections A1-A7 in
->     `tasks/b3-implementation-design.md` (BINDING; they refine §Phase B3 / §1a).** B3 LIFTS the `mode="all"`
->     `/connect` guard (in PR 2's /connect restructure).
+>   - **PR 2 ✅ SHIPPED** — backend: PR #39, squash `061ef37`, merged + Railway-deployed (`9cda4b1e` SUCCESS,
+>     `/health` 200). All A1-A7 + C4/C8/C18: `import_runs.py` lifecycle/DERIVED progress; `GRANOLA_IMPORT_QUEUE`
+>     + `granola_import_one_credential` + `run_import_step`; A1 poll-defers-uninitialized + proceeds-on-terminal;
+>     vault `anchor_credential_watermark` (LEAST earliest-wins); adapter `cycle_aborted` + `set_import_total`;
+>     `/connect` async restructure (mode="all" LIFTED; branch on import_scope; reconnect cancels prior-lifecycle
+>     runs); `/status` import block (scoped to current history); full headless recovery (cron + /status). **Codex
+>     gate 4 ROUNDS → CLEAN** (7 P1s folded) + pre-Codex multi-agent review. 603 tests/0 new fail; 0 Pyright; 0 drift.
 >   - **Split out of B3 per the consult (fast-follows):** newly-added-folder reconfigure backfill (backlog #21a)
 >     + exact re-import progress items-table (#21b). Sibling tickets: EQ-105 (sync boto3 off the loop), EQ-109
->     (per-loop asyncpg pool).
->   - Resume checkpoint: `granola-b3-pr2-import-runs-done`; next-session prompt:
->     `docs/superpowers/specs/2026-06-06-granola-b3-pr2-next-session-prompt.md`.
+>     (per-loop asyncpg pool); **NEW residual-P2** per-activation import-lifecycle scoping (Codex r3).
+>   - **NEXT = prod import E2E (fresh session) then EQ-94 (frontend).** Resume checkpoint:
+>     `granola-b3-pr2-shipped-e2e-next`; next-session prompt:
+>     `docs/superpowers/specs/2026-06-06-granola-b3-pr2-shipped-e2e-next-session-prompt.md`.
 > - **Deferred into B3/later:** per-folder watermarks (B2 holds the shared watermark on any skip); live-API
 >   multi-folder probes (multi-folder doc §6); newly-added-folder backfill on reconfigure (B3 Step 5b, C17).
 > - The **B1/B2 phase sections below are the BUILD RECORD** (shipped — their step checkboxes are left
@@ -853,9 +865,11 @@ reconfigure). Together they cover both the v1 and the fast-follow. No direct con
 default = history [defaulted; founder may flip to "forward" — a UI default, confirmable at build]; D1–D5
 technical calls made; C1–C18 are engineering corrections, now folded into the steps.)
 
-**VERDICT:** ENG + CODEX (4 rounds) REVIEWED — was BUILD-READY; **BUILD IN PROGRESS (2026-06-05):**
-**EQ-91 (B1+B2) SHIPPED + DEPLOYED** (main @ `922660b`, `/health` 200; PR #37 `de3b1f3` + PR #38
-`922660b`, each TDD'd + Codex pre-merge-gated). **NEXT = eq-frontend `granola_import_runs` Prisma
-migration → EQ-92 (B3 background history-import)** (B3 lifts the `mode="all"` `/connect` guard). C1–C18
-are folded into the executable phase steps (round-4 Codex: 0 remaining P0/P1). Backend-first build order
-stands; each remaining build phase keeps the Codex pre-merge gate.
+**VERDICT:** ENG + CODEX REVIEWED — was BUILD-READY; **BACKEND BUILD COMPLETE + DEPLOYED (2026-06-06):**
+**EQ-91 (B1+B2) + EQ-92 (B3) ALL SHIPPED + DEPLOYED** (main @ `061ef37`, `/health` 200; B1 PR #37 `de3b1f3`,
+B2 PR #38 `922660b`, B3 PR #39 `061ef37` — each TDD'd + Codex pre-merge-gated; B3's gate ran 4 rounds → clean,
+7 P1s folded, on top of a pre-Codex multi-agent review). C1–C18 + A1–A7 folded into the shipped code.
+**NEXT = the prod import E2E (a fresh, focused session — the build session was heavy-context) THEN EQ-94
+(the greenfield frontend, F1–F4, now that the backend contracts are LIVE).** Residual P2 ticketed
+(per-activation import-lifecycle scoping). Backend-first build order held; the Codex pre-merge gate was kept
+on every backend PR.

@@ -15,13 +15,15 @@ model), `tasks/granola-integration-plan.md` (the original Phase 2/3 plan + §2.1
 
 ## A. BACKEND — `live-transcription-fastapi` (the Granola engine; SHIPPED + LIVE)
 
-**State:** Functionally complete and live in production. **main tip `bfaf24a`** (EQ-91 code `922660b`) — EQ-91
-(multi-folder) SHIPPED + MERGED + DEPLOYED: B1 PR #37 `de3b1f3` + B2 PR #38 `922660b`. Prod has
-`ALLOW_LEGACY_HEADER_AUTH=true`. **EQ-92 / B3 IN PROGRESS (2026-06-06):** PR 1 (eq-frontend
-`granola_import_runs` migration #454 `54b9dbc8`) SHIPPED + DEPLOYED → the table is LIVE in Neon
-`super-glitter-11265514` (`eq-dev`) prod. PR 2 (backend) on branch `phase-3/granola-be-b3` @ `4e4346d` —
-component 1/6 `services/granola_ingestion/import_runs.py` done (11 tests green); design vetted by Codex consult
-(A1-A7 in `tasks/b3-implementation-design.md`). **NEXT = the remaining 5 PR-2 components + Codex review gate.**
+**State:** Functionally complete and live in production. **main tip `061ef37`** — EQ-91 (multi-folder) +
+EQ-92 (B3 background history-import) ALL SHIPPED + MERGED + DEPLOYED: B1 PR #37 `de3b1f3` + B2 PR #38
+`922660b` + **B3 PR #39 `061ef37`** (Railway `9cda4b1e` SUCCESS, `/health` 200). Prod has
+`ALLOW_LEGACY_HEADER_AUTH=true`. **EQ-92 / B3 ✅ BACKEND SHIPPED (2026-06-06):** PR 1 (eq-frontend
+`granola_import_runs` migration #454 `54b9dbc8`) live; PR 2 (backend, #39) implements A1-A7 + C4/C8/C18 —
+background import on `GRANOLA_IMPORT_QUEUE`, A1 poll-defers, DERIVED progress, `/connect` async restructure,
+`/status` import block, full headless recovery. Codex gate 4 rounds → clean (7 P1s folded) + pre-Codex
+multi-agent review; 603 tests/0 new fail; 0 Pyright; 0 contract drift. **NEXT = prod import E2E (fresh
+session) THEN EQ-94 (frontend).** Residual P2 ticketed (per-activation import-lifecycle scoping).
 **Note:** `/health` intermittently 502s (~15%, benign single-worker cold-start; EQ-105).
 
 **The end-to-end flow that works today:** connect a Granola account (currently via a hand-minted JWT,
@@ -38,8 +40,8 @@ published downstream to the relationship graph. Proven E2E in prod on a real mee
 | `routers/queue_actions.py` | Pending-approvals actions: `POST /queue/{id}/approve`, `/map`, `/ignore`. **No GET/list endpoint** — the UI must read the queue another way (Prisma direct or a new endpoint). First-owner-wins, per-user. |
 | `routers/granola_cron.py` | `POST /internal/granola/cron-tick` (X-Internal-Cron-Secret) — the 5-min EventBridge Rule hits this. |
 | `services/granola_ingestion/adapter.py` | `run_one_cycle` — the per-credential poll. **Polls EVERY watched folder in a loop** (`mode="all"` polls everything in one call), de-dups overlapping notes via an in-cycle seen-set; a per-folder `FOLDER_NOT_FOUND` → `config.folders[].status='not_found'` + skip (cycle continues; all-folders-gone → credential error); shared `last_polled_at` HELD on any partial skip. Notes still processed **SEQUENTIALLY** (parallelization = EQ-93/B4). Per-note idempotency anchor in `external_integration_runs`. `_resolve_known_account_contacts` + membership-aware `_build_envelope` `granola_folder_name` (C16). |
-| `services/granola_ingestion/scheduler.py` | DBOS workflow + per-credential advisory lock (serializes overlapping cycles). EQ-92/B3 (PR 2, in progress) adds `GRANOLA_IMPORT_QUEUE` + `granola_import_one_credential` + the poll-defers-to-uninitialized-credential guard. |
-| `services/granola_ingestion/import_runs.py` | **NEW (EQ-92/B3, committed on `phase-3/granola-be-b3`).** Background-import run lifecycle (`get_or_create_active_import_run`, `mark_running`, `set_import_total`, `complete/fail/cancel_import_run`) + DERIVED progress reader (`read_import_progress`, `latest_import_run`). Plain asyncpg; tenant/user scoped. |
+| `services/granola_ingestion/scheduler.py` | DBOS workflow + per-credential advisory lock (serializes overlapping cycles). **EQ-92/B3 SHIPPED (#39):** `GRANOLA_IMPORT_QUEUE` + `granola_import_one_credential`/`run_import_step` + the A1 poll-defers-uninitialized guard (proceeds once a history import is terminal) + headless recovery (`list_recoverable_import_runs`, `list_uninitialized_credentials`, `recover_uninitialized_credential`). |
+| `services/granola_ingestion/import_runs.py` | **NEW (EQ-92/B3 SHIPPED #39).** Background-import run lifecycle (`get_or_create_active_import_run`, `mark_running` [returns claimed], `set_import_total`, `complete/fail/cancel_import_run`, `cancel_active_import_runs`) + DERIVED progress reader (`read_import_progress`, `latest_import_run`). Plain asyncpg; tenant/user scoped. |
 | `services/granola_ingestion/api_client.py` | Granola HTTP client. `public-api.granola.ai/v1`. `list_folders`/`list_notes(folder_id, created_after)`/`get_note_detail`. Cursor pagination, retry/429 handling. |
 | `services/granola_ingestion/path2.py` | Scenario A (known account → ingest) / C (unknown → defer to approval queue) / D (no business attendee → skip). |
 | `services/granola_ingestion/contact_resolution.py` | (#36) race-safe `find_or_create_contact` (`INSERT … ON CONFLICT (tenant,email)`). |
