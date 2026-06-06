@@ -1,5 +1,12 @@
 # Next-session opening prompt — Granola Phase 3, EQ-92 (B3 background import)
 
+> ## ⛔ SUPERSEDED (2026-06-06) — this launched the session that SHIPPED PR 1 (the migration).
+> The `granola_import_runs` migration (PR #454) is DONE + deployed + prod-verified, and PR 2 (the backend)
+> is now IN PROGRESS (import_runs.py done). **Do NOT follow STEP 1/3/4 below — they tell you to build the
+> migration that already exists.** Use **`docs/superpowers/specs/2026-06-06-granola-b3-pr2-next-session-prompt.md`**,
+> which loads the `granola-b3-pr2-import-runs-done` checkpoint and resumes PR 2 on branch `phase-3/granola-be-b3`.
+> This doc is kept as the build record of PR 1.
+
 **Written:** 2026-06-05, at the end of the BUILD session that shipped EQ-91 (B1+B2). Paste the block
 below as the opening message of the next (B3) session. EQ-91 is DONE, merged, deployed, `/health` 200.
 

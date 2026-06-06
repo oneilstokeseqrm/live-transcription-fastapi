@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from routers import granola_cron
-from services.granola_ingestion.scheduler import CredentialMetadata
+from services.granola_ingestion.scheduler import CredentialMetadata, RecoverableImport
 
 
 _VALID_SECRET = "a" * 64  # 32-byte hex (64 chars); same shape as production
@@ -282,6 +282,105 @@ def test_cron_tick_same_credential_different_window_produces_distinct_ids(client
     assert captured_ids[0] != captured_ids[1]
     assert captured_ids[0].endswith("_100")
     assert captured_ids[1].endswith("_101")
+
+
+# ---------------------------------------------------------------------------
+# A2 strand recovery (EQ-92/B3): cron re-dispatches stale 'queued' imports
+# ---------------------------------------------------------------------------
+
+
+def test_cron_tick_redispatches_stale_queued_imports(client, monkeypatch):
+    """A2 backstop: the cron tick re-dispatches stale 'queued' import runs with
+    a window-stamped recovery workflow id, and reports the count. Independent of
+    the poll dispatch."""
+    monkeypatch.setenv("INTERNAL_CRON_SECRET", _VALID_SECRET)
+    stale = [
+        RecoverableImport(
+            import_run_id=uuid4(), credential_id=uuid4(),
+            tenant_id=uuid4(), user_id=uuid4(),
+        ),
+        RecoverableImport(
+            import_run_id=uuid4(), credential_id=uuid4(),
+            tenant_id=uuid4(), user_id=uuid4(),
+        ),
+    ]
+    enqueue_import_mock = AsyncMock()
+    with patch.object(granola_cron, "list_active_credentials", new=AsyncMock(return_value=[])), \
+         patch.object(granola_cron, "list_recoverable_import_runs", new=AsyncMock(return_value=stale)), \
+         patch.object(granola_cron, "list_uninitialized_credentials", new=AsyncMock(return_value=[])), \
+         patch.object(granola_cron, "enqueue_import_workflow", new=enqueue_import_mock), \
+         patch.object(granola_cron, "_current_cycle_window", return_value=777):
+        resp = client.post(
+            "/internal/granola/cron-tick",
+            headers={"X-Internal-Cron-Secret": _VALID_SECRET},
+        )
+    assert resp.status_code == 202
+    assert resp.json()["imports_recovered"] == 2
+    assert enqueue_import_mock.await_count == 2
+    for call, r in zip(enqueue_import_mock.await_args_list, stale):
+        kw = call.kwargs
+        assert kw["credential_id"] == r.credential_id
+        assert kw["tenant_id"] == r.tenant_id
+        assert kw["user_id"] == r.user_id
+        assert kw["import_run_id"] == r.import_run_id
+        # window-stamped recovery id (distinct from the deterministic /connect id)
+        assert kw["workflow_id"].endswith("_r777")
+        assert str(r.import_run_id) in kw["workflow_id"]
+
+
+def test_cron_tick_recovery_failure_is_non_fatal(client, monkeypatch):
+    """A recovery-query blip must NOT block the poll dispatch or 5xx the tick —
+    it's swallowed + logged; imports_recovered=0."""
+    monkeypatch.setenv("INTERNAL_CRON_SECRET", _VALID_SECRET)
+    cred = CredentialMetadata(id=uuid4(), tenant_id=uuid4(), user_id=uuid4())
+    list_mock, enqueue_mock, set_id_mock, _captured = _patch_dispatch(credentials=[cred])
+    with patch.object(granola_cron, "list_active_credentials", new=list_mock), \
+         patch.object(granola_cron.GRANOLA_POLL_QUEUE, "enqueue_async", new=enqueue_mock), \
+         patch.object(granola_cron, "SetWorkflowID", new=set_id_mock), \
+         patch.object(granola_cron, "list_recoverable_import_runs",
+                      new=AsyncMock(side_effect=RuntimeError("db blip"))), \
+         patch.object(granola_cron, "list_uninitialized_credentials",
+                      new=AsyncMock(side_effect=RuntimeError("db blip"))):
+        resp = client.post(
+            "/internal/granola/cron-tick",
+            headers={"X-Internal-Cron-Secret": _VALID_SECRET},
+        )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["enqueued"] == 1          # poll dispatch unaffected
+    assert body["imports_recovered"] == 0  # stale-queued recovery swallowed
+    assert body["creds_recovered"] == 0    # uninitialized recovery swallowed
+
+
+def test_cron_tick_recovers_uninitialized_credentials(client, monkeypatch):
+    """Codex P1: the cron re-initializes ACTIVE credentials stuck uninitialized
+    (no import row / forward anchor failure) — the headless backstop the
+    stale-queued scan can't reach (no row exists)."""
+    monkeypatch.setenv("INTERNAL_CRON_SECRET", _VALID_SECRET)
+    from services.granola_ingestion.scheduler import UninitializedCredential
+
+    creds = [
+        UninitializedCredential(
+            credential_id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), import_scope="history",
+        ),
+        UninitializedCredential(
+            credential_id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), import_scope="forward",
+        ),
+    ]
+    recover = AsyncMock(return_value="ok")
+    with patch.object(granola_cron, "list_active_credentials", new=AsyncMock(return_value=[])), \
+         patch.object(granola_cron, "list_recoverable_import_runs", new=AsyncMock(return_value=[])), \
+         patch.object(granola_cron, "list_uninitialized_credentials", new=AsyncMock(return_value=creds)), \
+         patch.object(granola_cron, "recover_uninitialized_credential", new=recover):
+        resp = client.post(
+            "/internal/granola/cron-tick",
+            headers={"X-Internal-Cron-Secret": _VALID_SECRET},
+        )
+    assert resp.status_code == 202
+    assert resp.json()["creds_recovered"] == 2
+    assert recover.await_count == 2
+    scopes = {c.kwargs["import_scope"] for c in recover.await_args_list}
+    assert scopes == {"history", "forward"}
 
 
 # ---------------------------------------------------------------------------

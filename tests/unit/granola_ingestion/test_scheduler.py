@@ -140,6 +140,7 @@ def _fake_cycle_result(
     credential_skipped: bool = False,
     credential_error_code: Optional[str] = None,
     deferred_reprocessed: int = 0,
+    cycle_aborted: bool = False,
 ):
     """Build a minimal CycleResult-shaped object.
 
@@ -152,6 +153,7 @@ def _fake_cycle_result(
         credential_skipped=credential_skipped,
         credential_error_code=credential_error_code,
         deferred_reprocessed=deferred_reprocessed,
+        cycle_aborted=cycle_aborted,
         outcomes={},
     )
 
@@ -609,6 +611,616 @@ async def test_list_active_credentials_raises_after_exhausting_retries(monkeypat
             await scheduler.list_active_credentials()
 
     assert len(conn.fetch_calls) == scheduler._LIST_RETRY_ATTEMPTS
+
+
+# ===========================================================================
+# EQ-92 / B3 — background import: queue, poll-defers guard (A1), run_import_step
+# (A2/A3), the import workflow, dispatch + recovery helpers
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# GRANOLA_IMPORT_QUEUE (C3 — separate from the poll queue)
+# ---------------------------------------------------------------------------
+
+
+def test_granola_import_queue_is_separate_with_concurrency_2():
+    """C3: a 33-83 min import must NOT occupy GRANOLA_POLL_QUEUE (concurrency=5)
+    or it starves other users' 5-min polls. A dedicated low-concurrency queue."""
+    assert scheduler.GRANOLA_IMPORT_QUEUE.name == "granola-import"
+    assert scheduler.GRANOLA_IMPORT_QUEUE.name != scheduler.GRANOLA_POLL_QUEUE.name
+    state = vars(scheduler.GRANOLA_IMPORT_QUEUE)
+    concurrency_value = None
+    for attr in ("concurrency", "_concurrency"):
+        if attr in state and isinstance(state[attr], int):
+            concurrency_value = state[attr]
+            break
+    assert concurrency_value == 2, f"GRANOLA_IMPORT_QUEUE.concurrency expected 2, got {state}"
+
+
+# ---------------------------------------------------------------------------
+# A1 — run_cycle_step poll-defers to a pending background import
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_defers_uninitialized_history_credential():
+    """A1: a freshly-connected history credential (import_scope='history',
+    last_polled_at NULL) is owned by the IMPORT, not the poll. A poll that wins
+    the advisory lock before the import must SKIP — else it would advance the
+    shared watermark past history the import hasn't ingested."""
+    pool = _FakePool(_FakeConn(fetchval_returns=True))
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "history", "folders": [{"id": "fol_a"}]},
+        last_polled_at=None,
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "latest_import_run", new=AsyncMock(return_value=None)), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock()) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
+        )
+    assert result.skipped is True
+    assert result.reason == "awaiting_import"
+    run_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_defers_uninitialized_history_while_import_running():
+    """A1: a queued/running import still owns the backfill → poll defers."""
+    pool = _FakePool(_FakeConn(fetchval_returns=True))
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "history", "folders": [{"id": "fol_a"}]},
+        last_polled_at=None,
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "latest_import_run", new=AsyncMock(return_value={"state": "running"})), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock()) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
+        )
+    assert result.skipped is True
+    assert result.reason == "awaiting_import"
+    run_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_proceeds_when_history_import_terminal_with_null_watermark():
+    """A1/Codex P1: a TERMINAL import that left the watermark NULL (a not_found
+    folder held it via B2) must NOT defer forever — the import is done, so the
+    poll proceeds (re-lists from NULL, dedup-safe, advances the watermark once
+    folders recover). Prevents the B2-hold × B3-defer permanent strand."""
+    pool = _FakePool(_FakeConn(fetchval_returns=True))
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "history", "folders": [{"id": "fol_a"}]},
+        last_polled_at=None,
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "latest_import_run", new=AsyncMock(return_value={"state": "complete"})), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock(return_value=_fake_cycle_result())) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
+        )
+    assert result.skipped is False  # import done → poll proceeds (no strand)
+    run_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_defers_uninitialized_forward_credential():
+    """A1: import_scope='forward' with last_polled_at NULL means the forward
+    anchor hasn't been written yet (a poll fired in the activation->anchor gap).
+    Skip until the anchor lands."""
+    pool = _FakePool(_FakeConn(fetchval_returns=True))
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "forward", "folders": [{"id": "fol_a"}]},
+        last_polled_at=None,
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock()) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
+        )
+    assert result.skipped is True
+    assert result.reason == "awaiting_forward_anchor"
+    run_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_does_not_defer_legacy_credential_without_import_scope():
+    """A1: a pre-B3 legacy credential has no import_scope, so the guard must NOT
+    trip (in prod its last_polled_at is also already set). The poll proceeds."""
+    pool = _FakePool(_FakeConn(fetchval_returns=True))
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"folder_id": "fol_legacy", "folder_name": "EQ"},  # no import_scope
+        last_polled_at=None,
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock(return_value=_fake_cycle_result())) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
+        )
+    assert result.skipped is False
+    run_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_does_not_defer_initialized_history_credential():
+    """A1: once the import finished (last_polled_at SET), polls resume normally
+    for a history credential."""
+    pool = _FakePool(_FakeConn(fetchval_returns=True))
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "history", "folders": [{"id": "fol_a"}]},
+        last_polled_at=datetime(2026, 6, 6, 10, 0, tzinfo=timezone.utc),
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock(return_value=_fake_cycle_result())) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
+        )
+    assert result.skipped is False
+    run_mock.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# run_import_step (A2 lock-busy + A3 cancel/fail/complete)
+# ---------------------------------------------------------------------------
+
+
+def _import_step_patches(*, credential, cycle_result=None, cycle_raises=None):
+    """Patch the import step's collaborators. Returns a contextmanager stack
+    helper via a dict of AsyncMocks the test can assert on."""
+    mocks = {
+        "get_cred": AsyncMock(return_value=credential),
+        "run_one_cycle": AsyncMock(side_effect=cycle_raises) if cycle_raises
+        else AsyncMock(return_value=cycle_result),
+        "mark_running": AsyncMock(),
+        "complete": AsyncMock(),
+        "fail": AsyncMock(),
+        "cancel": AsyncMock(),
+    }
+    return mocks
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_lock_busy_leaves_queued():
+    """A2: if a poll (or another import attempt) holds the per-credential
+    advisory lock, run_import_step leaves the run 'queued' (does not strand or
+    fail it) and returns state='lock_busy' — the cron/status recovery re-kicks
+    it with a fresh workflow id."""
+    conn = _FakeConn(fetchval_returns=False)  # lock NOT acquired
+    pool = _FakePool(conn)
+    run_run_id = uuid4()
+    m = _import_step_patches(credential=None)
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), import_run_id=run_run_id,
+        )
+    assert result.state == "lock_busy"
+    m["mark_running"].assert_not_called()
+    m["run_one_cycle"].assert_not_called()
+    m["complete"].assert_not_called()
+    m["fail"].assert_not_called()
+    m["cancel"].assert_not_called()
+    # no unlock when the lock was never acquired
+    assert not any("pg_advisory_unlock" in c[0] for c in conn.execute_calls)
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_cancels_when_credential_inactive_at_start():
+    """A3/C9: the credential was disconnected before the import got the lock →
+    cancel the run (not complete/fail). Lock released."""
+    cred_id = uuid4()
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    run_id = uuid4()
+    m = _import_step_patches(credential=None)  # vault returns None (no active row)
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=cred_id, tenant_id=uuid4(), user_id=uuid4(), import_run_id=run_id,
+        )
+    assert result.state == "cancelled"
+    m["cancel"].assert_awaited_once()
+    m["run_one_cycle"].assert_not_called()
+    expected_key = scheduler._advisory_lock_key(cred_id)
+    assert any("pg_advisory_unlock" in s and a == (expected_key,) for s, a in conn.execute_calls)
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_completes_on_clean_cycle():
+    """A3: a clean cycle (no abort, no credential error) marks the import
+    running, threads import_run_id into run_one_cycle, then completes it."""
+    cred = _FakeCredential(id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active")
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    run_id = uuid4()
+    m = _import_step_patches(credential=cred, cycle_result=_fake_cycle_result(notes_processed=7))
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id, import_run_id=run_id,
+        )
+    assert result.state == "complete"
+    assert result.notes_processed == 7
+    m["mark_running"].assert_awaited_once()
+    m["complete"].assert_awaited_once()
+    m["fail"].assert_not_called()
+    m["cancel"].assert_not_called()
+    # import_run_id threaded into the cycle so set_import_total fires
+    run_kwargs = m["run_one_cycle"].await_args.kwargs
+    assert run_kwargs["import_run_id"] == run_id
+    assert run_kwargs["credential"] is cred
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_cancels_stale_import_on_forward_credential():
+    """Codex round-3 P1: the credential id is reused across reconnects. A stale
+    history import re-dispatched against a credential now reconnected as FORWARD
+    must NOT backfill — cancel + bail (no run_one_cycle), honoring the user's
+    'from now on' choice."""
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "forward", "folders": [{"id": "fol_a"}]},
+    )
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    m = _import_step_patches(credential=cred, cycle_result=_fake_cycle_result())
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id, import_run_id=uuid4(),
+        )
+    assert result.state == "cancelled"
+    assert result.reason == "credential_now_forward"
+    m["cancel"].assert_awaited_once()
+    m["mark_running"].assert_not_called()      # never claims/starts the run
+    m["run_one_cycle"].assert_not_called()     # NO backfill against the forward cred
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_cancels_on_cycle_aborted():
+    """A3: run_one_cycle signals cycle_aborted (credential disconnected
+    mid-import) → cancel, not complete."""
+    cred = _FakeCredential(id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active")
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    m = _import_step_patches(credential=cred, cycle_result=_fake_cycle_result(cycle_aborted=True))
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id, import_run_id=uuid4(),
+        )
+    assert result.state == "cancelled"
+    m["cancel"].assert_awaited_once()
+    m["complete"].assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_fails_on_credential_error_code():
+    """A3: run_one_cycle returns a credential-level error (auth/folder) instead
+    of raising → fail the import (NOT complete — the wrapper must check
+    credential_error_code)."""
+    cred = _FakeCredential(id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active")
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    m = _import_step_patches(
+        credential=cred,
+        cycle_result=_fake_cycle_result(credential_error_code="granola_auth_failed"),
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id, import_run_id=uuid4(),
+        )
+    assert result.state == "failed"
+    assert result.credential_error_code == "granola_auth_failed"
+    m["fail"].assert_awaited_once()
+    m["complete"].assert_not_called()
+    m["cancel"].assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_bails_when_run_already_terminal():
+    """Codex P1: a recovery re-dispatch (A2) races the original workflow; if the
+    original finished first, mark_running claims 0 rows → run_import_step must NOT
+    run a redundant backfill on the terminal run."""
+    cred = _FakeCredential(id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active")
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    m = _import_step_patches(credential=cred, cycle_result=_fake_cycle_result())
+    m["mark_running"] = AsyncMock(return_value=False)  # already terminal → not claimed
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id, import_run_id=uuid4(),
+        )
+    assert result.state == "superseded"
+    m["run_one_cycle"].assert_not_called()   # NO redundant backfill
+    m["complete"].assert_not_called()
+    m["cancel"].assert_not_called()
+    m["fail"].assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_proceeds_when_run_claimed():
+    """The happy path claims the run (mark_running True) → runs the cycle."""
+    cred = _FakeCredential(id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active")
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    m = _import_step_patches(credential=cred, cycle_result=_fake_cycle_result(notes_processed=3))
+    m["mark_running"] = AsyncMock(return_value=True)
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id, import_run_id=uuid4(),
+        )
+    assert result.state == "complete"
+    m["run_one_cycle"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_import_step_fails_and_reraises_on_unexpected_raise():
+    """A3 'on raise -> fail_import_run': an unexpected exception from the cycle
+    marks the run failed (FE shows 'failed', not stuck 'running') and propagates
+    so DBOS records the workflow failed. Lock still released."""
+    cred = _FakeCredential(id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active")
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    m = _import_step_patches(credential=cred, cycle_raises=RuntimeError("boom"))
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        with pytest.raises(RuntimeError, match="boom"):
+            await scheduler.run_import_step(
+                credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id, import_run_id=uuid4(),
+            )
+    m["fail"].assert_awaited_once()
+    expected_key = scheduler._advisory_lock_key(cred.id)
+    assert any("pg_advisory_unlock" in s and a == (expected_key,) for s, a in conn.execute_calls)
+
+
+# ---------------------------------------------------------------------------
+# granola_import_one_credential (workflow body — structural)
+# ---------------------------------------------------------------------------
+
+
+def test_import_workflow_is_dbos_decorated():
+    fn = scheduler.granola_import_one_credential
+    assert callable(fn)
+    assert inspect.iscoroutinefunction(fn)
+    assert fn.__name__ == "granola_import_one_credential"
+
+
+def test_import_workflow_signature_takes_four_positional_uuids():
+    """Dispatch site enqueues (credential_id, tenant_id, user_id, import_run_id)
+    positionally — order must match the workflow signature."""
+    import typing as _t
+
+    sig = inspect.signature(scheduler.granola_import_one_credential)
+    params = [name for name, _ in sig.parameters.items()]
+    assert params == ["credential_id", "tenant_id", "user_id", "import_run_id"]
+    hints = _t.get_type_hints(scheduler.granola_import_one_credential)
+    for name in params:
+        assert hints[name] is UUID
+
+
+# ---------------------------------------------------------------------------
+# dispatch + workflow-id helpers
+# ---------------------------------------------------------------------------
+
+
+def test_import_workflow_id_is_deterministic():
+    """C8 idempotent dispatch: /connect + the /status no-run recovery use the
+    same deterministic id so a duplicate dispatch is a DBOS no-op."""
+    cred = uuid4()
+    run = uuid4()
+    wid = scheduler.import_workflow_id(cred, run)
+    assert wid == f"granola_import_{cred}_{run}"
+    assert scheduler.import_workflow_id(cred, run) == wid  # stable
+
+
+def test_import_recovery_workflow_id_is_window_stamped_and_distinct():
+    """A2 strand recovery uses a FRESH id per window (the deterministic
+    workflow already completed/returned lock_busy, so DBOS would dedup the
+    deterministic id to a no-op)."""
+    cred = uuid4()
+    run = uuid4()
+    rid = scheduler.import_recovery_workflow_id(cred, run, 12345)
+    assert rid != scheduler.import_workflow_id(cred, run)
+    assert "12345" in rid
+    # different windows -> different ids (so a later tick re-dispatches)
+    assert scheduler.import_recovery_workflow_id(cred, run, 12346) != rid
+
+
+@pytest.mark.asyncio
+async def test_enqueue_import_workflow_uses_set_workflow_id_and_import_queue():
+    """The dispatch helper enqueues granola_import_one_credential on the IMPORT
+    queue under the given workflow id (positional args match the signature)."""
+    cred, tenant, user, run = uuid4(), uuid4(), uuid4(), uuid4()
+    enqueue_mock = AsyncMock()
+    captured = {}
+
+    class _FakeSetWorkflowID:
+        def __init__(self, wid):
+            captured["wid"] = wid
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    with patch.object(scheduler.GRANOLA_IMPORT_QUEUE, "enqueue_async", new=enqueue_mock), \
+         patch.object(scheduler, "SetWorkflowID", new=_FakeSetWorkflowID):
+        await scheduler.enqueue_import_workflow(
+            credential_id=cred, tenant_id=tenant, user_id=user,
+            import_run_id=run, workflow_id="granola_import_test_wid",
+        )
+    assert captured["wid"] == "granola_import_test_wid"
+    enqueue_mock.assert_awaited_once()
+    args = enqueue_mock.await_args.args
+    assert args[0] is scheduler.granola_import_one_credential
+    assert args[1:] == (cred, tenant, user, run)
+
+
+# ---------------------------------------------------------------------------
+# list_recoverable_import_runs (A2 cron/status backstop)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_recoverable_import_runs_queries_stale_queued_rows():
+    """A2 recovery: find queued import runs older than the staleness window so
+    the cron/status can re-dispatch a strand. SQL filters state='queued' +
+    created_at < now - interval, with a LIMIT."""
+    rows = [
+        {"id": uuid4(), "credential_id": uuid4(), "tenant_id": uuid4(), "user_id": uuid4()},
+    ]
+    conn = _FakeConn(fetch_returns=rows)
+    pool = _FakePool(conn)
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
+        result = await scheduler.list_recoverable_import_runs()
+    assert len(result) == 1
+    assert result[0].import_run_id == rows[0]["id"]
+    assert result[0].credential_id == rows[0]["credential_id"]
+    sql, _ = conn.fetch_calls[0]
+    low = sql.lower()
+    assert "state = 'queued'" in low
+    assert "created_at <" in low
+    assert "limit" in low
+
+
+@pytest.mark.asyncio
+async def test_list_recoverable_import_runs_empty_when_none_stale():
+    conn = _FakeConn(fetch_returns=[])
+    pool = _FakePool(conn)
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
+        result = await scheduler.list_recoverable_import_runs()
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# list_uninitialized_credentials + recover_uninitialized_credential (Codex P1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_uninitialized_credentials_returns_scope_and_filters():
+    """Headless recovery target: active creds with NULL watermark + no live
+    import (NOT EXISTS), surfaced with their import_scope so the cron knows
+    whether to dispatch (history) or anchor (forward)."""
+    rows = [
+        {"id": uuid4(), "tenant_id": uuid4(), "user_id": uuid4(), "import_scope": "history"},
+        {"id": uuid4(), "tenant_id": uuid4(), "user_id": uuid4(), "import_scope": "forward"},
+    ]
+    conn = _FakeConn(fetch_returns=rows)
+    pool = _FakePool(conn)
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)):
+        result = await scheduler.list_uninitialized_credentials()
+    assert [c.import_scope for c in result] == ["history", "forward"]
+    assert all(isinstance(c, scheduler.UninitializedCredential) for c in result)
+    sql, _ = conn.fetch_calls[0]
+    low = sql.lower()
+    assert "status = 'active'" in low and "archived_at is null" in low
+    assert "last_polled_at is null" in low
+    assert "not exists" in low                      # excludes history creds with a live run
+    assert "config->>'import_scope' in ('history', 'forward')" in low
+    # forward creds always qualify (not masked by an old history run) — Codex P1
+    assert "config->>'import_scope' = 'forward'" in low
+
+
+@pytest.mark.asyncio
+async def test_recover_uninitialized_credential_history_creates_and_dispatches():
+    """history → create the run (idempotent) + dispatch under the DETERMINISTIC
+    id (the headless equivalent of /connect)."""
+    cred = uuid4()
+    run_id = uuid4()
+    get_or_create = AsyncMock(return_value=(run_id, True))
+    enqueue = AsyncMock()
+    with patch.object(scheduler, "get_or_create_active_import_run", get_or_create), \
+         patch.object(scheduler, "enqueue_import_workflow", enqueue):
+        action = await scheduler.recover_uninitialized_credential(
+            credential_id=cred, tenant_id=uuid4(), user_id=uuid4(), import_scope="history",
+        )
+    assert action == "history_created"
+    get_or_create.assert_awaited_once()
+    enqueue.assert_awaited_once()
+    assert enqueue.await_args.kwargs["workflow_id"] == f"granola_import_{cred}_{run_id}"
+
+
+@pytest.mark.asyncio
+async def test_recover_uninitialized_credential_forward_anchors_with_now():
+    """forward → re-anchor last_polled_at with NOW() via the vault helper, using
+    the scheduler's ALLOWLIST caller_module."""
+    cred = uuid4()
+    pool = _FakePool(_FakeConn())
+    anchor = AsyncMock()
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "anchor_credential_watermark", anchor):
+        action = await scheduler.recover_uninitialized_credential(
+            credential_id=cred, tenant_id=uuid4(), user_id=uuid4(), import_scope="forward",
+        )
+    assert action == "forward_anchored"
+    anchor.assert_awaited_once()
+    kw = anchor.await_args.kwargs
+    assert kw["credential_id"] == cred
+    assert kw["caller_module"] == "services.granola_ingestion.scheduler"
+    assert kw["ts"] is not None
 
 
 # ---------------------------------------------------------------------------
