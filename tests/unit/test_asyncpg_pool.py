@@ -30,6 +30,7 @@ def _reset_pool_state(monkeypatch):
     monkeypatch.delenv("DBOS_SYSTEM_DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("GRANOLA_DB_ALLOW_POOLER", raising=False)
+    monkeypatch.delenv("GRANOLA_DB_POOL_MAX_SIZE", raising=False)
     yield
     asyncpg_pool._reset_for_tests()
 
@@ -215,6 +216,60 @@ def test_resolve_dsn_rejects_unexpected_scheme(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "mysql://user@host/db")
     with pytest.raises(RuntimeError, match="unexpected scheme"):
         asyncpg_pool._resolve_dsn_and_kwargs()
+
+
+# ---------------------------------------------------------------------------
+# Pool sizing (A7 / EQ-92 B3): env-overridable max_size with an invariant floor
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_max_size_defaults_to_20(monkeypatch):
+    """B3 bumps the default 10 -> 20 (headroom for the import's extra
+    transient writes on top of the 2×(poll+import)=14 floor)."""
+    monkeypatch.delenv("GRANOLA_DB_POOL_MAX_SIZE", raising=False)
+    assert asyncpg_pool._resolve_max_size() == 20
+
+
+def test_resolve_max_size_honors_env_override(monkeypatch):
+    """An operator can tune the pool up via GRANOLA_DB_POOL_MAX_SIZE (A7)."""
+    monkeypatch.setenv("GRANOLA_DB_POOL_MAX_SIZE", "32")
+    assert asyncpg_pool._resolve_max_size() == 32
+
+
+def test_resolve_max_size_clamps_up_to_invariant_floor(monkeypatch, caplog):
+    """A sub-floor override is clamped UP to the 2×(poll+import)=14 floor
+    (not honored) — a too-small pool starves the held advisory-lock
+    connections and deadlocks the cron tick. Loud warning, safe value."""
+    import logging
+
+    monkeypatch.setenv("GRANOLA_DB_POOL_MAX_SIZE", "8")
+    with caplog.at_level(logging.WARNING):
+        resolved = asyncpg_pool._resolve_max_size()
+    assert resolved == 14
+    assert any("invariant floor" in r.message for r in caplog.records)
+
+
+def test_resolve_max_size_non_integer_falls_back_to_default(monkeypatch):
+    """A non-integer override is ignored (warn) rather than crashing pool
+    creation mid-startup."""
+    monkeypatch.setenv("GRANOLA_DB_POOL_MAX_SIZE", "not-a-number")
+    assert asyncpg_pool._resolve_max_size() == 20
+
+
+@pytest.mark.asyncio
+async def test_get_pool_uses_resolved_max_size(monkeypatch):
+    """get_asyncpg_pool passes the resolved (env-overridable) max_size to
+    asyncpg.create_pool."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://localhost:5432/dev_db")
+    monkeypatch.setenv("GRANOLA_DB_POOL_MAX_SIZE", "25")
+
+    fake_pool = MagicMock(name="FakeAsyncpgPool")
+    create_pool_mock = AsyncMock(return_value=fake_pool)
+    with patch.object(asyncpg_pool.asyncpg, "create_pool", create_pool_mock):
+        await asyncpg_pool.get_asyncpg_pool()
+
+    _, kwargs = create_pool_mock.call_args
+    assert kwargs["max_size"] == 25
 
 
 @pytest.mark.asyncio

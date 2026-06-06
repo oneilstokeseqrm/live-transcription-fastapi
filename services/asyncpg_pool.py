@@ -69,21 +69,26 @@ here and promote ``sslmode=require`` to an explicit SSL context —
 mirroring the SQLAlchemy engine's setup in
 :func:`services.database.get_database_url`.
 
-Sizing: the pool defaults to ``min_size=1, max_size=10``. Phase 2e's
-peak load is one workflow per active credential per 5 min, capped by
-the DBOS Queue at 5 concurrent workflows (per LOCKED-39 +
-:data:`services.granola_ingestion.scheduler.GRANOLA_POLL_QUEUE`'s
-``concurrency=5``). Each concurrent cycle holds ONE connection for its
-whole duration — the per-credential advisory lock that serializes
-overlapping cycles (Codex PR-#28 R1 P1) — PLUS up to one transient
-connection at a time for the ``external_integration_runs`` / credential
-SQL (the adapter's other DB access goes through the separate SQLAlchemy
-engine, not this pool). Peak is therefore ``2 × concurrency`` = 10. The
-invariant ``max_size >= 2 × GRANOLA_POLL_QUEUE.concurrency`` MUST hold or
-the held lock connections can starve the transient acquires and
-deadlock the cron tick. 10 stays well under Neon's per-database
-connection limit. Future tuning via env var if observed traffic
-demands it.
+Sizing: the pool defaults to ``min_size=1, max_size=20`` (B3 raised the
+default from 10). TWO DBOS queues now share this pool: the 5-min poll
+(:data:`services.granola_ingestion.scheduler.GRANOLA_POLL_QUEUE`,
+``concurrency=5``) and the background history-import
+(:data:`~services.granola_ingestion.scheduler.GRANOLA_IMPORT_QUEUE`,
+``concurrency=2``). Each concurrent poll cycle AND each concurrent
+import holds ONE connection for its whole duration — the per-credential
+advisory lock that serializes overlapping cycles (Codex PR-#28 R1 P1) —
+PLUS up to one transient connection at a time for the
+``external_integration_runs`` / credential / ``granola_import_runs`` SQL
+(the adapter's other DB access goes through the separate SQLAlchemy
+engine, not this pool). Peak is therefore
+``2 × (poll + import concurrency) = 2 × (5 + 2) = 14``. The invariant
+``max_size >= 2 × (poll + import concurrency)`` MUST hold or the held
+lock connections can starve the transient acquires and deadlock the
+cron tick — :func:`_resolve_max_size` enforces this floor. The default
+20 leaves headroom above the floor and stays well under Neon's
+per-database connection limit. Operators tune via the
+``GRANOLA_DB_POOL_MAX_SIZE`` env var (clamped up to the floor; per-loop
+pool ownership is the EQ-109 follow-up).
 """
 
 from __future__ import annotations
@@ -103,10 +108,61 @@ _pool: Optional[asyncpg.Pool] = None
 _lock: asyncio.Lock = asyncio.Lock()
 
 _DEFAULT_MIN_SIZE = 1
-# Invariant: must be >= 2 × GRANOLA_POLL_QUEUE.concurrency (see module
-# docstring) — each concurrent cycle holds 1 advisory-lock connection
-# for its whole duration plus up to 1 transient connection for SQL.
-_DEFAULT_MAX_SIZE = 10
+# Default max pool size. Env-overridable via GRANOLA_DB_POOL_MAX_SIZE (A7).
+# B3 raised the default 10 -> 20: a second worker queue (the background
+# history-import) now shares this pool, so peak concurrency grew, and the
+# import does extra transient writes (granola_import_runs +
+# external_integration_runs) on top of its held advisory-lock connection.
+# 20 gives headroom over the hard floor below and stays well under Neon's
+# per-database connection ceiling.
+_DEFAULT_MAX_SIZE = 20
+
+# Hard invariant floor (see module docstring). Each concurrent poll cycle
+# AND each concurrent import holds ONE advisory-lock connection for its
+# whole duration PLUS up to one transient connection for SQL, so peak is
+# 2 × (poll + import concurrency). With GRANOLA_POLL_QUEUE.concurrency=5 +
+# GRANOLA_IMPORT_QUEUE.concurrency=2 that is 2 × (5 + 2) = 14. A max_size
+# below this can starve the transient acquires and deadlock the cron tick,
+# so a too-small GRANOLA_DB_POOL_MAX_SIZE override is clamped UP to it.
+# KEEP IN SYNC with the two queue concurrencies in
+# services/granola_ingestion/scheduler.py (not imported here to avoid a
+# circular import — scheduler imports this module).
+_POOL_MAX_SIZE_FLOOR = 14
+
+_MAX_SIZE_ENV = "GRANOLA_DB_POOL_MAX_SIZE"
+
+
+def _resolve_max_size() -> int:
+    """Resolve the pool ``max_size`` from ``GRANOLA_DB_POOL_MAX_SIZE``.
+
+    Defaults to :data:`_DEFAULT_MAX_SIZE`. A non-integer value is ignored
+    (warn + default) rather than crashing pool creation at startup. A value
+    below :data:`_POOL_MAX_SIZE_FLOOR` is clamped UP to the floor (warn) —
+    the invariant ``max_size >= 2 × (poll + import concurrency)`` MUST hold
+    or the held advisory-lock connections starve the transient acquires and
+    deadlock the cron tick, so a too-small override is corrected, not
+    honored.
+    """
+    raw = os.environ.get(_MAX_SIZE_ENV)
+    if raw is None or not raw.strip():
+        return _DEFAULT_MAX_SIZE
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using default max_size=%d",
+            _MAX_SIZE_ENV, raw, _DEFAULT_MAX_SIZE,
+        )
+        return _DEFAULT_MAX_SIZE
+    if value < _POOL_MAX_SIZE_FLOOR:
+        logger.warning(
+            "%s=%d is below the pool invariant floor %d "
+            "(2 × (poll=5 + import=2 concurrency)); clamping up to %d to "
+            "avoid starving the held advisory-lock connections.",
+            _MAX_SIZE_ENV, value, _POOL_MAX_SIZE_FLOOR, _POOL_MAX_SIZE_FLOOR,
+        )
+        return _POOL_MAX_SIZE_FLOOR
+    return value
 
 
 def _to_direct_neon_url(url: str) -> str:
@@ -310,14 +366,15 @@ async def get_asyncpg_pool() -> asyncpg.Pool:
     async with _lock:
         if _pool is None:
             dsn, kwargs = _resolve_dsn_and_kwargs()
+            max_size = _resolve_max_size()
             logger.info(
                 "asyncpg_pool: creating pool (min=%d max=%d, ssl=%s)",
-                _DEFAULT_MIN_SIZE, _DEFAULT_MAX_SIZE, "yes" if "ssl" in kwargs else "no",
+                _DEFAULT_MIN_SIZE, max_size, "yes" if "ssl" in kwargs else "no",
             )
             _pool = await asyncpg.create_pool(
                 dsn,
                 min_size=_DEFAULT_MIN_SIZE,
-                max_size=_DEFAULT_MAX_SIZE,
+                max_size=max_size,
                 **kwargs,
             )
     return _pool
