@@ -41,7 +41,8 @@ TDD throughout (AsyncMock, no Docker). Tests: `tests/unit/granola_ingestion/test
 - [x] DO NOT BUILD (split fast-follows): #21a reconfigure-backfill (active-row reconfigure keeps B2 behavior), #21b exact re-import progress items-table.
 - [x] `scripts/verify_consumer_contracts.py` → **0 drift** (envelope UNCHANGED — LOCKED-38). Full unit suite **603 passed / 0 new failures** (1 pre-existing `account_provisioning` failure, identical on `main`). **0 Pyright errors** on all changed source.
 - [x] `/codex review` — **4 rounds → CLEAN** (7 P1s folded across rounds 1-3; round 4 NO P1s). Founder authorized merge → **PR #39 squash `061ef37` → main** → Railway **`9cda4b1e` SUCCESS** → `/health` **200** → routes live + gated.
-- [ ] **NEXT (fresh session): prod import E2E** (history + forward; shared-infra check; reconnect test cred; mint JWT from Railway env) → then **EQ-94 (frontend)**.
+- [x] **Prod import E2E PASSED (2026-06-06)** — history (0.26s async ACK → import_run queued→running→complete, total=2, on `GRANOLA_IMPORT_QUEUE`, success-note short-circuit, no DLQ) + forward (`import:null`, watermark anchored, no import_run); A1 resume observed, defer by-effect. **EQ-92 = DONE in Linear.** Active deploy `105cd404` (supersedes `9cda4b1e`). Test cred `6a727bae` left connected in FORWARD scope.
+- [ ] **NEXT (fresh session): EQ-94 (frontend, F1-F4)** — paste-ready prompt `docs/superpowers/specs/2026-06-06-granola-eq94-frontend-next-session-prompt.md`; resume checkpoint `granola-e2e-passed-eq94-next`.
 
 ## Session end
 - [x] Updated memory (project + index), repo docs (plan banner/VERDICT, system-map, this todo), the next-session prompt; filed the residual-P2 ticket + EQ-92 in Linear; ran the stale-signature cross-check.
@@ -58,4 +59,4 @@ All 5 remaining PR-2 components built TDD-first (AsyncMock, no Docker), then bot
 - **Shipped:** PR #39 squash `061ef37` → main; Railway `9cda4b1e` SUCCESS; `/health` 200; routes live + gated.
 - **Residual P2 (ticketed):** per-activation import-lifecycle scoping (rare crashed-reconnect → poll re-lists
   dedup-safe without a fresh progress row — data correct, progress UI missing).
-- **Deferred (deliberate, heavy-context):** prod import E2E → fresh session, then EQ-94.
+- **Deferred (deliberate, heavy-context):** prod import E2E → DONE 2026-06-06 (PASSED, see above; EQ-92 Done). Next = EQ-94 (frontend), its own fresh session.

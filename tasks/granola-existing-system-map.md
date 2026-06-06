@@ -22,8 +22,12 @@ EQ-92 (B3 background history-import) ALL SHIPPED + MERGED + DEPLOYED: B1 PR #37 
 `granola_import_runs` migration #454 `54b9dbc8`) live; PR 2 (backend, #39) implements A1-A7 + C4/C8/C18 —
 background import on `GRANOLA_IMPORT_QUEUE`, A1 poll-defers, DERIVED progress, `/connect` async restructure,
 `/status` import block, full headless recovery. Codex gate 4 rounds → clean (7 P1s folded) + pre-Codex
-multi-agent review; 603 tests/0 new fail; 0 Pyright; 0 contract drift. **NEXT = prod import E2E (fresh
-session) THEN EQ-94 (frontend).** Residual P2 ticketed (per-activation import-lifecycle scoping).
+multi-agent review; 603 tests/0 new fail; 0 Pyright; 0 contract drift. **✅ PROD IMPORT E2E PASSED
+(2026-06-06)** — history (0.26s async ACK → import_run queued→running→complete, total=2, on
+`GRANOLA_IMPORT_QUEUE`, success-note short-circuit, no DLQ) + forward (`import:null`, watermark anchored, no
+import_run); **EQ-92 = DONE in Linear. NEXT = EQ-94 (frontend, F1-F4).** Active Railway deploy `105cd404`
+(supersedes `9cda4b1e`; same B3 code). Test cred `6a727bae` now in FORWARD scope (was legacy single-folder).
+Residual P2 ticketed (EQ-135, per-activation import-lifecycle scoping).
 **Note:** `/health` intermittently 502s (~15%, benign single-worker cold-start; EQ-105).
 
 **The end-to-end flow that works today:** connect a Granola account (currently via a hand-minted JWT,

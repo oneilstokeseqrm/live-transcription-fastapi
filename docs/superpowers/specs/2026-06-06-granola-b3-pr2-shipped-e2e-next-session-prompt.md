@@ -1,3 +1,9 @@
+> ## ⛔ SUPERSEDED (2026-06-06) — this prompt's job (the prod import E2E) is DONE.
+> The prod import E2E (history + forward) **PASSED** and **EQ-92 is Done** in Linear. The remaining Phase-3 work
+> is the frontend (EQ-94). **Use the next prompt instead:**
+> `docs/superpowers/specs/2026-06-06-granola-eq94-frontend-next-session-prompt.md` (resume checkpoint
+> `granola-e2e-passed-eq94-next`). This file is kept as the historical E2E runbook only.
+
 # Next-session opening prompt — Granola EQ-92/B3: backend SHIPPED → prod E2E → EQ-94 (frontend)
 
 **Written:** 2026-06-06, end of the session that SHIPPED + DEPLOYED the B3 background-import backend (PR 2).
