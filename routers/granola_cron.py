@@ -18,7 +18,13 @@ authenticated by the ``X-Internal-Cron-Secret`` header. The handler:
    :func:`~services.granola_ingestion.scheduler.granola_poll_one_credential`
    via :data:`~services.granola_ingestion.scheduler.GRANOLA_POLL_QUEUE`
    with ``SetWorkflowID(f"granola_poll_{credential_id}_{cycle_window}")``.
-5. Returns ``{"enqueued": N, "cycle_window": <int>}``.
+5. EQ-92/B3 (A2): re-dispatches any stale ``queued`` background-import runs
+   (:func:`~services.granola_ingestion.scheduler.list_recoverable_import_runs`)
+   with a window-stamped recovery workflow id — the headless backstop for an
+   import whose ``run_import_step`` returned ``lock_busy`` (the /status surface
+   recovers it too while the connect screen is open). NON-FATAL: a blip here
+   never blocks the poll dispatch.
+6. Returns ``{"enqueued": N, "imports_recovered": M, "cycle_window": <int>}``.
 
 **Auth: defense-in-depth**, despite Railway's internal-network
 assumption. The cron endpoint is for Railway's scheduler service, NOT
@@ -54,8 +60,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from services.granola_ingestion.scheduler import (
     GRANOLA_POLL_QUEUE,
+    enqueue_import_workflow,
     granola_poll_one_credential,
+    import_recovery_workflow_id,
     list_active_credentials,
+    list_recoverable_import_runs,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,8 +184,40 @@ async def granola_cron_tick(
             )
         enqueued += 1
 
+    # A2 strand recovery (EQ-92/B3): re-dispatch background imports stuck
+    # 'queued' (their run_import_step returned lock_busy, or a crash landed
+    # between create + dispatch). A window-stamped recovery id makes this
+    # idempotent within the 5-min window and distinct from the deterministic
+    # /connect dispatch id (which already completed, so DBOS would dedup it to a
+    # no-op). NON-FATAL: a recovery-query / enqueue blip must never block the
+    # poll dispatch above or 5xx the tick — swallow + log; next tick retries.
+    imports_recovered = 0
+    try:
+        for run in await list_recoverable_import_runs():
+            recovery_id = import_recovery_workflow_id(
+                run.credential_id, run.import_run_id, cycle_window
+            )
+            await enqueue_import_workflow(
+                credential_id=run.credential_id,
+                tenant_id=run.tenant_id,
+                user_id=run.user_id,
+                import_run_id=run.import_run_id,
+                workflow_id=recovery_id,
+            )
+            imports_recovered += 1
+    except Exception:  # noqa: BLE001 — recovery must not break the poll tick
+        logger.exception(
+            "granola cron tick: import-recovery pass failed (non-fatal); "
+            "the next 5-min tick retries"
+        )
+
     logger.info(
-        "granola cron tick: enqueued=%d cycle_window=%d active_credentials=%d",
-        enqueued, cycle_window, len(credentials),
+        "granola cron tick: enqueued=%d imports_recovered=%d cycle_window=%d "
+        "active_credentials=%d",
+        enqueued, imports_recovered, cycle_window, len(credentials),
     )
-    return {"enqueued": enqueued, "cycle_window": cycle_window}
+    return {
+        "enqueued": enqueued,
+        "imports_recovered": imports_recovered,
+        "cycle_window": cycle_window,
+    }
