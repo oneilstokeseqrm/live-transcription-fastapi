@@ -438,10 +438,16 @@ async def _finalize_connect_with_scope(
     * ``forward``: anchor ``last_polled_at`` to the ROUTE-ENTRY timestamp (C4 —
       captured before any awaits) so the first 5-min poll's ``created_after``
       excludes pre-connect history. No backfill, no import run → ``import: null``.
+      NO advisory lock needed: the A1 poll-defer guard makes a poll on an
+      uninitialized credential SKIP rather than write ``last_polled_at`` (binding
+      A6 — "A1 covers the activation-before-anchor race"), so the anchor has no
+      concurrent writer. (A lock here would risk stranding — see
+      :func:`services.vault.anchor_credential_watermark`.)
     * ``history`` (default): create the import run (idempotent via the
       partial-unique) + dispatch the background import on the dedicated
       ``GRANOLA_IMPORT_QUEUE`` under the DETERMINISTIC workflow id (C8 — a retry
-      DBOS-dedups). Return the ``import`` ACK; the workflow flips it to running.
+      DBOS-dedups). Return the ``import`` ACK (state ``queued``: the row is
+      created queued; the workflow flips it to running via ``mark_running``).
     """
     if import_scope == "forward":
         try:
@@ -458,16 +464,38 @@ async def _finalize_connect_with_scope(
             raise _http_from_vault_error(exc)
         return {"ok": True, "status": "connected", "import": None}
 
-    run_id, _created = await get_or_create_active_import_run(
-        credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
-    )
-    await enqueue_import_workflow(
-        credential_id=credential_id,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        import_run_id=run_id,
-        workflow_id=import_workflow_id(credential_id, run_id),
-    )
+    # history: create the run + dispatch. The credential is already durable +
+    # active; a failure here must NOT 500 the connect (the get-or-create's rare
+    # double-race RuntimeError, or a DBOS enqueue blip). On failure we report the
+    # connection as established with no ACK block — the C8/A2 recovery on /status
+    # + the cron then create/dispatch the import (the same enqueue-atomicity
+    # guarantee that covers a crash between activation and dispatch).
+    try:
+        run_id, _created = await get_or_create_active_import_run(
+            credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
+        )
+    except Exception:  # noqa: BLE001 — connect must not 500 on a rare run-create race
+        logger.exception(
+            "granola /connect: could not create the import run for credential %s "
+            "(connected; /status + cron recovery will create + dispatch it)",
+            credential_id,
+        )
+        return {"ok": True, "status": "connected", "import": None}
+    try:
+        await enqueue_import_workflow(
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            import_run_id=run_id,
+            workflow_id=import_workflow_id(credential_id, run_id),
+        )
+    except Exception:  # noqa: BLE001 — the run is queued; recovery re-dispatches it
+        logger.exception(
+            "granola /connect: import dispatch failed for credential %s run %s "
+            "(run is queued; /status + cron recovery will re-dispatch it)",
+            credential_id, run_id,
+        )
+        # Still return the ACK — the run exists (queued) and recovery re-kicks it.
     return {
         "ok": True,
         "status": "connected",

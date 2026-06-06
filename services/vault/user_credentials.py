@@ -1259,13 +1259,26 @@ async def anchor_credential_watermark(
     :func:`rotate_credential_key`), the ``config`` (use
     :func:`update_credential_config`), or the ``status``.
 
-    Mirrors :func:`update_credential_config`: the caller MUST hold the
-    per-credential advisory lock, the WHERE is 3-field
+    Shaped like :func:`update_credential_config` (3-field WHERE
     ``(id, tenant_id, user_id)`` + ``status = 'active' AND archived_at IS NULL``
-    (tenant isolation + lifecycle guard), and the success audit shares the
-    UPDATE's transaction. Because the forward path runs at connect — before any
-    poll/import cycle — there is no contention with the adapter's mid-cycle
-    watermark write.
+    for tenant isolation + lifecycle guard; the success audit shares the
+    UPDATE's transaction), but with a DIFFERENT concurrency contract:
+
+    **The advisory lock is NOT required for the forward-connect anchor (binding
+    A6).** ``update_credential_config`` needs the lock because a poll cycle
+    concurrently writes ``config.folders[].status`` (C6) — two writers of the
+    same column. The ONLY other writer of ``last_polled_at`` is the adapter's
+    end-of-cycle ``_mark_credential_polled_success``, and the A1 poll-defer
+    guard (``run_cycle_step``) makes a poll on an uninitialized credential
+    (``import_scope`` in {history, forward} AND ``last_polled_at`` NULL) SKIP
+    rather than run a cycle — so it never writes ``last_polled_at`` in the
+    activation→anchor window. A6 states exactly this: "the poll guard A1 covers
+    the activation-before-anchor race." (Proof: the unit test
+    ``test_run_cycle_step_defers_uninitialized_forward_credential``.) Adding a
+    try-lock here would be unsafe — a lock-busy skip would leave the watermark
+    NULL forever, and A1 would then defer every future poll, stranding the
+    forward credential. Callers that COULD race a concurrent cycle (none today)
+    would need the lock; the forward-connect caller does not.
 
     Raises ``VAULT_DB_NOT_FOUND`` if no ACTIVE, non-archived row matches the
     ``credential_id`` (it flipped revoked/error or was archived between the

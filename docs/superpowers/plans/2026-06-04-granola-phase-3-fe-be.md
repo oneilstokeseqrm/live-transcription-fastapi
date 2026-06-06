@@ -253,8 +253,11 @@ included server-side by Granola).
   "import_scope": "history"  // "history" (full backfill) | "forward" (D6; watermark=now(), NO backfill)
 }
 // response when import_scope="history" (background import — decision #6; NO synchronous first-poll result)
+// state is "queued" at ACK: the granola_import_runs row is created queued; the dispatched workflow
+// flips it to "running" (mark_running) and /status then reports the live lifecycle state. (Reconciled
+// 2026-06-06 from an earlier "running" example to the accurate just-created value — B3 build + review.)
 { "ok": true, "status": "connected",
-  "import": { "import_run_id": "uuid", "state": "running", "total": null, "done": 0 }
+  "import": { "import_run_id": "uuid", "state": "queued", "total": null, "done": 0 }
 }
 // response when import_scope="forward" (no backfill; the 5-min poll picks up new meetings)
 { "ok": true, "status": "connected", "import": null }
