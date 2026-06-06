@@ -657,6 +657,7 @@ async def test_run_cycle_step_defers_uninitialized_history_credential():
     )
     with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
          patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "latest_import_run", new=AsyncMock(return_value=None)), \
          patch.object(scheduler, "run_one_cycle", new=AsyncMock()) as run_mock:
         result = await scheduler.run_cycle_step(
             credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
@@ -664,6 +665,50 @@ async def test_run_cycle_step_defers_uninitialized_history_credential():
     assert result.skipped is True
     assert result.reason == "awaiting_import"
     run_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_defers_uninitialized_history_while_import_running():
+    """A1: a queued/running import still owns the backfill → poll defers."""
+    pool = _FakePool(_FakeConn(fetchval_returns=True))
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "history", "folders": [{"id": "fol_a"}]},
+        last_polled_at=None,
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "latest_import_run", new=AsyncMock(return_value={"state": "running"})), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock()) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
+        )
+    assert result.skipped is True
+    assert result.reason == "awaiting_import"
+    run_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_step_proceeds_when_history_import_terminal_with_null_watermark():
+    """A1/Codex P1: a TERMINAL import that left the watermark NULL (a not_found
+    folder held it via B2) must NOT defer forever — the import is done, so the
+    poll proceeds (re-lists from NULL, dedup-safe, advances the watermark once
+    folders recover). Prevents the B2-hold × B3-defer permanent strand."""
+    pool = _FakePool(_FakeConn(fetchval_returns=True))
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "history", "folders": [{"id": "fol_a"}]},
+        last_polled_at=None,
+    )
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=AsyncMock(return_value=cred)), \
+         patch.object(scheduler, "latest_import_run", new=AsyncMock(return_value={"state": "complete"})), \
+         patch.object(scheduler, "run_one_cycle", new=AsyncMock(return_value=_fake_cycle_result())) as run_mock:
+        result = await scheduler.run_cycle_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id,
+        )
+    assert result.skipped is False  # import done → poll proceeds (no strand)
+    run_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1103,8 +1148,10 @@ async def test_list_uninitialized_credentials_returns_scope_and_filters():
     low = sql.lower()
     assert "status = 'active'" in low and "archived_at is null" in low
     assert "last_polled_at is null" in low
-    assert "not exists" in low                      # excludes creds with a live run
+    assert "not exists" in low                      # excludes history creds with a live run
     assert "config->>'import_scope' in ('history', 'forward')" in low
+    # forward creds always qualify (not masked by an old history run) — Codex P1
+    assert "config->>'import_scope' = 'forward'" in low
 
 
 @pytest.mark.asyncio

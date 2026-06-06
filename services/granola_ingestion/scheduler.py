@@ -76,6 +76,7 @@ from services.granola_ingestion.import_runs import (
     complete_import_run,
     fail_import_run,
     get_or_create_active_import_run,
+    latest_import_run,
     mark_running,
 )
 from services.vault import anchor_credential_watermark, get_granola_credential_for_user
@@ -408,34 +409,53 @@ async def run_cycle_step(
                     skipped=True, reason=f"credential_status={credential.status!r}"
                 )
 
-            # A1: defer to a pending background import. A freshly-connected B3
-            # credential is "uninitialized" — last_polled_at is still NULL and
-            # the IMPORT (created + dispatched at /connect, before this poll could
-            # fire) owns the first full backfill. If a poll wins the advisory
-            # lock first in that brief gap it MUST NOT run the cycle: a history
-            # poll would advance the shared watermark past history the import
-            # hasn't ingested; a forward poll would run before the forward anchor
-            # is written. Skip until the watermark is set (the import completes,
-            # or the forward anchor lands). Legacy pre-B3 credentials have no
-            # import_scope (and already have last_polled_at set), so this never
-            # trips for them. Activation and import-run creation aren't one txn,
-            # so this credential-STATE guard — not an "import_run exists" check —
-            # is what closes the activation-before-import race.
+            # A1: defer to a pending background import / forward anchor. A
+            # freshly-connected B3 credential is "uninitialized" — last_polled_at
+            # is still NULL. If a poll wins the advisory lock before the import
+            # set the watermark it MUST NOT run the cycle (it would advance the
+            # shared watermark past history the import hasn't ingested). Legacy
+            # pre-B3 credentials have no import_scope (and an already-set
+            # watermark), so this never trips for them.
+            #
+            # BUT defer only while the import is still RESPONSIBLE (forward:
+            # awaiting its anchor; history: no run yet, or a queued/running run).
+            # Once a history import is TERMINAL the import is done — proceed even
+            # with a NULL watermark. (run_one_cycle can complete an import while
+            # holding the watermark at NULL when a watched folder was not_found
+            # — B2 preserves the shared watermark on a skip. Deferring forever
+            # there would strand the credential; instead the poll proceeds,
+            # re-lists from NULL (dedup-safe via external_integration_runs), and
+            # advances the watermark once the folders recover.) — Codex P1.
             cfg = credential.config or {}
             import_scope = cfg.get("import_scope")
             if credential.last_polled_at is None and import_scope in ("history", "forward"):
-                reason = (
-                    "awaiting_import"
-                    if import_scope == "history"
-                    else "awaiting_forward_anchor"
+                if import_scope == "forward":
+                    logger.info(
+                        "run_cycle_step: credential_id=%s uninitialized forward "
+                        "(last_polled_at NULL); deferring until the forward anchor",
+                        credential_id,
+                    )
+                    return PollResult(skipped=True, reason="awaiting_forward_anchor")
+                latest = await latest_import_run(
+                    credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
                 )
+                if latest is None or latest["state"] in ("queued", "running"):
+                    logger.info(
+                        "run_cycle_step: credential_id=%s uninitialized history "
+                        "(import %s); deferring poll to the import",
+                        credential_id,
+                        "not yet created" if latest is None else latest["state"],
+                    )
+                    return PollResult(skipped=True, reason="awaiting_import")
+                # The import is terminal (complete/failed/cancelled) but the
+                # watermark is still NULL (e.g. a not_found folder) — the import
+                # is done; let the poll take over rather than defer forever.
                 logger.info(
-                    "run_cycle_step: credential_id=%s uninitialized "
-                    "(import_scope=%s, last_polled_at NULL); deferring poll to the "
-                    "import/forward-anchor (%s)",
-                    credential_id, import_scope, reason,
+                    "run_cycle_step: credential_id=%s history import terminal "
+                    "(state=%s) with NULL watermark; poll proceeds (re-lists, "
+                    "dedup-safe)",
+                    credential_id, latest["state"],
                 )
-                return PollResult(skipped=True, reason=reason)
 
             cycle_result = await run_one_cycle(credential=credential, pool=pool)
 
@@ -833,10 +853,17 @@ class UninitializedCredential:
     import_scope: str
 
 
-# Active + NULL-watermark credentials with no live initialization. The NOT
-# EXISTS excludes history credentials that already have a queued/running/complete
-# run (healthy, or a stale-queued strand handled by list_recoverable_import_runs);
-# forward credentials never have a run, so they always qualify when NULL-watermark.
+# Active + NULL-watermark credentials needing headless re-initialization:
+#
+# * forward → ALWAYS qualifies when the watermark is NULL: it needs anchoring,
+#   regardless of any import run from a PRIOR history lifecycle (a forward
+#   reconnect of a once-history credential keeps the old completed run, which
+#   must NOT mask the missing forward anchor — Codex P1).
+# * history → only when there is NO live/complete run (the NOT EXISTS): the
+#   no-row case (crash / swallowed get_or_create at /connect). A stale-QUEUED
+#   strand is handled by list_recoverable_import_runs; a TERMINAL run that left
+#   the watermark NULL (a not_found folder) is handled by run_cycle_step's A1
+#   guard (the poll proceeds once the import is terminal) — not here.
 _LIST_UNINITIALIZED_CREDS_SQL = """
 SELECT uc.id, uc.tenant_id, uc.user_id, uc.config->>'import_scope' AS import_scope
 FROM vault.user_credentials uc
@@ -845,10 +872,13 @@ WHERE uc.provider = 'granola'
   AND uc.archived_at IS NULL
   AND uc.last_polled_at IS NULL
   AND uc.config->>'import_scope' IN ('history', 'forward')
-  AND NOT EXISTS (
-    SELECT 1 FROM public.granola_import_runs r
-    WHERE r.credential_id = uc.id
-      AND r.state IN ('queued', 'running', 'complete')
+  AND (
+    uc.config->>'import_scope' = 'forward'
+    OR NOT EXISTS (
+      SELECT 1 FROM public.granola_import_runs r
+      WHERE r.credential_id = uc.id
+        AND r.state IN ('queued', 'running', 'complete')
+    )
   )
 ORDER BY uc.id ASC
 LIMIT $1

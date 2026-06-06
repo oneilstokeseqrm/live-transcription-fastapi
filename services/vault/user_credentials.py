@@ -296,17 +296,25 @@ WHERE id = $2
 RETURNING id
 """
 
-# B3/A6: anchor the poll watermark on a forward-scope connect. Writes the
-# EXISTING last_polled_at column to the route-entry timestamp (C4) so the
-# first 5-min poll's created_after excludes pre-connect history (no
-# backfill). Touches ONLY last_polled_at — never the key, status, or
-# config. ``status = 'active' AND archived_at IS NULL`` so a flipped/archived
-# row can't be anchored. Caller MUST hold the per-credential advisory lock
-# (forward path runs at connect, before any cycle, so there is no contention
-# with the adapter's mid-cycle watermark write).
+# B3/A6: anchor the poll watermark on a forward-scope connect. Sets the EXISTING
+# last_polled_at column to the route-entry timestamp (C4) so the first 5-min
+# poll's created_after excludes pre-connect history (no backfill). Touches ONLY
+# last_polled_at — never the key, status, or config. ``status = 'active' AND
+# archived_at IS NULL`` so a flipped/archived row can't be anchored.
+#
+# EARLIEST-anchor-wins via ``LEAST`` (Codex P1): the /connect happy path, the
+# /status recovery, and the cron recovery can all anchor the same forward
+# credential (the original anchor may have failed, then two recovery surfaces
+# race). A plain ``SET last_polled_at = $1`` lets a LATER timestamp overwrite an
+# earlier one, skipping notes created in between. ``LEAST(last_polled_at, $1)``
+# keeps the earliest watermark (Postgres LEAST ignores NULL, so the first anchor
+# on a NULL row writes ``$1``); a later writer never moves it forward, so the
+# poll re-lists (dedup-safe) rather than skipping. RETURNING id still matches the
+# active row regardless of the watermark value, so a benign re-anchor is success,
+# not VAULT_DB_NOT_FOUND.
 _UPDATE_WATERMARK_SQL = """
 UPDATE vault.user_credentials
-SET last_polled_at = $1,
+SET last_polled_at = LEAST(last_polled_at, $1),
     updated_at = CURRENT_TIMESTAMP
 WHERE id = $2
   AND tenant_id = $3
@@ -1249,12 +1257,16 @@ async def anchor_credential_watermark(
     caller_module: str,
     trace_id: str | None = None,
 ) -> UUID:
-    """Set ``last_polled_at = ts`` on an ACTIVE credential row (B3/A6).
+    """Anchor ``last_polled_at`` to ``ts`` (EARLIEST-wins) on an ACTIVE credential
+    row (B3/A6).
 
     The forward-scope connect path (``import_scope='forward'``): instead of a
     background backfill, anchor the poll watermark to the EXACT route-entry
     timestamp (captured before any awaits — C4) so the first 5-min poll's
-    ``created_after`` excludes pre-connect history. Touches ONLY
+    ``created_after`` excludes pre-connect history. Uses
+    ``LEAST(last_polled_at, ts)`` so a racing recovery anchor (the original may
+    have failed) keeps the EARLIEST timestamp and never moves the watermark
+    forward — moving it forward would skip notes created in between (Codex P1). Touches ONLY
     ``last_polled_at`` — never the encrypted key (use
     :func:`rotate_credential_key`), the ``config`` (use
     :func:`update_credential_config`), or the ``status``.

@@ -1723,7 +1723,9 @@ class TestAnchorCredentialWatermark:
         assert result == credential_id
 
         sql = conn.fetchrow.await_args.args[0]
-        assert "last_polled_at = $1" in sql
+        # EARLIEST-anchor-wins (Codex P1): LEAST keeps the earlier watermark so a
+        # racing later anchor never moves it forward + skips notes.
+        assert "last_polled_at = LEAST(last_polled_at, $1)" in sql
         assert "updated_at = CURRENT_TIMESTAMP" in sql
         # Only an ACTIVE, non-archived row is anchored; tenant isolation in WHERE.
         assert "status = 'active'" in sql
