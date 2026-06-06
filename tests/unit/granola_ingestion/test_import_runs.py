@@ -158,6 +158,32 @@ async def test_mark_running_sets_started_at_and_state():
 
 
 @pytest.mark.asyncio
+async def test_mark_running_returns_true_when_row_claimed():
+    """mark_running returns True when it claims a queued/running row (the command
+    tag is 'UPDATE 1')."""
+    conn = _RoutingConn()  # _RoutingConn.execute returns "UPDATE 1"
+    with _patch_pool(conn):
+        claimed = await import_runs.mark_running(
+            import_run_id=RUN, tenant_id=TENANT, user_id=USER
+        )
+    assert claimed is True
+
+
+@pytest.mark.asyncio
+async def test_mark_running_returns_false_when_already_terminal():
+    """A2/Codex P1: mark_running on an already-terminal run matches 0 rows
+    ('UPDATE 0') → False, so run_import_step bails rather than re-running a
+    backfill on a terminal run."""
+    conn = _RoutingConn()
+    conn.execute = AsyncMock(return_value="UPDATE 0")  # nothing claimed
+    with _patch_pool(conn):
+        claimed = await import_runs.mark_running(
+            import_run_id=RUN, tenant_id=TENANT, user_id=USER
+        )
+    assert claimed is False
+
+
+@pytest.mark.asyncio
 async def test_set_import_total_writes_total():
     conn = _RoutingConn()
     with _patch_pool(conn):
@@ -165,6 +191,8 @@ async def test_set_import_total_writes_total():
     sql, args = _sql_calls(conn, "execute")[0]
     assert "total" in sql.lower()
     assert 240 in args
+    # defense-in-depth: never overwrite the total on a terminal run (Codex P1).
+    assert "state in ('queued', 'running')" in sql.lower() or "state in ('queued','running')" in sql.lower()
 
 
 @pytest.mark.asyncio

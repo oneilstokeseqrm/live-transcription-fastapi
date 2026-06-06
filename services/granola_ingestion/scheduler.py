@@ -62,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -74,9 +75,10 @@ from services.granola_ingestion.import_runs import (
     cancel_import_run,
     complete_import_run,
     fail_import_run,
+    get_or_create_active_import_run,
     mark_running,
 )
-from services.vault import get_granola_credential_for_user
+from services.vault import anchor_credential_watermark, get_granola_credential_for_user
 
 logger = logging.getLogger(__name__)
 
@@ -610,9 +612,25 @@ async def run_import_step(
                     reason="credential_not_active",
                 )
 
-            await mark_running(
+            claimed = await mark_running(
                 import_run_id=import_run_id, tenant_id=tenant_id, user_id=user_id
             )
+            if not claimed:
+                # The run is already TERMINAL — a recovery re-dispatch (A2) raced
+                # the original workflow and the original finished first. Do NOT
+                # run a redundant backfill (it would re-poll Granola, hold the
+                # lock for the whole backfill, and set_import_total would mutate
+                # the terminal row). Bail; the run is already done (Codex P1).
+                logger.info(
+                    "run_import_step: import_run=%s already terminal (mark_running "
+                    "claimed nothing) for credential_id=%s; skipping redundant cycle",
+                    import_run_id, credential_id,
+                )
+                return ImportResult(
+                    state="superseded",
+                    import_run_id=import_run_id,
+                    reason="already_terminal",
+                )
             try:
                 cycle_result = await run_one_cycle(
                     credential=credential, pool=pool, import_run_id=import_run_id
@@ -790,3 +808,121 @@ async def list_recoverable_import_runs(
         )
         for row in rows
     ]
+
+
+@dataclass(frozen=True)
+class UninitializedCredential:
+    """An ACTIVE credential with a NULL watermark that the A1 poll-defer guard
+    skips, and which has no live initialization in flight:
+
+    * ``history`` → no ``granola_import_runs`` row in queued/running/complete (the
+      import was never created/dispatched — a crash, or the rare get_or_create
+      failure swallowed at /connect). Stale-queued strands are handled separately
+      by :func:`list_recoverable_import_runs`.
+    * ``forward`` → never has an import run; a NULL watermark means the forward
+      anchor failed.
+
+    The cron tick re-initializes each (create+dispatch / anchor) so the credential
+    starts polling — the headless backstop for the C8/A2/forward recovery the
+    /status surface does instantly.
+    """
+
+    credential_id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    import_scope: str
+
+
+# Active + NULL-watermark credentials with no live initialization. The NOT
+# EXISTS excludes history credentials that already have a queued/running/complete
+# run (healthy, or a stale-queued strand handled by list_recoverable_import_runs);
+# forward credentials never have a run, so they always qualify when NULL-watermark.
+_LIST_UNINITIALIZED_CREDS_SQL = """
+SELECT uc.id, uc.tenant_id, uc.user_id, uc.config->>'import_scope' AS import_scope
+FROM vault.user_credentials uc
+WHERE uc.provider = 'granola'
+  AND uc.status = 'active'
+  AND uc.archived_at IS NULL
+  AND uc.last_polled_at IS NULL
+  AND uc.config->>'import_scope' IN ('history', 'forward')
+  AND NOT EXISTS (
+    SELECT 1 FROM public.granola_import_runs r
+    WHERE r.credential_id = uc.id
+      AND r.state IN ('queued', 'running', 'complete')
+  )
+ORDER BY uc.id ASC
+LIMIT $1
+"""
+
+
+async def list_uninitialized_credentials(
+    *, limit: int = _IMPORT_RECOVERY_LIMIT,
+) -> list[UninitializedCredential]:
+    """Active credentials stuck uninitialized (NULL watermark, no live init) —
+    the headless recovery target for the cron (Codex P1: a crash/anchor-failure
+    leaves no row for :func:`list_recoverable_import_runs` to find, and the poll
+    defers them forever). Plain async helper; single attempt (a transient failure
+    waits for the next 5-min tick). Bounded by ``limit``."""
+    pool = await get_asyncpg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_LIST_UNINITIALIZED_CREDS_SQL, limit)
+    return [
+        UninitializedCredential(
+            credential_id=row["id"],
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            import_scope=row["import_scope"],
+        )
+        for row in rows
+    ]
+
+
+async def recover_uninitialized_credential(
+    *,
+    credential_id: UUID,
+    tenant_id: UUID,
+    user_id: UUID,
+    import_scope: str,
+) -> Optional[str]:
+    """Re-initialize an uninitialized ACTIVE credential so the A1-deferred poll
+    resumes. The shared recovery action for the /status, /connect-retry, and cron
+    surfaces. Idempotent + safe to call repeatedly:
+
+    * ``history`` → ensure an import run exists (``get_or_create_active_import_run``,
+      idempotent) + dispatch it under the DETERMINISTIC id (a live dispatch
+      DBOS-dedups). Headless equivalent of the /connect history path; heals a
+      credential whose import was never created/dispatched. (A stale-QUEUED run is
+      a different case — re-dispatched with a window-stamped id by the caller via
+      :func:`list_recoverable_import_runs`; the deterministic id would DBOS-dedup.)
+    * ``forward`` → anchor ``last_polled_at`` to NOW(). The C4 route-entry
+      precision is lost on this rare recovery path (the original anchor failed),
+      but a forward credential only needs "from roughly now on"; a meeting created
+      in the brief anchor-failure window is an accepted edge.
+
+    Returns a short action string (for logging) or None. The caller wraps this in
+    try/except — best-effort recovery must not break /status, /connect, or the
+    cron poll dispatch.
+    """
+    if import_scope == "forward":
+        pool = await get_asyncpg_pool()
+        await anchor_credential_watermark(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            ts=datetime.now(timezone.utc),
+            caller_module=_CALLER_MODULE,
+        )
+        return "forward_anchored"
+
+    run_id, created = await get_or_create_active_import_run(
+        credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
+    )
+    await enqueue_import_workflow(
+        credential_id=credential_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        import_run_id=run_id,
+        workflow_id=import_workflow_id(credential_id, run_id),
+    )
+    return "history_created" if created else "history_dispatched"

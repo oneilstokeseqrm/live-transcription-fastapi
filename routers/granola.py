@@ -508,33 +508,50 @@ async def _finalize_connect_with_scope(
     }
 
 
-async def _recover_history_import(
+async def _recover_uninitialized_credential(
     *, status_row, tenant_id: UUID, user_id: UUID
 ) -> None:
-    """Best-effort import recovery on the /status + /connect-retry surfaces.
+    """Best-effort INSTANT recovery on the /status + /connect-retry surfaces for
+    an ACTIVE credential stuck uninitialized (NULL watermark) — the A1 poll-defer
+    guard skips it, so it must be re-initialized. The 5-min cron
+    (:func:`services.granola_ingestion.scheduler.recover_uninitialized_credential`
+    + ``list_uninitialized_credentials``) is the headless backstop.
 
-    Closes the enqueue-atomicity gap (C8) and re-kicks a lock-busy strand (A2)
-    for an ACTIVE history credential whose watermark is still NULL (the import
-    never set it):
-
-    * no import run (crash before create/dispatch) → create + dispatch with the
-      DETERMINISTIC id (idempotent: a live dispatch DBOS-dedups);
-    * a STALE ``queued`` run (lock-busy strand / crash before dispatch) →
-      re-dispatch with a window-stamped recovery id;
-    * running / complete / failed / cancelled → no action (don't auto-retry a
-      genuinely failed import — a failed import flips the credential non-active,
-      so this guard won't fire for it).
+    * history, NO import run (crash before create/dispatch, or a swallowed
+      get_or_create at /connect) → create + dispatch with the DETERMINISTIC id
+      (C8; idempotent — a live dispatch DBOS-dedups);
+    * history, STALE ``queued`` run (lock-busy strand) → re-dispatch with a
+      window-stamped id (A2; the deterministic id would DBOS-dedup);
+    * history, running / complete → no action (don't auto-retry a genuinely
+      failed import — a failed import flips the credential non-active);
+    * forward, NULL watermark (the connect-time anchor failed) → re-anchor with
+      NOW() (Codex P1; C4 route-entry precision is lost on this rare recovery
+      path, acceptable for a forward credential).
 
     NEVER raises — a recovery blip must not break the read / connect response.
     """
     cfg = status_row.config or {}
+    scope = cfg.get("import_scope")
     if (
         status_row.status != "active"
-        or cfg.get("import_scope") != "history"
         or status_row.last_polled_at is not None
+        or scope not in ("history", "forward")
     ):
         return
     try:
+        if scope == "forward":
+            # Re-anchor a forward credential whose connect-time anchor failed.
+            # Mirrors scheduler.recover_uninitialized_credential (cron backstop).
+            pool = await get_asyncpg_pool()
+            await anchor_credential_watermark(
+                pool=pool,
+                credential_id=status_row.id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                ts=datetime.now(timezone.utc),
+                caller_module=_CALLER_MODULE,
+            )
+            return
         latest = await latest_import_run(
             credential_id=status_row.id, tenant_id=tenant_id, user_id=user_id
         )
@@ -561,7 +578,8 @@ async def _recover_history_import(
             )
     except Exception:  # noqa: BLE001 — recovery must not break the surface
         logger.exception(
-            "granola: history-import recovery (non-fatal) failed for credential %s",
+            "granola: uninitialized-credential recovery (non-fatal) failed for "
+            "credential %s",
             status_row.id,
         )
 
@@ -643,7 +661,7 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
     Active-row reconfigure keeps B2 behavior (update ``config.folders`` in
     place; no new import / re-anchor — newly-added-folder backfill is the #21a
     fast-follow). The reconfigure path doubles as a /connect-retry recovery
-    surface (C8) via :func:`_recover_history_import`.
+    surface (C8) via :func:`_recover_uninitialized_credential`.
     """
     # C4: capture the forward-anchor timestamp at ROUTE ENTRY, BEFORE any awaits,
     # so a meeting created during the connect round-trip isn't skipped by the
@@ -776,7 +794,7 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
             # recovery surface (C8): if a prior /connect crashed after creating
             # the credential but before creating/dispatching its import, recover
             # it here. Then report the connection + its current import block.
-            await _recover_history_import(
+            await _recover_uninitialized_credential(
                 status_row=existing, tenant_id=tenant_id, user_id=user_id
             )
             import_block = await _build_import_block(
@@ -943,7 +961,7 @@ async def granola_status(request: Request) -> dict:
     # lock-busy strand) while the connect screen is open — the instant half of
     # the founder-approved "both surfaces" recovery (the 5-min cron is the
     # headless backstop). Self-gates + best-effort (never raises).
-    await _recover_history_import(
+    await _recover_uninitialized_credential(
         status_row=status_row, tenant_id=tenant_id, user_id=user_id
     )
 

@@ -65,6 +65,8 @@ from services.granola_ingestion.scheduler import (
     import_recovery_workflow_id,
     list_active_credentials,
     list_recoverable_import_runs,
+    list_uninitialized_credentials,
+    recover_uninitialized_credential,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +195,9 @@ async def granola_cron_tick(
     # poll dispatch above or 5xx the tick — swallow + log; next tick retries.
     imports_recovered = 0
     try:
+        # Pass 1: a stale 'queued' run whose run_import_step returned lock_busy →
+        # re-dispatch with a window-stamped id (the deterministic id already
+        # completed, so DBOS would dedup it to a no-op).
         for run in await list_recoverable_import_runs():
             recovery_id = import_recovery_workflow_id(
                 run.credential_id, run.import_run_id, cycle_window
@@ -207,17 +212,40 @@ async def granola_cron_tick(
             imports_recovered += 1
     except Exception:  # noqa: BLE001 — recovery must not break the poll tick
         logger.exception(
-            "granola cron tick: import-recovery pass failed (non-fatal); "
-            "the next 5-min tick retries"
+            "granola cron tick: stale-queued import-recovery pass failed "
+            "(non-fatal); the next 5-min tick retries"
+        )
+
+    creds_recovered = 0
+    try:
+        # Pass 2 (Codex P1): an ACTIVE credential stuck uninitialized (NULL
+        # watermark) with NO live import — a history import that was never
+        # created/dispatched (crash / swallowed get_or_create failure), or a
+        # forward credential whose anchor failed. list_recoverable_import_runs
+        # CANNOT see these (no row), and the A1 poll-defer guard skips them
+        # forever, so the cron is the only headless way to re-initialize them.
+        for cred in await list_uninitialized_credentials():
+            await recover_uninitialized_credential(
+                credential_id=cred.credential_id,
+                tenant_id=cred.tenant_id,
+                user_id=cred.user_id,
+                import_scope=cred.import_scope,
+            )
+            creds_recovered += 1
+    except Exception:  # noqa: BLE001 — recovery must not break the poll tick
+        logger.exception(
+            "granola cron tick: uninitialized-credential recovery pass failed "
+            "(non-fatal); the next 5-min tick retries"
         )
 
     logger.info(
-        "granola cron tick: enqueued=%d imports_recovered=%d cycle_window=%d "
-        "active_credentials=%d",
-        enqueued, imports_recovered, cycle_window, len(credentials),
+        "granola cron tick: enqueued=%d imports_recovered=%d creds_recovered=%d "
+        "cycle_window=%d active_credentials=%d",
+        enqueued, imports_recovered, creds_recovered, cycle_window, len(credentials),
     )
     return {
         "enqueued": enqueued,
         "imports_recovered": imports_recovered,
+        "creds_recovered": creds_recovered,
         "cycle_window": cycle_window,
     }

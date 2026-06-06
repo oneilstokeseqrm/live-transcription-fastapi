@@ -1170,12 +1170,12 @@ def test_status_surfaces_persisted_per_folder_status(client):
 
 
 # ---------------------------------------------------------------------------
-# _recover_history_import (C8 enqueue-atomicity + A2 lock-busy strand recovery)
+# _recover_uninitialized_credential (C8 enqueue-atomicity + A2 lock-busy strand recovery)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_recover_history_import_creates_and_dispatches_when_no_run():
+async def test_recover_uninitialized_credential_creates_and_dispatches_when_no_run():
     """C8: active history cred + NULL watermark + NO import run (crash before
     create/dispatch) → create + dispatch under the DETERMINISTIC id."""
     status_row = _cred_status(
@@ -1190,7 +1190,7 @@ async def test_recover_history_import_creates_and_dispatches_when_no_run():
     with patch.object(granola, "latest_import_run", latest), \
          patch.object(granola, "get_or_create_active_import_run", get_or_create), \
          patch.object(granola, "enqueue_import_workflow", enqueue):
-        await granola._recover_history_import(
+        await granola._recover_uninitialized_credential(
             status_row=status_row, tenant_id=uuid4(), user_id=uuid4()
         )
     get_or_create.assert_awaited_once()
@@ -1199,7 +1199,7 @@ async def test_recover_history_import_creates_and_dispatches_when_no_run():
 
 
 @pytest.mark.asyncio
-async def test_recover_history_import_redispatches_stale_queued_run():
+async def test_recover_uninitialized_credential_redispatches_stale_queued_run():
     """A2: a STALE queued run (lock-busy strand) → re-dispatch with a
     window-stamped recovery id (NOT the deterministic id, which DBOS-dedups)."""
     from datetime import timedelta
@@ -1217,7 +1217,7 @@ async def test_recover_history_import_redispatches_stale_queued_run():
     with patch.object(granola, "latest_import_run", latest), \
          patch.object(granola, "get_or_create_active_import_run", get_or_create), \
          patch.object(granola, "enqueue_import_workflow", enqueue):
-        await granola._recover_history_import(
+        await granola._recover_uninitialized_credential(
             status_row=status_row, tenant_id=uuid4(), user_id=uuid4()
         )
     get_or_create.assert_not_awaited()  # run exists; don't create a second
@@ -1228,7 +1228,7 @@ async def test_recover_history_import_redispatches_stale_queued_run():
 
 
 @pytest.mark.asyncio
-async def test_recover_history_import_noop_for_fresh_queued_run():
+async def test_recover_uninitialized_credential_noop_for_fresh_queued_run():
     """A queued run that's not yet stale (just dispatched) → no re-dispatch."""
     run_id = uuid4()
     status_row = _cred_status(
@@ -1242,7 +1242,7 @@ async def test_recover_history_import_noop_for_fresh_queued_run():
     with patch.object(granola, "latest_import_run", latest), \
          patch.object(granola, "get_or_create_active_import_run", get_or_create), \
          patch.object(granola, "enqueue_import_workflow", enqueue):
-        await granola._recover_history_import(
+        await granola._recover_uninitialized_credential(
             status_row=status_row, tenant_id=uuid4(), user_id=uuid4()
         )
     enqueue.assert_not_awaited()
@@ -1250,7 +1250,7 @@ async def test_recover_history_import_noop_for_fresh_queued_run():
 
 
 @pytest.mark.asyncio
-async def test_recover_history_import_noop_for_running_run():
+async def test_recover_uninitialized_credential_noop_for_running_run():
     """A running import is healthy → recovery takes no action."""
     status_row = _cred_status(
         status="active", config={"import_scope": "history"}, last_polled_at=None
@@ -1262,7 +1262,7 @@ async def test_recover_history_import_noop_for_running_run():
     with patch.object(granola, "latest_import_run", latest), \
          patch.object(granola, "get_or_create_active_import_run", AsyncMock()), \
          patch.object(granola, "enqueue_import_workflow", enqueue):
-        await granola._recover_history_import(
+        await granola._recover_uninitialized_credential(
             status_row=status_row, tenant_id=uuid4(), user_id=uuid4()
         )
     enqueue.assert_not_awaited()
@@ -1273,32 +1273,59 @@ async def test_recover_history_import_noop_for_running_run():
     "status,config,uninitialized",
     [
         ("revoked", {"import_scope": "history"}, True),    # not active
-        ("active", {"import_scope": "forward"}, True),     # forward, not history
         ("active", {"folder_id": "fol_x"}, True),          # legacy, no import_scope
         ("active", {"import_scope": "history"}, False),    # watermark already set
     ],
 )
-async def test_recover_history_import_self_gates(status, config, uninitialized):
-    """Recovery fires ONLY for active + history + NULL watermark; otherwise it
-    returns before even querying latest_import_run."""
+async def test_recover_uninitialized_credential_self_gates(status, config, uninitialized):
+    """Recovery fires ONLY for active + (history|forward) + NULL watermark;
+    otherwise it returns before doing any work (no query, no anchor, no
+    dispatch). (forward+NULL is a recover case, not a self-gate — tested
+    separately.)"""
     kwargs = {"status": status, "config": config}
     if uninitialized:
         kwargs["last_polled_at"] = None
     status_row = _cred_status(**kwargs)
     latest = AsyncMock(return_value=None)
     enqueue = AsyncMock()
+    anchor = AsyncMock()
     with patch.object(granola, "latest_import_run", latest), \
          patch.object(granola, "get_or_create_active_import_run", AsyncMock()), \
-         patch.object(granola, "enqueue_import_workflow", enqueue):
-        await granola._recover_history_import(
+         patch.object(granola, "enqueue_import_workflow", enqueue), \
+         patch.object(granola, "anchor_credential_watermark", anchor):
+        await granola._recover_uninitialized_credential(
             status_row=status_row, tenant_id=uuid4(), user_id=uuid4()
         )
     enqueue.assert_not_awaited()
-    latest.assert_not_awaited()  # self-gate returns before the query
+    anchor.assert_not_awaited()
+    latest.assert_not_awaited()  # self-gate returns before any query/work
 
 
 @pytest.mark.asyncio
-async def test_recover_history_import_swallows_exceptions():
+async def test_recover_uninitialized_credential_forward_reanchors():
+    """Codex P1: forward credential stuck with a NULL watermark (the connect-time
+    anchor failed) → re-anchor with NOW() on the instant /status surface."""
+    status_row = _cred_status(
+        status="active", config={"import_scope": "forward", "folders": [{"id": "fol_a"}]},
+        last_polled_at=None,
+    )
+    pool = _FakePool()
+    anchor = AsyncMock()
+    enqueue = AsyncMock()
+    with patch.object(granola, "get_asyncpg_pool", AsyncMock(return_value=pool)), \
+         patch.object(granola, "anchor_credential_watermark", anchor), \
+         patch.object(granola, "enqueue_import_workflow", enqueue):
+        await granola._recover_uninitialized_credential(
+            status_row=status_row, tenant_id=uuid4(), user_id=uuid4()
+        )
+    anchor.assert_awaited_once()
+    assert anchor.await_args.kwargs["credential_id"] == status_row.id
+    assert anchor.await_args.kwargs["ts"] is not None
+    enqueue.assert_not_awaited()  # forward never dispatches an import
+
+
+@pytest.mark.asyncio
+async def test_recover_uninitialized_credential_swallows_exceptions():
     """Best-effort: a failure must NOT raise — it backs /status + /connect, which
     must not break if recovery hiccups."""
     status_row = _cred_status(
@@ -1306,7 +1333,7 @@ async def test_recover_history_import_swallows_exceptions():
     )
     latest = AsyncMock(side_effect=RuntimeError("db blip"))
     with patch.object(granola, "latest_import_run", latest):
-        await granola._recover_history_import(  # must not raise
+        await granola._recover_uninitialized_credential(  # must not raise
             status_row=status_row, tenant_id=uuid4(), user_id=uuid4()
         )
 

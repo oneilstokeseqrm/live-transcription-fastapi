@@ -66,6 +66,7 @@ _SET_TOTAL_SQL = """
 UPDATE public.granola_import_runs
 SET total = $4, updated_at = NOW()
 WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+  AND state IN ('queued', 'running')
 """
 
 # Terminal transitions only fire from an active state, so a double-call (e.g. a
@@ -148,12 +149,21 @@ async def get_or_create_active_import_run(
         return existing, False
 
 
-async def mark_running(*, import_run_id: UUID, tenant_id: UUID, user_id: UUID) -> None:
-    """Transition queued -> running and anchor ``started_at`` (idempotent — a
-    replay keeps the original ``started_at`` via COALESCE)."""
+async def mark_running(*, import_run_id: UUID, tenant_id: UUID, user_id: UUID) -> bool:
+    """Transition queued/running -> running and anchor ``started_at`` (idempotent
+    — a replay keeps the original ``started_at`` via COALESCE).
+
+    Returns ``True`` iff a row was actually claimed (state was queued/running).
+    Returns ``False`` when the UPDATE matched 0 rows — the run is already TERMINAL
+    (complete/failed/cancelled) or gone. A recovery re-dispatch (A2) can race the
+    original workflow: if the original finished first, the recovery's mark_running
+    matches nothing, and the caller MUST bail rather than run a redundant backfill
+    on a terminal run (Codex P1)."""
     pool = await get_asyncpg_pool()
     async with pool.acquire() as conn:
-        await conn.execute(_MARK_RUNNING_SQL, import_run_id, tenant_id, user_id)
+        result = await conn.execute(_MARK_RUNNING_SQL, import_run_id, tenant_id, user_id)
+    # asyncpg returns the command tag, e.g. "UPDATE 1" / "UPDATE 0".
+    return not result.strip().endswith(" 0")
 
 
 async def set_import_total(
