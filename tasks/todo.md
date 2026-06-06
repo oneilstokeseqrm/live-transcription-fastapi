@@ -30,22 +30,24 @@
 
 ## PR 2 — backend EQ-92 (live-transcription-fastapi), feature branch `phase-3/granola-be-b3`
 > **Codex consult done (2026-06-06) — corrections folded into `tasks/b3-implementation-design.md` §POST-CONSULT (A1-A7).** Key: A1 poll skips uninitialized creds (`import_scope=history/forward AND last_polled_at NULL`); A2 try-lock + lock_busy + cron recovery (new wf id); A3 expose `cycle_aborted` on CycleResult + check credential_error_code; A4 SPLIT reconfigure-backfill out (→ backlog #21a); A5 derived progress exact-for-fresh-import only (#21b items-table fast-follow); A7 pool max 10→20 env-overridable, per-loop ownership → EQ-109. Pool concern ticketed EQ-109 (founder: ticket+proceed).
-TDD throughout (AsyncMock, no Docker). Tests: `tests/unit/granola_ingestion/test_import_runs.py`, `test_scheduler.py`, `tests/unit/test_granola_admin.py`.
-- [ ] **`services/granola_ingestion/import_runs.py`** (NEW): `create_import_run`, `mark_running`, `set_import_total`, `complete/fail/cancel_import_run`, `read_import_progress(id)` — progress **DERIVED** (C1) via COUNT/GROUP-BY over `external_integration_runs` scoped `(tenant_id,user_id,provider='granola')` + `created_at >= started_at`. Status→bucket map (from `outcomes.py`): success→done, deferred_pending_account→deferred, skipped_*→skipped, failed/failed_permanent→errors. NO mutable counter. All tenant+user scoped. Add module to vault `ALLOWLIST` (or route reads through scheduler).
-- [ ] **`scheduler.py`**: add `GRANOLA_IMPORT_QUEUE = Queue("granola-import", concurrency=2)` (C3 — NOT the poll queue) + `granola_import_one_credential` (@DBOS.workflow) + `run_import_step` (@DBOS.step) mirroring poll. Lock-busy (C2): block-with-retry / requeue, stay `queued` (don't strand). On `_CredentialDeactivated`/inactive mid-import → `cancel_import_run` (C9). **VERIFY pool invariant** (`asyncpg_pool.py:72-86`): max_size ≥ 2×(poll+import concurrency)=2×7=14 vs current 10 → bump max_size if required.
-- [ ] **`adapter.py`**: thread optional `import_run_id` into `run_one_cycle`; set `total` after first listing (`set_import_total`); progress stays DERIVED (no counters).
-- [ ] **`routers/granola.py`**:
-  - LIFT the `mode="all"` 400 guard (635–642).
-  - Capture `forward_anchor_at = datetime.now(UTC)` at ROUTE ENTRY (C4), before any awaits.
-  - Rewrite `/connect` post-store branch on `import_scope`: `history` → leave `last_polled_at` NULL, `create_import_run`, enqueue on GRANOLA_IMPORT_QUEUE with `SetWorkflowID(f"granola_import_{credential_id}_{import_run_id}")`, return `{import:{...}}` ACK; `forward` → `anchor_credential_watermark(last_polled_at=forward_anchor_at)`, NO import, return `{import:null}`. Delete the synchronous `_save_and_test_locked` call (814–824).
-  - Enqueue atomicity (C8): `/connect` retry + `/status` recover "active history cred, NULL watermark, no running/complete import" → create+enqueue.
-  - Active-row reconfigure (B3 Step 5b / C17): on add-folder, `history`→backfill only NEW folders; `forward`→backfill new folders from now() WITHOUT moving global `last_polled_at`.
-  - `/status`: add `import` block (C18) — latest import_run + derived progress; `state ∈ {queued,running,complete,failed,cancelled}`; indeterminate until `total` known (C14); omit block when no import_run (forward / pre-B3 rows).
-- [ ] **`services/vault/user_credentials.py`**: NEW `anchor_credential_watermark(credential_id, ts)` — writes `last_polled_at = ts` (NOT a new column), mirrors `update_credential_config` (advisory-lock-gated, 3-field WHERE, status='active' AND archived_at IS NULL guard, same-txn audit). Forward path only; runs at connect under the lock before any cycle.
-- [ ] `scripts/verify_consumer_contracts.py` → 0 drift (envelope UNCHANGED — LOCKED-38). `/codex review` 4-round cap → founder merge → Railway deploy → `/health` 200.
+TDD throughout (AsyncMock, no Docker). Tests: `tests/unit/granola_ingestion/test_import_runs.py`, `test_scheduler.py`, `tests/unit/test_granola_admin.py`, `tests/unit/test_granola_cron.py`, `tests/unit/vault/test_user_credentials.py`, `tests/unit/test_asyncpg_pool.py`.
+- [x] **`services/granola_ingestion/import_runs.py`** (NEW): `get_or_create_active_import_run`, `mark_running`, `set_import_total`, `complete/fail/cancel_import_run`, `read_import_progress`, `latest_import_run` — DERIVED progress (C1). Shipped in the prior session (`4e4346d`, 11 tests).
+- [x] **`services/asyncpg_pool.py`** (A7) — `0410a53`: `_DEFAULT_MAX_SIZE` 10→20, env-overridable `GRANOLA_DB_POOL_MAX_SIZE` clamped up to the invariant floor `2×(poll5+import2)=14`; docstring re-derived.
+- [x] **`services/vault/user_credentials.py`** (A6) — `d4c1615`: NEW `anchor_credential_watermark(*, pool, credential_id, tenant_id, user_id, ts, caller_module, trace_id)` mirrors `update_credential_config` (advisory-lock-gated, 3-field WHERE + status='active' AND archived_at IS NULL, same-txn audit, NOT_FOUND on null). Exported from `services/vault/__init__.py`.
+- [x] **`adapter.py`** (A3/A5) — `7afb0b0`: `cycle_aborted` on `CycleResult` set on every edge-#12 deactivation path + threaded into the result; optional `import_run_id` → `set_import_total(len(deduped notes))` after first listing; progress stays DERIVED. (Also fixed the `_credential_is_active` docstring stale-ref in `4b1e4e7`.)
+- [x] **`scheduler.py`** (A1/A2) — `5866173`: `GRANOLA_IMPORT_QUEUE` (concurrency=2, C3); `granola_import_one_credential` workflow + `run_import_step` (try-lock; lock-busy leaves queued → `state='lock_busy'`; cancel/fail/complete via cycle_aborted+credential_error_code A3; raise→fail+re-raise); POLL-DEFERS A1 guard in `run_cycle_step`; `enqueue_import_workflow` + deterministic/window-stamped id helpers + `list_recoverable_import_runs` (A2 backstop).
+- [x] **`routers/granola_cron.py`** (A2 backstop) — `1ce1da1`: cron tick re-dispatches stale queued imports (window-stamped id); non-fatal; returns `imports_recovered`.
+- [x] **`routers/granola.py`** (C4/C8/C18) — `4b1e4e7`: `/connect` async restructure (forward_anchor_at at route entry C4; mode="all" guard LIFTED; branch on import_scope → history dispatch + ACK / forward anchor + import:null; deleted `_save_and_test_locked`; reconfigure keeps B2 behavior per A4 + doubles as /connect-retry C8 recovery); `/status` import block (C18) + import_scope + C8/A2 best-effort recovery (window-stamped to dedup with cron).
+- [x] DO NOT BUILD (split fast-follows): #21a reconfigure-backfill (active-row reconfigure keeps B2 behavior), #21b exact re-import progress items-table.
+- [x] `scripts/verify_consumer_contracts.py` → **0 drift** (envelope UNCHANGED — LOCKED-38). Full unit suite **578 passed / 0 new failures** (1 pre-existing `account_provisioning` failure, identical on `main`). **0 Pyright errors** on all changed source.
+- [ ] `/codex review` 4-round cap → fold P0/P1 → **founder authorizes merge** → Railway deploy → `/health` 200 → prod E2E → EQ-94 (FE).
 
 ## Session end
 - [ ] Update Linear EQ-92 + audit handoff docs (repo + Linear + memory) for mutual consistency; grep for stale signatures.
 
 ## Review (filled after implementation)
-_(pending)_
+All 5 remaining PR-2 components built TDD-first (AsyncMock, no Docker) on `phase-3/granola-be-b3`, 6 commits
+(`0410a53` A7 → `d4c1615` A6 → `7afb0b0` A3/A5 → `5866173` A1/A2 → `1ce1da1` A2-cron → `4b1e4e7` C4/C8/C18).
+Founder decision this session: lock-busy recovery on **both surfaces** (cron backstop + /status), per binding A2.
+Pre-Codex adversarial multi-agent review run over the diff (6 dimensions → verify). Codex pre-merge gate is the
+next step; merge is founder-authorized.
