@@ -632,6 +632,26 @@ async def run_import_step(
                     reason="credential_not_active",
                 )
 
+            # Codex round-3 P1: the credential id is reused across reconnects. A
+            # stale history import re-dispatched against a credential that was
+            # since reconnected as FORWARD must NOT backfill (the user chose "from
+            # now on"). An import is only ever valid for a history credential —
+            # if the current scope is forward, this run is stale; cancel + bail.
+            if (credential.config or {}).get("import_scope") == "forward":
+                logger.info(
+                    "run_import_step: credential_id=%s is now forward-scope; "
+                    "cancelling stale import_run=%s (no backfill for forward)",
+                    credential_id, import_run_id,
+                )
+                await cancel_import_run(
+                    import_run_id=import_run_id, tenant_id=tenant_id, user_id=user_id
+                )
+                return ImportResult(
+                    state="cancelled",
+                    import_run_id=import_run_id,
+                    reason="credential_now_forward",
+                )
+
             claimed = await mark_running(
                 import_run_id=import_run_id, tenant_id=tenant_id, user_id=user_id
             )

@@ -53,6 +53,7 @@ from services.asyncpg_pool import get_asyncpg_pool
 from services.granola_ingestion.api_client import GranolaAPIClient
 from services.granola_ingestion.errors import GranolaError, GranolaErrorCode
 from services.granola_ingestion.import_runs import (
+    cancel_active_import_runs,
     get_or_create_active_import_run,
     latest_import_run,
     read_import_progress,
@@ -848,6 +849,15 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                         ),
                     )
                 raise _http_from_vault_error(react_exc)
+            # Reactivate reuses the credential id, so import runs from the PRIOR
+            # lifecycle can linger (Codex round-3 P1). Cancel any still-active
+            # ones so the reconnect starts clean: a forward reconnect won't let a
+            # stale history import backfill, and a history reconnect's
+            # get_or_create makes a FRESH run instead of colliding with the old
+            # one on the partial-unique. Under the advisory lock held above.
+            await cancel_active_import_runs(
+                credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
+            )
 
     # B3: the credential is durable + active (new INSERT or reactivated archived
     # row). Branch on import_scope (D6): history → create + dispatch the
@@ -987,10 +997,18 @@ async def granola_status(request: Request) -> dict:
         if folders_cfg
         else None
     )
-    # C18: the import block (latest run + DERIVED progress). Omitted when the
-    # credential never had an import (forward + pre-B3 legacy rows).
-    import_block = await _build_import_block(
-        credential_id=status_row.id, tenant_id=tenant_id, user_id=user_id
+    # C18: the import block (latest run + DERIVED progress). Only for a HISTORY
+    # connection — forward + pre-B3 legacy rows have no import. Gating on the
+    # CURRENT scope (not just "a run exists") also stops a stale import block
+    # from a PRIOR history lifecycle leaking onto a forward reconnect, where the
+    # credential id is reused and old granola_import_runs rows remain (Codex
+    # round-3 P2).
+    import_block = (
+        await _build_import_block(
+            credential_id=status_row.id, tenant_id=tenant_id, user_id=user_id
+        )
+        if cfg.get("import_scope") == "history"
+        else None
     )
     resp = {
         "connected": True,

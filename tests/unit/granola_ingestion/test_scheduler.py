@@ -881,6 +881,36 @@ async def test_run_import_step_completes_on_clean_cycle():
 
 
 @pytest.mark.asyncio
+async def test_run_import_step_cancels_stale_import_on_forward_credential():
+    """Codex round-3 P1: the credential id is reused across reconnects. A stale
+    history import re-dispatched against a credential now reconnected as FORWARD
+    must NOT backfill — cancel + bail (no run_one_cycle), honoring the user's
+    'from now on' choice."""
+    cred = _FakeCredential(
+        id=uuid4(), tenant_id=uuid4(), user_id=uuid4(), status="active",
+        config={"import_scope": "forward", "folders": [{"id": "fol_a"}]},
+    )
+    conn = _FakeConn(fetchval_returns=True)
+    pool = _FakePool(conn)
+    m = _import_step_patches(credential=cred, cycle_result=_fake_cycle_result())
+    with patch.object(scheduler, "get_asyncpg_pool", new=AsyncMock(return_value=pool)), \
+         patch.object(scheduler, "get_granola_credential_for_user", new=m["get_cred"]), \
+         patch.object(scheduler, "run_one_cycle", new=m["run_one_cycle"]), \
+         patch.object(scheduler, "mark_running", new=m["mark_running"]), \
+         patch.object(scheduler, "complete_import_run", new=m["complete"]), \
+         patch.object(scheduler, "fail_import_run", new=m["fail"]), \
+         patch.object(scheduler, "cancel_import_run", new=m["cancel"]):
+        result = await scheduler.run_import_step(
+            credential_id=cred.id, tenant_id=cred.tenant_id, user_id=cred.user_id, import_run_id=uuid4(),
+        )
+    assert result.state == "cancelled"
+    assert result.reason == "credential_now_forward"
+    m["cancel"].assert_awaited_once()
+    m["mark_running"].assert_not_called()      # never claims/starts the run
+    m["run_one_cycle"].assert_not_called()     # NO backfill against the forward cred
+
+
+@pytest.mark.asyncio
 async def test_run_import_step_cancels_on_cycle_aborted():
     """A3: run_one_cycle signals cycle_aborted (credential disconnected
     mid-import) → cancel, not complete."""

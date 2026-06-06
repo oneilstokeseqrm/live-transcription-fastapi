@@ -418,12 +418,14 @@ def test_connect_reconnect_after_disconnect_uses_reactivate(client):
     reactivate = AsyncMock(return_value=cred_id)
     get_or_create = AsyncMock(return_value=(run_id, True))
     enqueue = AsyncMock()
+    cancel_active = AsyncMock()
 
     auth, pool = _patch_auth_and_pool()  # default pool: advisory lock free
     with auth, pool, \
          patch.object(granola, "store_credential", store), \
          patch.object(granola, "get_credential_status", get_status), \
          patch.object(granola, "reactivate_credential", reactivate), \
+         patch.object(granola, "cancel_active_import_runs", cancel_active), \
          patch.object(granola, "get_or_create_active_import_run", get_or_create), \
          patch.object(granola, "enqueue_import_workflow", enqueue):
         resp = client.post(
@@ -438,6 +440,9 @@ def test_connect_reconnect_after_disconnect_uses_reactivate(client):
     reactivate.assert_awaited_once()
     # reactivate is an UPDATE path, not a second INSERT
     assert reactivate.await_args.kwargs["new_api_key"] == "grn_new"
+    # prior-lifecycle import runs cancelled so the reconnect starts clean (round-3 P1)
+    cancel_active.assert_awaited_once()
+    assert cancel_active.await_args.kwargs["credential_id"] == cred_id
     enqueue.assert_awaited_once()
 
 
@@ -894,6 +899,33 @@ def test_status_includes_import_block_for_history(client):
     assert body["import"]["deferred"] == 4
     assert body["import"]["skipped"] == 9
     assert body["import"]["started_at"] == started.isoformat()
+
+
+def test_status_forward_omits_import_block_even_if_stale_run_exists(client):
+    """Codex round-3 P2: a forward reconnect of a once-history credential keeps
+    old granola_import_runs rows (the id is reused). /status must OMIT the import
+    block for the current FORWARD scope, not surface the stale prior import."""
+    status_row = _cred_status(
+        status="active",
+        config={"import_scope": "forward", "mode": "folders", "folders": [{"id": "fol_a", "name": "A"}]},
+    )
+    pool = _FakePool(_FakeConn(fetch_returns=[]))
+    get_status = AsyncMock(return_value=status_row)
+    # a stale prior-lifecycle run EXISTS, but it must NOT surface for forward
+    latest = AsyncMock(return_value={
+        "id": uuid4(), "state": "complete", "total": 9,
+        "started_at": None, "finished_at": None, "created_at": None,
+    })
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "latest_import_run", latest):
+        resp = client.get(f"{_BASE}/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["import_scope"] == "forward"
+    assert "import" not in body          # gated on history scope
+    latest.assert_not_awaited()          # forward → import block not even built
 
 
 def test_status_omits_import_block_when_no_import_run(client):

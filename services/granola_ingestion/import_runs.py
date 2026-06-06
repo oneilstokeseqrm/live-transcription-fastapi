@@ -214,6 +214,34 @@ async def cancel_import_run(
         )
 
 
+_CANCEL_ACTIVE_RUNS_SQL = """
+UPDATE public.granola_import_runs
+SET state = 'cancelled', finished_at = NOW(), updated_at = NOW()
+WHERE credential_id = $1 AND tenant_id = $2 AND user_id = $3
+  AND state IN ('queued', 'running')
+"""
+
+
+async def cancel_active_import_runs(
+    *, credential_id: UUID, tenant_id: UUID, user_id: UUID
+) -> None:
+    """Cancel ALL active (queued/running) import runs for a credential.
+
+    Called on the /connect RECONNECT path (Codex round-3 P1): the credential id
+    is reused across disconnect→reconnect, so a queued/running import from a
+    PRIOR lifecycle can linger. Without this, a forward reconnect could let a
+    stale history import backfill against the user's forward choice, and a
+    history reconnect would collide with the partial-unique and reuse the stale
+    run. Cancelling them lets the new lifecycle start clean (a fresh import for
+    history; none for forward). The per-credential advisory lock the reconnect
+    holds keeps this from racing a live cycle."""
+    pool = await get_asyncpg_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            _CANCEL_ACTIVE_RUNS_SQL, credential_id, tenant_id, user_id
+        )
+
+
 def _bucket_counts(rows: list) -> dict[str, int]:
     done = deferred = skipped = errors = 0
     for row in rows:

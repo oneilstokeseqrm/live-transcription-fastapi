@@ -215,6 +215,25 @@ async def test_terminal_transitions(fn, terminal):
     assert args[0] == RUN and TENANT in args and USER in args
 
 
+@pytest.mark.asyncio
+async def test_cancel_active_import_runs_cancels_queued_and_running():
+    """Codex round-3 P1: the reconnect path cancels ALL active runs for a
+    credential (the id is reused across lifecycles) so the new lifecycle starts
+    clean. Tenant + user scoped; only queued/running rows."""
+    conn = _RoutingConn()
+    with _patch_pool(conn):
+        await import_runs.cancel_active_import_runs(
+            credential_id=CRED, tenant_id=TENANT, user_id=USER
+        )
+    sql, args = _sql_calls(conn, "execute")[0]
+    low = sql.lower()
+    assert "state = 'cancelled'" in low
+    assert "credential_id = $1" in low
+    assert "tenant_id = $2" in low and "user_id = $3" in low
+    assert "state in ('queued', 'running')" in low
+    assert args == (CRED, TENANT, USER)
+
+
 # ---------------------------------------------------------------------------
 # read_import_progress — DERIVED (C1), status->bucket mapping
 # ---------------------------------------------------------------------------
