@@ -1049,6 +1049,10 @@ async def test_run_one_cycle_skips_inactive_credential():
     )
 
     assert result.credential_skipped is True
+    # Entry status-check skip is distinct from a mid-import deactivation: the
+    # import wrapper treats credential_skipped as cancel too, but cycle_aborted
+    # stays False here (A3 lists the _credential_is_active paths, not this one).
+    assert result.cycle_aborted is False
     client.list_notes.assert_not_called()
     # No SQL writes for an inactive credential cycle
     assert conn.execute_calls == []
@@ -1589,6 +1593,7 @@ async def test_run_one_cycle_aborts_remaining_notes_when_disconnected_after_a_no
     assert process_mock.await_count == 1            # only note1 published
     assert result.notes_processed == 1
     assert client.get_note_detail.await_count == 1  # note2 never fetched
+    assert result.cycle_aborted is True             # A3: surfaced for the import wrapper
 
 
 @pytest.mark.asyncio
@@ -1638,6 +1643,7 @@ async def test_run_one_cycle_does_not_publish_when_disconnected_during_a_note():
     assert process_mock.await_count == 0           # publish never fired
     assert result.notes_processed == 0
     assert text_clean_service.get_lane2_in_flight() == 0  # reserved slot released
+    assert result.cycle_aborted is True            # A3: mid-note _CredentialDeactivated
 
 
 @pytest.mark.asyncio
@@ -1666,6 +1672,7 @@ async def test_run_one_cycle_skips_granola_api_when_disconnected_before_listing(
         )
 
     assert result.credential_skipped is True
+    assert result.cycle_aborted is True            # A3: pre-list deactivation aborts the import
     client.list_notes.assert_not_called()
     process_mock.assert_not_called()
 
@@ -1925,7 +1932,7 @@ async def test_run_one_cycle_skips_success_bookkeeping_on_mid_cycle_deactivation
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
-        await adapter.run_one_cycle(
+        result = await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
             pool=pool,  # type: ignore[arg-type]
             api_client=client,
@@ -1938,6 +1945,7 @@ async def test_run_one_cycle_skips_success_bookkeeping_on_mid_cycle_deactivation
         if "last_polled_at = $4" in c[0] and "consecutive_failures = 0" in c[0]
     ]
     assert success_marks == []
+    assert result.cycle_aborted is True            # A3: mid-cycle deactivation
 
 
 @pytest.mark.asyncio
@@ -1982,7 +1990,7 @@ async def test_run_one_cycle_skips_success_bookkeeping_when_deactivated_during_r
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock()):
-        await adapter.run_one_cycle(
+        result = await adapter.run_one_cycle(
             credential=credential,  # type: ignore[arg-type]
             pool=pool,  # type: ignore[arg-type]
             api_client=client,
@@ -1993,6 +2001,7 @@ async def test_run_one_cycle_skips_success_bookkeeping_when_deactivated_during_r
         if "last_polled_at = $4" in c[0] and "consecutive_failures = 0" in c[0]
     ]
     assert success_marks == []
+    assert result.cycle_aborted is True            # A3: deactivation during reprocess
 
 
 @pytest.mark.asyncio
@@ -2034,6 +2043,62 @@ async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
         )
 
     assert process_mock.await_count == 2
+    assert result.notes_processed == 2
+    assert result.cycle_aborted is False           # A3: clean cycle is not aborted
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_sets_import_total_after_listing_when_import_run_id_given():
+    """A5: a background import threads import_run_id into run_one_cycle. After
+    the (deduped) note list is known, the cycle records that count as the import
+    total exactly once (C14: the FE shows indeterminate progress until then).
+    Progress stays DERIVED — no per-note counter. The 5-min poll path (no
+    import_run_id) must NOT touch import_runs (verified for free by every other
+    run_one_cycle test, which never patches set_import_total)."""
+    credential = _build_credential()
+    import_run_id = uuid4()
+    note1 = _make_note_summary("not_imp_1")
+    note2 = _make_note_summary("not_imp_2")
+    detail1 = _make_note_detail(note_id="not_imp_1", attendees=[Attendee(email="bob@bigco.com")])
+    detail2 = _make_note_detail(note_id="not_imp_2", attendees=[Attendee(email="carol@bigco.com")])
+
+    conn = _FakeConn(fetchrow_returns=None, fetch_returns=[])
+    pool = _FakePool(conn)
+
+    client = MagicMock(spec=GranolaAPIClient)
+    client.list_notes = AsyncMock(return_value=[note1, note2])
+    client.get_note_detail = AsyncMock(side_effect=[detail1, detail2])
+    client.aclose = AsyncMock()
+
+    process_mock = AsyncMock(return_value=text_clean_service.ProcessResult(
+        interaction_id="00000000-0000-4000-8000-00000000af01",
+        lane1_published=True, lane2_dispatched=True))
+
+    sess_cm = MagicMock()
+    sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+    sess_cm.__aexit__ = AsyncMock(return_value=None)
+
+    set_total_mock = AsyncMock()
+    with patch.object(adapter, "_credential_is_active", new=AsyncMock(return_value=True)), \
+         patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
+         patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
+         patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
+         patch.object(adapter, "set_import_total", new=set_total_mock), \
+         patch.object(text_clean_service, "process", new=process_mock):
+        result = await adapter.run_one_cycle(
+            credential=credential,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            api_client=client,
+            import_run_id=import_run_id,
+        )
+
+    set_total_mock.assert_awaited_once()
+    kw = set_total_mock.await_args.kwargs
+    assert kw["import_run_id"] == import_run_id
+    assert kw["tenant_id"] == credential.tenant_id
+    assert kw["user_id"] == credential.user_id
+    assert kw["total"] == 2                          # deduped listing size
     assert result.notes_processed == 2
 
 

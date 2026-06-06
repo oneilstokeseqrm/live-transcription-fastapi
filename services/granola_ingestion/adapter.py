@@ -65,6 +65,7 @@ from services.granola_ingestion.models import (
     GranolaNoteSummary,
     TranscriptTurn,
 )
+from services.granola_ingestion.import_runs import set_import_total
 from services.granola_ingestion.outcomes import IngestionOutcome
 from services.granola_ingestion.path2 import (
     PathTwoDecision,
@@ -147,12 +148,22 @@ class CycleResult:
     notify-user. ``deferred_reprocessed`` counts deferred rows from
     prior cycles that were re-checked this cycle (whether they
     completed, stayed deferred, or hit a per-note skip).
+
+    ``cycle_aborted`` (B3/A3) is ``True`` when the cycle stopped because the
+    credential was deactivated (disconnected / revoked-error) at ANY edge-#12
+    liveness gate — pre-list, mid-note, mid-process ``_CredentialDeactivated``,
+    or the pre-success-bookkeeping re-check (which also covers a deactivation
+    during the reprocess pass). The background-import wrapper reads it to choose
+    ``cancel_import_run`` (deactivated) vs ``fail_import_run``
+    (``credential_error_code`` set) vs ``complete_import_run`` (clean). The
+    5-min poll path ignores it.
     """
 
     notes_processed: int = 0
     credential_skipped: bool = False
     credential_error_code: Optional[str] = None
     deferred_reprocessed: int = 0
+    cycle_aborted: bool = False
     outcomes: dict[str, int] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -171,12 +182,20 @@ async def run_one_cycle(
     credential: GranolaCredential,
     pool: asyncpg.Pool,
     api_client: Optional[GranolaAPIClient] = None,
+    import_run_id: Optional[UUID] = None,
 ) -> CycleResult:
     """Drive one polling cycle for a decrypted credential.
 
     ``api_client``, when provided, is reused (caller owns its lifecycle).
     When ``None``, the cycle constructs its own ``GranolaAPIClient`` and
     closes it on exit. Tests inject a mock client this way.
+
+    ``import_run_id`` (B3/A5), when provided, marks this as the background
+    history-import for that ``granola_import_runs`` row: once the (deduped)
+    listing is known the cycle records ``set_import_total(len(notes))`` so the
+    FE switches from indeterminate to "N of M" (C14). Progress counts stay
+    DERIVED from ``external_integration_runs`` (no per-note counter). The 5-min
+    poll path passes ``None`` and never touches ``granola_import_runs``.
 
     Branch summary (full detail in :func:`process_note`):
       - Credential not active → skip the whole cycle.
@@ -245,7 +264,9 @@ async def run_one_cycle(
                 "Granola call; skipping (no API request)",
                 credential.id,
             )
-            return CycleResult(credential_skipped=True)
+            # A3: a pre-list deactivation aborts an in-flight import (the wrapper
+            # cancels the run). credential_skipped also stops the poll path.
+            return CycleResult(credential_skipped=True, cycle_aborted=True)
 
         # B2: multi-folder poll loop. Read the watched-folder LIST (legacy
         # singular folder_id as a one-release fallback). mode='all' polls
@@ -316,6 +337,20 @@ async def run_one_cycle(
                 pool=pool,
             )
             return CycleResult(credential_error_code=outcome_code, outcomes={})
+
+        # A5: for a background history-import, record the import total once the
+        # (deduped) listing is known — the FE shows indeterminate progress until
+        # this is set, then "N of M" (C14). Exact for a fresh first import (all
+        # notes listed at once with last_polled_at=NULL). Progress counts stay
+        # DERIVED from external_integration_runs; we never store a per-note
+        # tally. The 5-min poll path passes import_run_id=None and skips this.
+        if import_run_id is not None:
+            await set_import_total(
+                import_run_id=import_run_id,
+                tenant_id=credential.tenant_id,
+                user_id=credential.user_id,
+                total=len(note_summaries),
+            )
 
         # Edge #12 (Codex R6 [P2] #1): track mid-cycle deactivation so the
         # end-of-cycle reprocess + success bookkeeping is SKIPPED on abort. The
@@ -446,6 +481,10 @@ async def run_one_cycle(
                     "skipping success bookkeeping",
                     credential.id,
                 )
+                # A3: a deactivation detected at the pre-success re-check (also
+                # the path for a deactivation DURING the reprocess pass, which
+                # returns a count rather than an abort signal) aborts the import.
+                cycle_aborted = True
     finally:
         if owned_client:
             await client.aclose()
@@ -453,6 +492,7 @@ async def run_one_cycle(
     return CycleResult(
         notes_processed=notes_processed,
         deferred_reprocessed=deferred_reprocessed,
+        cycle_aborted=cycle_aborted,
         outcomes=outcomes,
     )
 
