@@ -31,6 +31,7 @@ Coverage:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1664,4 +1665,154 @@ class TestArchiveCredential:
         kw = audit_spy.await_args.kwargs
         assert kw["success"] is False
         assert kw["operation"] == "archive"
+        assert kw["credential_id"] == credential_id
+
+
+class TestAnchorCredentialWatermark:
+    """EQ-92/B3 A6: forward-scope connect anchors last_polled_at = the
+    route-entry timestamp so the first 5-min poll's created_after excludes
+    existing history (no backfill). Mirrors update_credential_config: the
+    caller holds the per-credential advisory lock, the WHERE is 3-field +
+    status='active' AND archived_at IS NULL, the success audit shares the
+    txn, and a null RETURNING raises VAULT_DB_NOT_FOUND."""
+
+    _TS = datetime(2026, 6, 6, 12, 0, 0, tzinfo=timezone.utc)
+
+    @pytest.mark.asyncio
+    async def test_caller_not_in_allowlist_raises_and_audits(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        credential_id = uuid.uuid4()
+        with pytest.raises(VaultPermissionError):
+            await user_credentials.anchor_credential_watermark(
+                pool=fake_pool,
+                credential_id=credential_id,
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                ts=self._TS,
+                caller_module=_BLOCKED_CALLER,
+            )
+        audit_spy.assert_awaited_once()
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "write"
+        assert kw["success"] is False
+        assert kw["error_code"] == VaultErrorCode.VAULT_CALLER_NOT_ALLOWED.value
+        assert kw["credential_id"] == credential_id
+        fake_pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_happy_path_writes_watermark_and_audits(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        tenant_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = {"id": credential_id}  # RETURNING id
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        result = await user_credentials.anchor_credential_watermark(
+            pool=fake_pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            ts=self._TS,
+            caller_module="routers.granola",
+            trace_id="trace-fwd",
+        )
+        assert result == credential_id
+
+        sql = conn.fetchrow.await_args.args[0]
+        assert "last_polled_at = $1" in sql
+        assert "updated_at = CURRENT_TIMESTAMP" in sql
+        # Only an ACTIVE, non-archived row is anchored; tenant isolation in WHERE.
+        assert "status = 'active'" in sql
+        assert "archived_at IS NULL" in sql
+        assert "AND tenant_id = $3" in sql
+        assert "AND user_id = $4" in sql
+        # The exact route-entry timestamp is written (C4 boundary), NOT NOW().
+        args = conn.fetchrow.await_args.args
+        assert args[1] == self._TS
+        assert args[2] == credential_id
+        assert args[3] == tenant_id
+        assert args[4] == user_id
+
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "write"
+        assert kw["success"] is True
+        assert kw["credential_id"] == credential_id
+        assert kw["trace_id"] == "trace-fwd"
+        # Same-transaction audit (no nested pool acquire).
+        assert "conn" in kw and "pool" not in kw
+
+    @pytest.mark.asyncio
+    async def test_no_active_row_raises_not_found_and_audits(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        """Row flipped revoked/error/archived between the caller's load and
+        the anchor → no active row matches → VAULT_DB_NOT_FOUND + failure
+        audit (mirrors update_credential_config)."""
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = None  # RETURNING matched nothing
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.anchor_credential_watermark(
+                pool=fake_pool,
+                credential_id=credential_id,
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                ts=self._TS,
+                caller_module="routers.granola",
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_NOT_FOUND
+        kw = audit_spy.await_args.kwargs
+        assert kw["operation"] == "write"
+        assert kw["success"] is False
+        assert kw["error_code"] == VaultErrorCode.VAULT_DB_NOT_FOUND.value
+
+    @pytest.mark.asyncio
+    async def test_only_one_pool_acquire(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        """Success-audit uses write_audit_row_on_conn(conn=...) — no nested
+        pool acquire inside the open txn."""
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow.return_value = {"id": credential_id}
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        await user_credentials.anchor_credential_watermark(
+            pool=fake_pool,
+            credential_id=credential_id,
+            tenant_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            ts=self._TS,
+            caller_module="routers.granola",
+        )
+        assert fake_pool.acquire.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_wraps_raw_db_error_and_audits_failure(
+        self, fake_pool: MagicMock, audit_spy: AsyncMock
+    ):
+        credential_id = uuid.uuid4()
+        conn = _make_fake_conn()
+        conn.fetchrow = AsyncMock(side_effect=ConnectionError("network drop"))
+        _configure_pool_to_yield(fake_pool, [conn])
+
+        with pytest.raises(VaultError) as exc_info:
+            await user_credentials.anchor_credential_watermark(
+                pool=fake_pool,
+                credential_id=credential_id,
+                tenant_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                ts=self._TS,
+                caller_module="routers.granola",
+            )
+        assert exc_info.value.code == VaultErrorCode.VAULT_DB_QUERY_FAILED
+        kw = audit_spy.await_args.kwargs
+        assert kw["success"] is False
+        assert kw["operation"] == "write"
         assert kw["credential_id"] == credential_id

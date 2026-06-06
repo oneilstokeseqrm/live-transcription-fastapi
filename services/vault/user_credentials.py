@@ -296,6 +296,26 @@ WHERE id = $2
 RETURNING id
 """
 
+# B3/A6: anchor the poll watermark on a forward-scope connect. Writes the
+# EXISTING last_polled_at column to the route-entry timestamp (C4) so the
+# first 5-min poll's created_after excludes pre-connect history (no
+# backfill). Touches ONLY last_polled_at — never the key, status, or
+# config. ``status = 'active' AND archived_at IS NULL`` so a flipped/archived
+# row can't be anchored. Caller MUST hold the per-credential advisory lock
+# (forward path runs at connect, before any cycle, so there is no contention
+# with the adapter's mid-cycle watermark write).
+_UPDATE_WATERMARK_SQL = """
+UPDATE vault.user_credentials
+SET last_polled_at = $1,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $2
+  AND tenant_id = $3
+  AND user_id = $4
+  AND status = 'active'
+  AND archived_at IS NULL
+RETURNING id
+"""
+
 
 def _build_encryption_context(
     *, tenant_id: UUID, user_id: UUID, provider: str, credential_id: UUID
@@ -1209,6 +1229,113 @@ async def update_credential_config(
             tenant_id=tenant_id,
             user_id=user_id,
             provider=provider,
+            caller_module=caller_module,
+            operation="write",
+            error_code=wrapped.code.value,
+            trace_id=trace_id,
+        )
+        raise wrapped from exc
+
+    return credential_id
+
+
+async def anchor_credential_watermark(
+    *,
+    pool: asyncpg.Pool,
+    credential_id: UUID,
+    tenant_id: UUID,
+    user_id: UUID,
+    ts: datetime,
+    caller_module: str,
+    trace_id: str | None = None,
+) -> UUID:
+    """Set ``last_polled_at = ts`` on an ACTIVE credential row (B3/A6).
+
+    The forward-scope connect path (``import_scope='forward'``): instead of a
+    background backfill, anchor the poll watermark to the EXACT route-entry
+    timestamp (captured before any awaits — C4) so the first 5-min poll's
+    ``created_after`` excludes pre-connect history. Touches ONLY
+    ``last_polled_at`` — never the encrypted key (use
+    :func:`rotate_credential_key`), the ``config`` (use
+    :func:`update_credential_config`), or the ``status``.
+
+    Mirrors :func:`update_credential_config`: the caller MUST hold the
+    per-credential advisory lock, the WHERE is 3-field
+    ``(id, tenant_id, user_id)`` + ``status = 'active' AND archived_at IS NULL``
+    (tenant isolation + lifecycle guard), and the success audit shares the
+    UPDATE's transaction. Because the forward path runs at connect — before any
+    poll/import cycle — there is no contention with the adapter's mid-cycle
+    watermark write.
+
+    Raises ``VAULT_DB_NOT_FOUND`` if no ACTIVE, non-archived row matches the
+    ``credential_id`` (it flipped revoked/error or was archived between the
+    caller's load and this anchor). Raises :class:`VaultPermissionError` if
+    ``caller_module`` is not in :data:`ALLOWLIST`.
+    """
+    try:
+        _check_allowlist(caller_module)
+    except VaultPermissionError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="write",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+
+    try:
+        async with pool.acquire() as cred_conn:
+            async with cred_conn.transaction():
+                updated = await cred_conn.fetchrow(
+                    _UPDATE_WATERMARK_SQL,
+                    ts,
+                    credential_id,
+                    tenant_id,
+                    user_id,
+                )
+                if updated is None:
+                    raise VaultError(
+                        VaultErrorCode.VAULT_DB_NOT_FOUND,
+                        f"no active credential id={credential_id} to anchor "
+                        f"(archived/revoked/error between lookup and anchor)",
+                    )
+                await audit.write_audit_row_on_conn(
+                    conn=cred_conn,
+                    credential_id=credential_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    provider=_GRANOLA_PROVIDER,
+                    caller_module=caller_module,
+                    operation="write",
+                    success=True,
+                    trace_id=trace_id,
+                )
+    except VaultError as exc:
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
+            caller_module=caller_module,
+            operation="write",
+            error_code=exc.code.value,
+            trace_id=trace_id,
+        )
+        raise
+    except Exception as exc:
+        wrapped = _wrap_db_error(exc, operation="anchor_watermark DB section")
+        await _best_effort_failure_audit(
+            pool=pool,
+            credential_id=credential_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=_GRANOLA_PROVIDER,
             caller_module=caller_module,
             operation="write",
             error_code=wrapped.code.value,

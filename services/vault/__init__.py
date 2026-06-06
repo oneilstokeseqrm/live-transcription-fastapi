@@ -13,6 +13,9 @@ Public API:
 * :func:`store_credential` — encrypt-and-insert accessor.
 * :func:`rotate_credential_key` — replace key material on an existing row.
 * :func:`reactivate_credential` — re-enable a previously archived row.
+* :func:`update_credential_config` — in-place ``config`` reconfigure (B2/C5).
+* :func:`anchor_credential_watermark` — set ``last_polled_at`` on a forward-scope
+  connect (B3/A6) so the first poll skips pre-connect history.
 * :func:`archive_credential` — soft-delete a row (LOCKED-34 disconnect).
 * :data:`ALLOWLIST` — caller modules permitted to use the accessor.
 * :class:`VaultError`, :class:`VaultPermissionError`, :class:`VaultErrorCode`
@@ -37,6 +40,7 @@ from .user_credentials import (
     ALLOWLIST,
     CredentialStatus,
     GranolaCredential,
+    anchor_credential_watermark,
     archive_credential,
     get_credential_status,
     get_granola_credential_for_user,
@@ -53,6 +57,7 @@ __all__ = [
     "VaultError",
     "VaultErrorCode",
     "VaultPermissionError",
+    "anchor_credential_watermark",
     "archive_credential",
     "get_credential_status",
     "get_granola_credential_for_user",
