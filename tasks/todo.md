@@ -1,72 +1,51 @@
-# Session: Phase 2f follow-ups — edge #12 → wire trigger → first /connect E2E → edge #13
+# B3 / EQ-92 — Background Granola history-import (execution plan)
 
-Start state: `main` @ `1831235` (Phase 2f #29 `260b863` shipped + prod-verified). /health 200.
-Plan spec: `tasks/granola-integration-plan.md` §2.1 #12 (line 955) + #13 (line 956); §Phase 4c E2E (836-877).
-Locked decisions this session (with user, 2026-05-25):
-- Execution order: **#12 first** (it makes the disconnect-during-sync race live once the trigger runs), then trigger, then E2E, then #13.
-- Trigger platform: **AWS EventBridge Scheduler** (free at our volume — 8.7k/mo vs 14M free tier; I build it all via AWS MCP w/ user authorization). Co-exists with existing EventBridge event fabric (16 rules) but is a net-new *scheduler* (0 schedules today).
-- Infra documentation: commit `docs/infrastructure/granola-eventbridge-scheduler.md` (live ARNs + exact create/teardown/modify commands) — the bridge to future IaC. No IaC framework adopted now (repo has none).
+**Source of truth:** `docs/superpowers/plans/2026-06-04-granola-phase-3-fe-be.md` §Phase B3 (C1/C2/C3/C4/C7/C8/C9/C13/C17/C18).
+**Status:** 🟢 PR 1 (migration) SHIPPED + deployed + verified in prod (2026-06-06). PR 2 (backend) IN PROGRESS.
+- **PR 1 ✅** — eq-frontend #454, squash `54b9dbc8`, merged + Vercel-deployed; `public.granola_import_runs` live in `eq-dev`/super-glitter `production` branch (table + partial-unique + CHECK + 3 FKs verified). Codex gate PASS (1 P2 folded). Worktree removed.
+
+## What I verified before planning (trust-but-verify)
+- [x] Backend `922660b` present on `main`; `/health` 200 (intermittent cold-start 502 root-caused → benign; latent sync-boto3 ticketed EQ-105 / backlog #19 as fast-follow — NOT a B3 blocker).
+- [x] Neon truth: `vault.user_credentials` PK = `id` (uuid), UNIQUE `(tenant_id,user_id,provider)`. `external_integration_runs` has **no credential_id** — keyed `(tenant_id,user_id,provider,external_id)` UNIQUE + `(provider,status,created_at)` index. `granola_import_runs` does NOT exist yet.
+- [x] Live test credential `6a727bae-…` still LEGACY single-folder config (`{folder_id,folder_name}`, no import_scope) — B3 must tolerate missing `import_scope` on pre-B3 rows; its `/status` shows no import block (no import_run row).
+- [x] eq-frontend Prisma: multiSchema ON (`schemas=["public","vault"]`); new-table PK convention = `uuidv7()`.
+- [x] Code anchors mapped (current lines): connect_granola 606–824, mode="all" guard 635–642 (LIFT), save&test 814–824 (REMOVE), /status 886–951; scheduler GRANOLA_POLL_QUEUE:83, run_cycle_step 240–371, granola_poll_one_credential 378–427, _advisory_lock_key 226–237; adapter run_one_cycle 169–457, _mark_credential_polled_success 2268–2305, _credential_is_active 1884–1924; vault update_credential_config 1119–1219, ALLOWLIST 68–82.
+
+## Deploy/merge order (plan §5) — each step = 1 PR + Codex gate + founder-authorized merge
+1. **eq-frontend `granola_import_runs` Prisma migration** → Vercel deploy applies to Neon → verify. (MUST deploy before the backend PR.)
+2. **Backend B3 (EQ-92)** → Railway deploy → `/health` 200.
 
 ---
 
-## 1. EDGE #12 — adapter `archived_at`-awareness  [IN PROGRESS]
-Branch: `phase-2.1/granola-adapter-archived-at-guard` off `main`.
-Root fix (plan §2.1 #12): a credential archived/disconnected mid-cycle must abort the in-flight cycle cleanly instead of ingesting a few more notes.
-- [ ] Guard the 3 credential-state UPDATE SQLs on `AND archived_at IS NULL`:
-      `_UPDATE_CREDENTIAL_POLL_SUCCESS_SQL` (adapter.py:1286), `_UPDATE_CREDENTIAL_STATUS_SQL` (:1298),
-      `_INCREMENT_CREDENTIAL_FAILURES_SQL` (:1308). (Tenant+user already in WHERE.)
-- [ ] Re-check the credential is still active before each publish in `process_note` / `_ingest_scenario_a`
-      (re-read status/archived_at just before `text_clean_service.process`; abort the note if archived mid-cycle).
-- [ ] Decide + handle the "UPDATE matched 0 rows because archived" signal (e.g. `_record_credential_transient_failure`
-      already returns threshold when row gone — extend the success/status helpers similarly; don't crash the cycle).
-- [ ] TDD: AsyncMock tests (mirror tests/unit/granola_ingestion/test_adapter.py `_FakeConn`/`_FakePool`):
-      archived-mid-cycle → no publish + clean abort; 3 UPDATE SQLs contain `archived_at IS NULL`; active path unchanged.
-- [ ] Run suite with `DBOS_SYSTEM_DATABASE_URL=x pytest` — 0 new regressions (baseline: 1 unit + 16 integration pre-existing).
-- [ ] `verify_consumer_contracts.py --source generic --interaction-type meeting` → 0 drift (envelope untouched; sanity).
-- [ ] Codex pre-merge gate (4-round soft cap; SPLIT/FREEZE per the two oscillation lessons).
-- [ ] Open PR. DO NOT merge / push-to-main without per-action user auth.
-NOTE: closing #12 means the per-endpoint `_credential_poll_lock` gates become belt-and-suspenders (can stay; removing is optional, out of scope this PR unless trivial).
+## PR 1 — eq-frontend: `granola_import_runs` migration
+- [ ] Work in an ISOLATED git worktree off `origin/main` (shared checkout is on another agent's branch `eq-81-…` with uncommitted work). `git branch --show-current` before every commit.
+- [ ] Add `granola_import_runs` model to `prisma/schema.prisma` in **`public`** schema (sibling of `external_integration_runs`), cross-schema FK to `vault.user_credentials(id)`:
+  - `id uuid @id @default(dbgenerated("uuidv7()"))` (repo convention), `tenant_id uuid`, `user_id uuid`, `credential_id uuid` (FK → vault.user_credentials.id), `state text`, `total int?`, `started_at timestamptz?`, `finished_at timestamptz?`, `created_at @default(now())`, `updated_at @updatedAt`.
+  - `@@index([credential_id, state])`.
+  - state ∈ {queued,running,complete,failed,cancelled} (app-enforced; optional CHECK).
+- [ ] Generate migration; **hand-add the partial-unique via raw SQL** (Prisma can't express it): `CREATE UNIQUE INDEX granola_import_runs_one_active ON public.granola_import_runs (credential_id) WHERE state IN ('queued','running');`
+- [ ] Mirror `external_integration_runs` RLS/role posture (verify how the backend asyncpg role accesses it; add RLS policy if its sibling has one).
+- [ ] `/// ` doc-comments on key columns per the 5-layer semantic convention.
+- [ ] PR → `/codex review` (4-round cap) → founder authorizes merge → Vercel deploy → **verify in Neon** (table + partial-unique exist).
 
-## 2. WIRE THE 5-MIN TRIGGER — EventBridge Scheduler  [after #12 merges]
-- [ ] Provision via AWS MCP (user authorizes each AWS change): Connection (secret header) + API destination
-      (POST public /internal/granola/cron-tick) + IAM invoke role + `rate(5 minutes)` schedule + DLQ.
-- [ ] Put INTERNAL_CRON_SECRET value into the EventBridge Connection (it must match Railway's env value).
-- [ ] Verify: one real tick → cron-tick returns 202; with 0 credentials enqueued=0; logs show the dispatch.
-- [ ] Commit `docs/infrastructure/granola-eventbridge-scheduler.md` (ARNs + create/teardown/modify commands).
+## PR 2 — backend EQ-92 (live-transcription-fastapi), feature branch `phase-3/granola-be-b3`
+> **Codex consult done (2026-06-06) — corrections folded into `tasks/b3-implementation-design.md` §POST-CONSULT (A1-A7).** Key: A1 poll skips uninitialized creds (`import_scope=history/forward AND last_polled_at NULL`); A2 try-lock + lock_busy + cron recovery (new wf id); A3 expose `cycle_aborted` on CycleResult + check credential_error_code; A4 SPLIT reconfigure-backfill out (→ backlog #21a); A5 derived progress exact-for-fresh-import only (#21b items-table fast-follow); A7 pool max 10→20 env-overridable, per-loop ownership → EQ-109. Pool concern ticketed EQ-109 (founder: ticket+proceed).
+TDD throughout (AsyncMock, no Docker). Tests: `tests/unit/granola_ingestion/test_import_runs.py`, `test_scheduler.py`, `tests/unit/test_granola_admin.py`.
+- [ ] **`services/granola_ingestion/import_runs.py`** (NEW): `create_import_run`, `mark_running`, `set_import_total`, `complete/fail/cancel_import_run`, `read_import_progress(id)` — progress **DERIVED** (C1) via COUNT/GROUP-BY over `external_integration_runs` scoped `(tenant_id,user_id,provider='granola')` + `created_at >= started_at`. Status→bucket map (from `outcomes.py`): success→done, deferred_pending_account→deferred, skipped_*→skipped, failed/failed_permanent→errors. NO mutable counter. All tenant+user scoped. Add module to vault `ALLOWLIST` (or route reads through scheduler).
+- [ ] **`scheduler.py`**: add `GRANOLA_IMPORT_QUEUE = Queue("granola-import", concurrency=2)` (C3 — NOT the poll queue) + `granola_import_one_credential` (@DBOS.workflow) + `run_import_step` (@DBOS.step) mirroring poll. Lock-busy (C2): block-with-retry / requeue, stay `queued` (don't strand). On `_CredentialDeactivated`/inactive mid-import → `cancel_import_run` (C9). **VERIFY pool invariant** (`asyncpg_pool.py:72-86`): max_size ≥ 2×(poll+import concurrency)=2×7=14 vs current 10 → bump max_size if required.
+- [ ] **`adapter.py`**: thread optional `import_run_id` into `run_one_cycle`; set `total` after first listing (`set_import_total`); progress stays DERIVED (no counters).
+- [ ] **`routers/granola.py`**:
+  - LIFT the `mode="all"` 400 guard (635–642).
+  - Capture `forward_anchor_at = datetime.now(UTC)` at ROUTE ENTRY (C4), before any awaits.
+  - Rewrite `/connect` post-store branch on `import_scope`: `history` → leave `last_polled_at` NULL, `create_import_run`, enqueue on GRANOLA_IMPORT_QUEUE with `SetWorkflowID(f"granola_import_{credential_id}_{import_run_id}")`, return `{import:{...}}` ACK; `forward` → `anchor_credential_watermark(last_polled_at=forward_anchor_at)`, NO import, return `{import:null}`. Delete the synchronous `_save_and_test_locked` call (814–824).
+  - Enqueue atomicity (C8): `/connect` retry + `/status` recover "active history cred, NULL watermark, no running/complete import" → create+enqueue.
+  - Active-row reconfigure (B3 Step 5b / C17): on add-folder, `history`→backfill only NEW folders; `forward`→backfill new folders from now() WITHOUT moving global `last_polled_at`.
+  - `/status`: add `import` block (C18) — latest import_run + derived progress; `state ∈ {queued,running,complete,failed,cancelled}`; indeterminate until `total` known (C14); omit block when no import_run (forward / pre-B3 rows).
+- [ ] **`services/vault/user_credentials.py`**: NEW `anchor_credential_watermark(credential_id, ts)` — writes `last_polled_at = ts` (NOT a new column), mirrors `update_credential_config` (advisory-lock-gated, 3-field WHERE, status='active' AND archived_at IS NULL guard, same-txn audit). Forward path only; runs at connect under the lock before any cycle.
+- [ ] `scripts/verify_consumer_contracts.py` → 0 drift (envelope UNCHANGED — LOCKED-38). `/codex review` 4-round cap → founder merge → Railway deploy → `/health` 200.
 
-## 3. FIRST REAL /connect E2E  [after trigger live]
-- [ ] Pre-flight collision check (feedback_shared_infrastructure_collision): `ls -lt ~/.claude/projects/-Users-peteroneil-*/*.jsonl | head`.
-- [ ] User provides real Granola API key + test folder. /validate → /connect → wait one tick → verify ingest:
-      vault.user_credentials row, external_integration_runs status='success', raw_interactions meeting row, no DLQ.
-- [ ] LOCKED-11 atomic cleanup of test artifacts afterward.
+## Session end
+- [ ] Update Linear EQ-92 + audit handoff docs (repo + Linear + memory) for mutual consistency; grep for stale signatures.
 
-## 4. EDGE #13 — /connect bad-folder recovery  [lower priority]
-- [ ] Plan §2.1 #13 options: validate folder_id in /connect before store; OR let /connect re-configure a broken
-      non-archived row instead of 409; OR PATCH /folder. Decide approach, implement smallest, Codex gate.
-
-## Out of scope this session
-- Phase 2g (transactional email on credential breakage) — its own session.
-- Removing the per-endpoint advisory-lock gates (optional cleanup; leave unless trivial).
-
-## Disciplines (non-negotiable)
-- `git branch --show-current` immediately before every commit (shared checkout).
-- Per-action user auth for push-to-main / merge / Railway / AWS / GitHub-secret changes.
-- Tenant isolation: every query carries tenant_id. NEVER modify downstream envelope contracts (LOCKED-38).
-- Tests: AsyncMock, no Docker. Run with DBOS_SYSTEM_DATABASE_URL set.
-- ALLOW_LEGACY_HEADER_AUTH=true in prod (load-bearing context for any auth reasoning).
-
-## Progress
-- [x] §1 EDGE #12 coded + TDD (RED→GREEN): 3 SQL guards (`archived_at IS NULL`) + `_credential_is_active`
-      recheck in run_one_cycle main loop + reprocess pass. 5 new tests. Full unit suite 496 pass /
-      1 pre-existing failure / 0 regressions. 0 envelope contract drift (script exit-1 is pre-existing
-      stale-rule-registry noise, proven via stash test — unrelated to this change).
-- [x] §1 Codex pre-merge gate — 8 rounds. R1-R7 folded (each a real narrowing bug; gate passed/no-P1 from R2 on);
-      R6#2 declined (reconnect-generation race is lock-prevented — both run_one_cycle callers hold the advisory
-      lock, reactivate is gated on it); R8 residual (sub-ms window inside _defer_pending_account) ship+ticketed by
-      user. 11 new tests; 504 unit pass / 1 pre-existing failure / 0 regressions; 0 envelope contract drift.
-      Final gate state: PASS. Deferred items ticketed as plan §2.1 #14 (defer-path atomicity) + #15 (generation token).
-- [x] §1 PR #30 opened, user-authorized merge → squash-merged `06415fa`, Railway `c252ddda` SUCCESS, prod-verified
-      (/health 200, /validate 401, /status 400, cron-tick 401, /text/clean 422 — no regression). EDGE #12 DONE.
-- [ ] §2 wire EventBridge Scheduler trigger + infra manifest (docs/infrastructure/granola-eventbridge-scheduler.md) — NEXT
-- [ ] §3 first real /connect E2E (interactive — needs Peter's Granola key)
-- [ ] §4 edge #13
+## Review (filled after implementation)
+_(pending)_

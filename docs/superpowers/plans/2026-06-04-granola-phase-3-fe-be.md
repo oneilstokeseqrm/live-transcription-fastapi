@@ -13,9 +13,20 @@
 >   (C16); active-row `/connect` RECONFIGURE via NEW vault `update_credential_config` (different key → 409
 >   "use /rotate"); success-update guards `status='active'`; **shared `last_polled_at` watermark HELD on any
 >   folder skip**.
-> - **NEXT = eq-frontend `granola_import_runs` Prisma migration → EQ-92 (B3 background history-import).**
->   B3 LIFTS the `mode="all"` `/connect` guard (once `/connect` is async). Resume checkpoint:
->   `granola-eq91-shipped-b3-next`; next-session prompt: `docs/superpowers/specs/2026-06-05-granola-b3-next-session-prompt.md`.
+> - **EQ-92 / B3 IN PROGRESS (updated 2026-06-06):**
+>   - **PR 1 ✅ SHIPPED** — eq-frontend `granola_import_runs` migration: PR #454, squash `54b9dbc8`, merged +
+>     Vercel-deployed; table LIVE in Neon `super-glitter-11265514` (`eq-dev`) `production` branch (partial-unique
+>     + CHECK + 3 FKs verified). Codex gate PASS.
+>   - **PR 2 IN PROGRESS** — backend on branch `phase-3/granola-be-b3` @ `4e4346d`. Component 1/6 done:
+>     `services/granola_ingestion/import_runs.py` (lifecycle + DERIVED progress, 11 tests green). 5 components +
+>     Codex review gate remain. **The B3 design was Codex-consult-vetted → corrections A1-A7 in
+>     `tasks/b3-implementation-design.md` (BINDING; they refine §Phase B3 / §1a).** B3 LIFTS the `mode="all"`
+>     `/connect` guard (in PR 2's /connect restructure).
+>   - **Split out of B3 per the consult (fast-follows):** newly-added-folder reconfigure backfill (backlog #21a)
+>     + exact re-import progress items-table (#21b). Sibling tickets: EQ-105 (sync boto3 off the loop), EQ-109
+>     (per-loop asyncpg pool).
+>   - Resume checkpoint: `granola-b3-pr2-import-runs-done`; next-session prompt:
+>     `docs/superpowers/specs/2026-06-06-granola-b3-pr2-next-session-prompt.md`.
 > - **Deferred into B3/later:** per-folder watermarks (B2 holds the shared watermark on any skip); live-API
 >   multi-folder probes (multi-folder doc §6); newly-added-folder backfill on reconfigure (B3 Step 5b, C17).
 > - The **B1/B2 phase sections below are the BUILD RECORD** (shipped — their step checkboxes are left
