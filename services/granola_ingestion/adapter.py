@@ -1947,11 +1947,12 @@ async def _credential_is_active(
     still holding the old key/folder. That race is structurally prevented:
     BOTH callers of :func:`run_one_cycle` hold the per-credential
     ``pg_try_advisory_lock`` for the whole cycle
-    (:func:`services.granola_ingestion.scheduler.run_cycle_step` and
-    ``routers.granola._save_and_test_locked``), and
-    ``reactivate_credential`` is itself gated on that same lock
-    (``routers.granola._credential_poll_lock``) — so a reconnect cannot
-    interleave with a running cycle (it 409s until the cycle releases the
+    (:func:`services.granola_ingestion.scheduler.run_cycle_step`, the 5-min
+    poll, and :func:`services.granola_ingestion.scheduler.run_import_step`, the
+    B3 background history-import — the synchronous /connect "save & test" poll
+    was retired in B3), and ``reactivate_credential`` is itself gated on that
+    same lock (``routers.granola._credential_poll_lock``) — so a reconnect
+    cannot interleave with a running cycle (it 409s until the cycle releases the
     lock). A generation token would only matter for a hypothetical future
     lock-free caller; that's tracked as a defense-in-depth follow-up, not a
     reachable bug today.

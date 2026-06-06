@@ -292,17 +292,21 @@ def test_validate_accepts_jwt_without_pg_user_id(client):
 # ---------------------------------------------------------------------------
 
 
-def test_connect_happy_new_stores_and_first_polls(client):
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock(return_value=MagicMock())  # decrypted credential (opaque here)
-    cycle = _cycle(notes_processed=2, outcomes={"success": 2})
-    run = AsyncMock(return_value=cycle)
+def test_connect_happy_new_history_dispatches_import(client):
+    """B3: a new history connect stores the credential, creates a
+    granola_import_runs row, and dispatches the background import on
+    GRANOLA_IMPORT_QUEUE — NO synchronous first poll. Returns the import ACK."""
+    cred_id = uuid4()
+    run_id = uuid4()
+    store = AsyncMock(return_value=cred_id)
+    get_or_create = AsyncMock(return_value=(run_id, True))
+    enqueue = AsyncMock()
 
     auth, pool = _patch_auth_and_pool()
     with auth, pool, \
          patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
+         patch.object(granola, "get_or_create_active_import_run", get_or_create), \
+         patch.object(granola, "enqueue_import_workflow", enqueue):
         resp = client.post(
             f"{_BASE}/connect",
             json={"api_key": "grn_test", "folder_id": "fol_eq", "folder_name": "EQ"},
@@ -312,70 +316,148 @@ def test_connect_happy_new_stores_and_first_polls(client):
     body = resp.json()
     assert body["ok"] is True
     assert body["status"] == "connected"
-    assert body["first_poll"]["ingested"] == 2
-    assert body["first_poll"]["notes_processed"] == 2
-    assert body["error_code"] is None
+    # B3 import ACK (NOT first_poll): queued, indeterminate total, done 0.
+    assert body["import"]["import_run_id"] == str(run_id)
+    assert body["import"]["state"] == "queued"
+    assert body["import"]["total"] is None
+    assert body["import"]["done"] == 0
 
-    # store called with the pg_user UUID + config carrying folder_id/name
     store.assert_awaited_once()
     kwargs = store.await_args.kwargs
     assert str(kwargs["tenant_id"]) == _TENANT
     assert str(kwargs["user_id"]) == _PG_USER
     assert kwargs["provider"] == "granola"
-    # B1: config is now the folder-LIST shape (mode + import_scope + folders[])
-    # with the legacy singular folder_id/folder_name MIRRORED for one release
-    # (so the not-yet-updated adapter + any old client keep working).
     assert kwargs["config"]["folders"] == [{"id": "fol_eq", "name": "EQ"}]
     assert kwargs["config"]["mode"] == "folders"
     assert kwargs["config"]["import_scope"] == "history"
-    assert kwargs["config"]["folder_id"] == "fol_eq"
-    assert kwargs["config"]["folder_name"] == "EQ"
+    assert kwargs["config"]["folder_id"] == "fol_eq"  # legacy mirror
     assert kwargs["caller_module"] == "routers.granola"
-    # the test poll ran against the decrypted credential
-    run.assert_awaited_once()
+
+    # import created (idempotent) + dispatched under the DETERMINISTIC id (C8).
+    get_or_create.assert_awaited_once()
+    enqueue.assert_awaited_once()
+    eq_kwargs = enqueue.await_args.kwargs
+    assert eq_kwargs["credential_id"] == cred_id
+    assert eq_kwargs["import_run_id"] == run_id
+    assert eq_kwargs["workflow_id"] == f"granola_import_{cred_id}_{run_id}"
 
 
-def test_connect_reconnect_after_disconnect_uses_reactivate(client):
-    """store UNIQUE-violation + an ARCHIVED row exists → reactivate (UPDATE)."""
-    store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
-    get_status = AsyncMock(
-        return_value=_cred_status(status="archived", archived_at=datetime.now(timezone.utc))
-    )
-    reactivate = AsyncMock(return_value=uuid4())
-    load = AsyncMock(return_value=MagicMock())
-    run = AsyncMock(return_value=_cycle(notes_processed=1, outcomes={"success": 1}))
+def test_connect_forward_anchors_watermark_no_import(client):
+    """B3 forward scope (D6): anchor last_polled_at to the route-entry timestamp
+    (C4), run NO backfill, dispatch NO import → import:null."""
+    cred_id = uuid4()
+    store = AsyncMock(return_value=cred_id)
+    anchor = AsyncMock(return_value=cred_id)
+    get_or_create = AsyncMock()
+    enqueue = AsyncMock()
 
     auth, pool = _patch_auth_and_pool()
     with auth, pool, \
          patch.object(granola, "store_credential", store), \
+         patch.object(granola, "anchor_credential_watermark", anchor), \
+         patch.object(granola, "get_or_create_active_import_run", get_or_create), \
+         patch.object(granola, "enqueue_import_workflow", enqueue):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={
+                "api_key": "grn_test",
+                "folders": [{"id": "fol_eq", "name": "EQ"}],
+                "import_scope": "forward",
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["status"] == "connected"
+    assert body["import"] is None
+    # anchor written with the route-entry timestamp; no import created/dispatched.
+    anchor.assert_awaited_once()
+    akw = anchor.await_args.kwargs
+    assert akw["credential_id"] == cred_id
+    assert isinstance(akw["ts"], datetime)
+    get_or_create.assert_not_awaited()
+    enqueue.assert_not_awaited()
+    assert store.await_args.kwargs["config"]["import_scope"] == "forward"
+
+
+def test_connect_mode_all_is_accepted_now(client):
+    """B3 LIFTS the mode='all' 400 guard (no synchronous backfill anymore): a
+    history 'all' connect dispatches a background import over all folders."""
+    cred_id = uuid4()
+    run_id = uuid4()
+    store = AsyncMock(return_value=cred_id)
+    get_or_create = AsyncMock(return_value=(run_id, True))
+    enqueue = AsyncMock()
+
+    auth, pool = _patch_auth_and_pool()
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
+         patch.object(granola, "get_or_create_active_import_run", get_or_create), \
+         patch.object(granola, "enqueue_import_workflow", enqueue):
+        resp = client.post(
+            f"{_BASE}/connect",
+            json={"api_key": "grn_test", "mode": "all", "folders": []},
+        )
+
+    assert resp.status_code == 200  # was 400 pre-B3
+    body = resp.json()
+    assert body["status"] == "connected"
+    assert body["import"]["state"] == "queued"
+    assert store.await_args.kwargs["config"]["mode"] == "all"
+    enqueue.assert_awaited_once()
+
+
+def test_connect_reconnect_after_disconnect_uses_reactivate(client):
+    """store UNIQUE-violation + an ARCHIVED row exists → reactivate (UPDATE),
+    then B3 dispatches the background import for the (default history) reconnect."""
+    cred_id = uuid4()
+    run_id = uuid4()
+    store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
+    get_status = AsyncMock(
+        return_value=_cred_status(status="archived", archived_at=datetime.now(timezone.utc))
+    )
+    reactivate = AsyncMock(return_value=cred_id)
+    get_or_create = AsyncMock(return_value=(run_id, True))
+    enqueue = AsyncMock()
+
+    auth, pool = _patch_auth_and_pool()  # default pool: advisory lock free
+    with auth, pool, \
+         patch.object(granola, "store_credential", store), \
          patch.object(granola, "get_credential_status", get_status), \
          patch.object(granola, "reactivate_credential", reactivate), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
+         patch.object(granola, "get_or_create_active_import_run", get_or_create), \
+         patch.object(granola, "enqueue_import_workflow", enqueue):
         resp = client.post(
             f"{_BASE}/connect",
             json={"api_key": "grn_new", "folder_id": "fol_eq"},
         )
 
     assert resp.status_code == 200
-    assert resp.json()["status"] == "connected"
+    body = resp.json()
+    assert body["status"] == "connected"
+    assert body["import"]["import_run_id"] == str(run_id)  # import dispatched on reconnect
     reactivate.assert_awaited_once()
     # reactivate is an UPDATE path, not a second INSERT
     assert reactivate.await_args.kwargs["new_api_key"] == "grn_new"
+    enqueue.assert_awaited_once()
 
 
 def test_connect_active_same_key_reconfigures_folders(client):
-    """C5: ACTIVE row + the SAME key + new folders → in-place folder reconfigure
-    (update_credential_config) + save-and-test over the new set — NOT a 409 and
-    NOT reactivate_credential (which only handles archived rows)."""
+    """C5/A4: ACTIVE row + the SAME key + new folders → in-place folder
+    reconfigure (update_credential_config), keeping B2 behavior — NOT a 409, NOT
+    reactivate, and (A4) NO new import / synchronous poll. Returns connected;
+    the import block is omitted for this (legacy, no-import) credential."""
     store = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_INSERT_FAILED, "unique"))
-    existing = _cred_status(status="active", archived_at=None)
+    existing = _cred_status(status="active", archived_at=None)  # legacy config, watermark set
     get_status = AsyncMock(return_value=existing)
     current = MagicMock(api_key="grn_same")          # decrypted stored credential
     load = AsyncMock(return_value=current)
     reconfigure = AsyncMock(return_value=existing.id)
     reactivate = AsyncMock()
-    run = AsyncMock(return_value=_cycle(notes_processed=2, outcomes={"success": 2}))
+    get_or_create = AsyncMock()
+    enqueue = AsyncMock()
+    latest = AsyncMock(return_value=None)  # no import run for the legacy cred
 
     auth, pool = _patch_auth_and_pool()
     with auth, pool, \
@@ -384,7 +466,9 @@ def test_connect_active_same_key_reconfigures_folders(client):
          patch.object(granola, "get_granola_credential_for_user", load), \
          patch.object(granola, "update_credential_config", reconfigure), \
          patch.object(granola, "reactivate_credential", reactivate), \
-         patch.object(granola, "run_one_cycle", run):
+         patch.object(granola, "get_or_create_active_import_run", get_or_create), \
+         patch.object(granola, "enqueue_import_workflow", enqueue), \
+         patch.object(granola, "latest_import_run", latest):
         resp = client.post(
             f"{_BASE}/connect",
             json={
@@ -394,12 +478,16 @@ def test_connect_active_same_key_reconfigures_folders(client):
         )
 
     assert resp.status_code == 200
-    assert resp.json()["status"] == "connected"
+    body = resp.json()
+    assert body["status"] == "connected"
+    assert "import" not in body  # A4: reconfigure starts no import; legacy cred has none
     reconfigure.assert_awaited_once()
     cfg = reconfigure.await_args.kwargs["new_config"]
     assert cfg["folders"] == [{"id": "fol_a", "name": "A"}, {"id": "fol_b", "name": "B"}]
     reactivate.assert_not_awaited()   # reconfigure path, NOT reactivate
-    run.assert_awaited_once()         # save-and-test ran over the new folder set
+    # A4: no new import (recovery self-gates — legacy cred, watermark set, no history scope).
+    enqueue.assert_not_awaited()
+    get_or_create.assert_not_awaited()
 
 
 def test_connect_active_different_key_returns_409_use_rotate(client):
@@ -473,197 +561,6 @@ def test_connect_non_uniqueness_insert_failure_returns_502(client):
     reactivate.assert_not_awaited()
 
 
-def test_connect_load_failure_after_store_is_graceful(client):
-    """A vault read failure AFTER the credential committed must not 500
-    (a retry would hit 409) — report it like a failed first poll (Codex P2)."""
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock(side_effect=VaultError(VaultErrorCode.VAULT_DB_QUERY_FAILED, "db blip"))
-    run = AsyncMock()
-
-    auth, pool = _patch_auth_and_pool()
-    with auth, pool, \
-         patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_test", "folder_id": "fol_eq"},
-        )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is False
-    assert body["status"] == "connected"
-    assert body["error_code"] == "first_poll_failed"
-    run.assert_not_awaited()  # never reached the poll
-
-
-def test_connect_first_poll_auth_failure_reports_revoked(client):
-    """First-poll auth failure flips the credential to 'revoked' in the
-    adapter; the response must report 'revoked', not 'error' (Codex P3)."""
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock(return_value=MagicMock())
-    run = AsyncMock(return_value=_cycle(credential_error_code="granola_auth_failed"))
-
-    auth, pool = _patch_auth_and_pool()
-    with auth, pool, \
-         patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_bad", "folder_id": "fol_eq"},
-        )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is False
-    assert body["status"] == "revoked"
-    assert body["error_code"] == "granola_auth_failed"
-    assert body["first_poll"]["errors"] == 1
-
-
-def test_connect_first_poll_folder_error_reports_error_status(client):
-    """A non-auth credential error (folder deleted, sustained outage) →
-    status='error' (the adapter marks it 'error', not 'revoked')."""
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock(return_value=MagicMock())
-    run = AsyncMock(return_value=_cycle(credential_error_code="granola_folder_not_found"))
-
-    auth, pool = _patch_auth_and_pool()
-    with auth, pool, \
-         patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_test", "folder_id": "fol_gone"},
-        )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is False
-    assert body["status"] == "error"
-    assert body["error_code"] == "granola_folder_not_found"
-
-
-def test_connect_first_poll_transient_error_stays_connected(client):
-    """A transient first-poll error (429/5xx/timeout) leaves the credential
-    'active' in the adapter (retries until the threshold); the connection
-    must report 'connected', not a broken 'error' (Codex R3 P2)."""
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock(return_value=MagicMock())
-    run = AsyncMock(return_value=_cycle(credential_error_code="granola_5xx"))
-
-    auth, pool = _patch_auth_and_pool()
-    with auth, pool, \
-         patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_test", "folder_id": "fol_eq"},
-        )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "connected"  # NOT "error"
-    assert body["ok"] is False  # the poll itself didn't fully succeed
-    assert body["error_code"] == "granola_5xx"
-    assert body["first_poll"]["errors"] == 1
-
-
-def test_connect_defers_first_poll_when_scheduler_holds_lock(client):
-    """If a 5-min scheduler cycle already holds the per-credential advisory
-    lock, /connect skips the synchronous poll (no concurrent double-publish)
-    and reports the credential connected — the scheduler is already on it."""
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock()
-    run = AsyncMock()
-    # Lock NOT free: pg_try_advisory_lock returns False.
-    pool = _FakePool(_FakeConn(fetchval_returns=False))
-
-    auth, pool_patch = _patch_auth_and_pool(pool=pool)
-    with auth, pool_patch, \
-         patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_test", "folder_id": "fol_eq"},
-        )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is True
-    assert body["status"] == "connected"
-    assert body["first_poll"]["notes_processed"] == 0
-    # Poll skipped: neither the load nor the cycle ran.
-    load.assert_not_awaited()
-    run.assert_not_awaited()
-
-
-def test_connect_readback_non_active_reports_real_state(client):
-    """If the credential is saved but a prior scheduler cycle flipped it
-    non-active, get_granola_credential_for_user (active-only) returns None.
-    /connect must report the real state (via get_credential_status), not 500
-    a retry into a spurious 409 (Codex R4 P2)."""
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock(return_value=None)  # active-only read finds nothing
-    revoked = _cred_status(status="revoked", last_error={"error_code": "granola_auth_failed"})
-    get_status = AsyncMock(return_value=revoked)
-    run = AsyncMock()
-
-    auth, pool = _patch_auth_and_pool()
-    with auth, pool, \
-         patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "get_credential_status", get_status), \
-         patch.object(granola, "run_one_cycle", run):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_test", "folder_id": "fol_eq"},
-        )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "revoked"
-    assert body["ok"] is False
-    assert body["error_code"] == "granola_auth_failed"
-    run.assert_not_awaited()
-
-
-def test_connect_lock_setup_failure_is_graceful(client):
-    """A transient asyncpg failure acquiring the advisory lock AFTER the
-    credential committed must report 'connected, first poll failed', not 500
-    (which a retry would turn into a spurious 409) — Codex R5 P2."""
-    import asyncpg as _asyncpg
-
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock()
-    run = AsyncMock()
-    # pg_try_advisory_lock raises a transient error.
-    pool = _FakePool(_FakeConn(fetchval_raises=_asyncpg.PostgresError("pool blip")))
-
-    auth, pool_patch = _patch_auth_and_pool(pool=pool)
-    with auth, pool_patch, \
-         patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_test", "folder_id": "fol_eq"},
-        )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is False
-    assert body["status"] == "connected"
-    assert body["error_code"] == "first_poll_failed"
-    load.assert_not_awaited()
-    run.assert_not_awaited()
-
-
 def test_connect_reconnect_blocked_while_cycle_in_flight(client):
     """Reconnect while a stale scheduler cycle still holds the per-credential
     advisory lock → 409 'sync running'. Reactivating underneath the running
@@ -717,31 +614,6 @@ def test_connect_concurrent_reconnect_race_returns_409(client):
 
     assert resp.status_code == 409
     assert "already connected" in resp.json()["detail"].lower()
-
-
-def test_connect_first_poll_raise_is_graceful(client):
-    """If run_one_cycle raises (infra error), the credential is still saved;
-    connect returns ok:false + first_poll_failed rather than a 500."""
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock(return_value=MagicMock())
-    run = AsyncMock(side_effect=RuntimeError("db blip"))
-
-    auth, pool = _patch_auth_and_pool()
-    with auth, pool, \
-         patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_test", "folder_id": "fol_eq"},
-        )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is False
-    assert body["status"] == "connected"
-    assert body["error_code"] == "first_poll_failed"
-    assert body["first_poll"]["errors"] == 1
 
 
 def test_connect_kms_failure_maps_to_502(client):
@@ -911,9 +783,12 @@ def test_status_connected_with_activity(client):
     ]
     pool = _FakePool(_FakeConn(fetch_returns=activity_rows))
     get_status = AsyncMock(return_value=status_row)
+    latest = AsyncMock(return_value=None)  # legacy cred → no import run
 
     auth, pool_patch = _patch_auth_and_pool(pool=pool)
-    with auth, pool_patch, patch.object(granola, "get_credential_status", get_status):
+    with auth, pool_patch, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "latest_import_run", latest):
         resp = client.get(f"{_BASE}/status")
 
     assert resp.status_code == 200
@@ -929,6 +804,8 @@ def test_status_connected_with_activity(client):
     # Expand-contract: the legacy singular `folder` (= folders[0]) is ALSO
     # returned during the expand window so a pre-B1 /status reader still works.
     assert body["folder"] == {"id": "fol_eq", "name": "EQ"}
+    # C18: a legacy credential has no import run → the import block is OMITTED.
+    assert "import" not in body
 
 
 def test_status_not_connected_when_no_row(client):
@@ -968,14 +845,80 @@ def test_status_revoked_is_connected_but_flagged(client):
     status_row = _cred_status(status="revoked")
     pool = _FakePool(_FakeConn(fetch_returns=[]))
     get_status = AsyncMock(return_value=status_row)
+    latest = AsyncMock(return_value=None)
 
     auth, pool_patch = _patch_auth_and_pool(pool=pool)
-    with auth, pool_patch, patch.object(granola, "get_credential_status", get_status):
+    with auth, pool_patch, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "latest_import_run", latest):
         resp = client.get(f"{_BASE}/status")
 
     body = resp.json()
     assert body["connected"] is True
     assert body["status"] == "revoked"
+
+
+def test_status_includes_import_block_for_history(client):
+    """C18: a history credential with a background import surfaces the `import`
+    block (latest run + DERIVED progress) + `import_scope`."""
+    run_id = uuid4()
+    started = datetime(2026, 6, 6, 10, 0, tzinfo=timezone.utc)
+    # last_polled_at set → the recovery self-gate won't fire.
+    status_row = _cred_status(
+        status="active",
+        config={"import_scope": "history", "mode": "folders", "folders": [{"id": "fol_a", "name": "A"}]},
+    )
+    pool = _FakePool(_FakeConn(fetch_returns=[]))
+    get_status = AsyncMock(return_value=status_row)
+    latest = AsyncMock(return_value={
+        "id": run_id, "state": "running", "total": 240,
+        "started_at": started, "finished_at": None, "created_at": started,
+    })
+    prog = AsyncMock(return_value={
+        "state": "running", "total": 240, "done": 87, "deferred": 4,
+        "skipped": 9, "errors": 0, "started_at": started, "finished_at": None,
+    })
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "latest_import_run", latest), \
+         patch.object(granola, "read_import_progress", prog):
+        resp = client.get(f"{_BASE}/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["import_scope"] == "history"
+    assert body["import"]["import_run_id"] == str(run_id)
+    assert body["import"]["state"] == "running"
+    assert body["import"]["total"] == 240
+    assert body["import"]["done"] == 87
+    assert body["import"]["deferred"] == 4
+    assert body["import"]["skipped"] == 9
+    assert body["import"]["started_at"] == started.isoformat()
+
+
+def test_status_omits_import_block_when_no_import_run(client):
+    """C18: forward connections + pre-B3 legacy rows have no import run → the
+    import block is OMITTED (but import_scope is still reported)."""
+    status_row = _cred_status(
+        status="active",
+        config={"import_scope": "forward", "mode": "folders", "folders": [{"id": "fol_a", "name": "A"}]},
+    )
+    pool = _FakePool(_FakeConn(fetch_returns=[]))
+    get_status = AsyncMock(return_value=status_row)
+    latest = AsyncMock(return_value=None)
+
+    auth, pool_patch = _patch_auth_and_pool(pool=pool)
+    with auth, pool_patch, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "latest_import_run", latest):
+        resp = client.get(f"{_BASE}/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["import_scope"] == "forward"
+    assert "import" not in body
 
 
 def test_status_activity_db_failure_maps_to_503(client):
@@ -1101,8 +1044,9 @@ def test_connect_request_back_compat_singular_folder_id():
 
 
 def test_connect_request_mode_all_accepted_at_model_level():
-    # the contract field accepts "all" (watch everything); the ENDPOINT gates it
-    # until the multi-folder loop ships (see the rejection test below).
+    # the contract field accepts "all" (watch everything); B3 also accepts it at
+    # the ENDPOINT now that the synchronous backfill is gone (the import runs in
+    # the background) — see test_connect_mode_all_is_accepted_now.
     body = granola.ConnectRequest(api_key="grn_x", mode="all", folders=[])
     assert body.mode == "all"
     assert body.normalized_folders() == []
@@ -1129,15 +1073,16 @@ def test_connect_request_config_has_folders_and_legacy_mirror():
 
 
 def test_connect_accepts_folders_array_and_stores_list_config(client):
-    store = AsyncMock(return_value=uuid4())
-    load = AsyncMock(return_value=MagicMock())
-    run = AsyncMock(return_value=_cycle(notes_processed=1, outcomes={"success": 1}))
+    cred_id = uuid4()
+    store = AsyncMock(return_value=cred_id)
+    get_or_create = AsyncMock(return_value=(uuid4(), True))
+    enqueue = AsyncMock()
 
     auth, pool = _patch_auth_and_pool()
     with auth, pool, \
          patch.object(granola, "store_credential", store), \
-         patch.object(granola, "get_granola_credential_for_user", load), \
-         patch.object(granola, "run_one_cycle", run):
+         patch.object(granola, "get_or_create_active_import_run", get_or_create), \
+         patch.object(granola, "enqueue_import_workflow", enqueue):
         resp = client.post(
             f"{_BASE}/connect",
             json={
@@ -1156,22 +1101,9 @@ def test_connect_accepts_folders_array_and_stores_list_config(client):
     assert cfg["folder_id"] == "fol_a"  # legacy mirror = folders[0]
 
 
-def test_connect_mode_all_rejected_until_loop_ships(client):
-    """C10: B1 accepts mode='all' in the *contract*, but the synchronous
-    save-&-test can't safely backfill 'everything' (Railway ~5-min cap) and the
-    multi-folder loop lands in B2 — so the endpoint rejects mode='all' (4xx)
-    WITHOUT storing, which also prevents a folder_id="" → 400 to Granola."""
-    store = AsyncMock(return_value=uuid4())
-
-    auth, pool = _patch_auth_and_pool()
-    with auth, pool, patch.object(granola, "store_credential", store):
-        resp = client.post(
-            f"{_BASE}/connect",
-            json={"api_key": "grn_x", "mode": "all", "folders": []},
-        )
-
-    assert resp.status_code == 400
-    store.assert_not_awaited()
+# (mode='all' is now ACCEPTED at /connect in B3 — see
+# test_connect_mode_all_is_accepted_now above; the B1/B2-era rejection test was
+# removed when B3 lifted the guard.)
 
 
 def test_status_returns_folders_array_from_new_config(client):
@@ -1189,9 +1121,12 @@ def test_status_returns_folders_array_from_new_config(client):
     )
     pool = _FakePool(_FakeConn(fetch_returns=[]))
     get_status = AsyncMock(return_value=status_row)
+    latest = AsyncMock(return_value=None)
 
     auth, pool_patch = _patch_auth_and_pool(pool=pool)
-    with auth, pool_patch, patch.object(granola, "get_credential_status", get_status):
+    with auth, pool_patch, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "latest_import_run", latest):
         resp = client.get(f"{_BASE}/status")
 
     body = resp.json()
@@ -1221,9 +1156,12 @@ def test_status_surfaces_persisted_per_folder_status(client):
     )
     pool = _FakePool(_FakeConn(fetch_returns=[]))
     get_status = AsyncMock(return_value=status_row)
+    latest = AsyncMock(return_value=None)
 
     auth, pool_patch = _patch_auth_and_pool(pool=pool)
-    with auth, pool_patch, patch.object(granola, "get_credential_status", get_status):
+    with auth, pool_patch, \
+         patch.object(granola, "get_credential_status", get_status), \
+         patch.object(granola, "latest_import_run", latest):
         resp = client.get(f"{_BASE}/status")
 
     body = resp.json()

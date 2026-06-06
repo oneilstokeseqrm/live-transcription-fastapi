@@ -39,7 +39,8 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Literal
+from datetime import datetime, timezone
+from typing import Literal, Optional
 from uuid import UUID
 
 import asyncpg
@@ -49,20 +50,32 @@ from pydantic import BaseModel, Field, model_validator
 from middleware.jwt_auth import extract_bearer_token
 
 from services.asyncpg_pool import get_asyncpg_pool
-from services.granola_ingestion.adapter import run_one_cycle
 from services.granola_ingestion.api_client import GranolaAPIClient
 from services.granola_ingestion.errors import GranolaError, GranolaErrorCode
-# Shared per-credential advisory-lock key convention (pure UUID->int64). The
-# /connect "save & test" poll holds the SAME lock the scheduler's
-# run_cycle_step holds, so a synchronous connect poll and a 5-min scheduler
-# cycle can never run the same credential concurrently (which would bypass the
-# adapter's per-note idempotency anchor and double-publish). We import only the
-# key helper, NOT run_cycle_step — that's a @DBOS.step and calling it outside a
-# launched workflow has uncertain production semantics.
-from services.granola_ingestion.scheduler import _advisory_lock_key
+from services.granola_ingestion.import_runs import (
+    get_or_create_active_import_run,
+    latest_import_run,
+    read_import_progress,
+)
+# B3 background-import dispatch + recovery. ``_advisory_lock_key`` is the shared
+# per-credential lock convention the reconfigure/reactivate/rotate mutations
+# reuse so they never run under an in-flight scheduler cycle.
+# ``_IMPORT_RECOVERY_STALE_SECONDS`` mirrors the cron backstop so a
+# /status-triggered recovery and a cron-triggered one in the same 5-min window
+# dedup to a single re-dispatch. We import only these helpers, NOT the
+# @DBOS.step/workflow bodies — calling those outside a launched workflow has
+# uncertain production semantics; dispatch goes through ``enqueue_import_workflow``.
+from services.granola_ingestion.scheduler import (
+    _IMPORT_RECOVERY_STALE_SECONDS,
+    _advisory_lock_key,
+    enqueue_import_workflow,
+    import_recovery_workflow_id,
+    import_workflow_id,
+)
 from services.vault import (
     VaultError,
     VaultErrorCode,
+    anchor_credential_watermark,
     archive_credential,
     get_credential_status,
     get_granola_credential_for_user,
@@ -354,202 +367,175 @@ async def _credential_poll_lock(pool, credential_id: UUID):
                     )
 
 
-def _first_poll_zero() -> dict:
+def _current_cycle_window() -> int:
+    """5-min window index (``unix_minute // 5``).
+
+    Mirrors :func:`routers.granola_cron._current_cycle_window` so a
+    /status-triggered import recovery and a cron-triggered one in the SAME
+    window produce the same recovery workflow id → DBOS dedups to a single
+    re-dispatch.
+    """
+    return int(datetime.now(timezone.utc).timestamp() // 60) // 5
+
+
+def _import_run_is_stale(created_at: Optional[datetime]) -> bool:
+    """True if a ``queued`` import run is old enough to assume its workflow
+    never ran / returned lock_busy (A2 strand). A fresh dispatch marks_running
+    within ~1-2s, so anything past the staleness window is recoverable."""
+    if created_at is None:
+        return True
+    return (
+        datetime.now(timezone.utc) - created_at
+    ).total_seconds() >= _IMPORT_RECOVERY_STALE_SECONDS
+
+
+async def _build_import_block(
+    *, credential_id: UUID, tenant_id: UUID, user_id: UUID
+) -> Optional[dict]:
+    """C18 ``/status`` import block: the latest run + DERIVED progress, or
+    ``None`` when the credential never had an import (forward connections +
+    pre-B3 legacy rows → the block is OMITTED). Counts come from
+    ``external_integration_runs`` (idempotent), never a stored tally.
+    """
+    latest = await latest_import_run(
+        credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
+    )
+    if latest is None:
+        return None
+    prog = await read_import_progress(
+        import_run_id=latest["id"], tenant_id=tenant_id, user_id=user_id
+    )
+    if prog is None:
+        return None
+    started = prog["started_at"]
+    finished = prog["finished_at"]
     return {
-        "notes_processed": 0,
-        "ingested": 0,
-        "deferred": 0,
-        "skipped": 0,
-        "errors": 0,
+        "import_run_id": str(latest["id"]),
+        "state": prog["state"],  # queued | running | complete | failed | cancelled
+        "total": prog["total"],  # null until the first listing → FE indeterminate (C14)
+        "done": prog["done"],
+        "deferred": prog["deferred"],
+        "skipped": prog["skipped"],
+        "errors": prog["errors"],
+        "started_at": started.isoformat() if started else None,
+        "finished_at": finished.isoformat() if finished else None,
     }
 
 
-async def _run_save_and_test(
-    *, credential_id: UUID, tenant_id: UUID, user_id: UUID, pool, trace_id
+async def _finalize_connect_with_scope(
+    *,
+    credential_id: UUID,
+    import_scope: str,
+    forward_anchor_at: datetime,
+    tenant_id: UUID,
+    user_id: UUID,
+    pool,
+    trace_id,
 ) -> dict:
-    """LOCKED-31 "save & test" first poll. Thin wrapper that converts a
-    transient advisory-lock SETUP failure (``pool.acquire`` /
-    ``pg_try_advisory_lock`` raising) into the graceful "connected, first poll
-    failed" response: the credential is already committed + active, so a
-    lock-setup blip must not 500 a retry into a spurious 409 (Codex R5 P2).
-    The locked body is :func:`_save_and_test_locked`.
+    """B3 post-store branch on ``import_scope`` (D6), replacing the retired
+    synchronous "save & test" first poll (LOCKED-31).
+
+    * ``forward``: anchor ``last_polled_at`` to the ROUTE-ENTRY timestamp (C4 —
+      captured before any awaits) so the first 5-min poll's ``created_after``
+      excludes pre-connect history. No backfill, no import run → ``import: null``.
+    * ``history`` (default): create the import run (idempotent via the
+      partial-unique) + dispatch the background import on the dedicated
+      ``GRANOLA_IMPORT_QUEUE`` under the DETERMINISTIC workflow id (C8 — a retry
+      DBOS-dedups). Return the ``import`` ACK; the workflow flips it to running.
     """
-    try:
-        return await _save_and_test_locked(
-            credential_id=credential_id,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            pool=pool,
-            trace_id=trace_id,
-        )
-    except (asyncpg.PostgresError, OSError):
-        logger.exception(
-            "granola /connect: advisory-lock setup failed (credential saved + "
-            "active; scheduler retries). credential=%s",
-            credential_id,
-        )
-        return {
-            "ok": False,
-            "status": "connected",
-            "first_poll": {**_first_poll_zero(), "errors": 1},
-            "error_code": "first_poll_failed",
-        }
-
-
-async def _save_and_test_locked(
-    *, credential_id: UUID, tenant_id: UUID, user_id: UUID, pool, trace_id
-) -> dict:
-    """LOCKED-31 "save & test" first poll, serialized against the scheduler.
-
-    Holds the SAME per-credential advisory lock the scheduler's
-    ``run_cycle_step`` holds, keyed on ``credential_id``. If a 5-min
-    scheduler cycle is already polling this credential, ``pg_try_advisory_lock``
-    fails and we skip the synchronous poll (the credential is saved + active
-    and the scheduler is already on it) — never running two concurrent cycles
-    for the same credential, which would bypass the adapter's per-note
-    idempotency anchor and double-publish (Codex R4 P2 + the LOCKED-39 race
-    the scheduler's lock exists to prevent).
-
-    Returns the /connect response body. The credential is durable + active
-    before this runs, so EVERY failure path here reports the connection's
-    real state rather than 500ing — a failed first poll just means the
-    scheduler picks it up on the next tick.
-    """
-    lock_key = _advisory_lock_key(credential_id)
-    async with pool.acquire() as lock_conn:
-        got_lock = await lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_key)
-        if not got_lock:
-            logger.info(
-                "granola /connect: scheduler holds the poll lock for credential "
-                "%s; deferring the first poll to the scheduler",
-                credential_id,
-            )
-            return {
-                "ok": True,
-                "status": "connected",
-                "first_poll": _first_poll_zero(),
-                "error_code": None,
-            }
+    if import_scope == "forward":
         try:
-            # Load (decrypt round-trip). A structured VaultError here (DB /
-            # audit / decrypt) is NOT a failed connection — the credential is
-            # committed + active — so report it like a failed first poll
-            # rather than a 500 that a retry would turn into a spurious 409.
-            try:
-                credential = await get_granola_credential_for_user(
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    caller_module=_CALLER_MODULE,
-                    pool=pool,
-                    trace_id=trace_id,
-                )
-            except VaultError:
-                logger.exception(
-                    "granola /connect: read-back failed (credential active; "
-                    "scheduler retries). tenant=%s user=%s",
-                    tenant_id, user_id,
-                )
-                return {
-                    "ok": False,
-                    "status": "connected",
-                    "first_poll": {**_first_poll_zero(), "errors": 1},
-                    "error_code": "first_poll_failed",
-                }
+            await anchor_credential_watermark(
+                pool=pool,
+                credential_id=credential_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                ts=forward_anchor_at,
+                caller_module=_CALLER_MODULE,
+                trace_id=trace_id,
+            )
+        except VaultError as exc:
+            raise _http_from_vault_error(exc)
+        return {"ok": True, "status": "connected", "import": None}
 
-            if credential is None:
-                # Saved, but get_granola_credential_for_user (active-only)
-                # returned nothing: a PRIOR scheduler cycle flipped it
-                # (revoked/error) or a concurrent /disconnect archived it.
-                # Report the real state, not a 500 (Codex R4 P2).
-                post = await _load_status_or_http(
-                    tenant_id=tenant_id, user_id=user_id, pool=pool, trace_id=trace_id
-                )
-                if post is None:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Credential was saved but could not be read back; please retry.",
-                    )
-                if post.archived_at is not None:
-                    return {
-                        "ok": False,
-                        "status": "disconnected",
-                        "first_poll": _first_poll_zero(),
-                        "error_code": (post.last_error or {}).get("error_code"),
-                    }
-                real_status = "connected" if post.status == "active" else post.status
-                return {
-                    "ok": post.status == "active",
-                    "status": real_status,
-                    "first_poll": _first_poll_zero(),
-                    "error_code": (post.last_error or {}).get("error_code"),
-                }
+    run_id, _created = await get_or_create_active_import_run(
+        credential_id=credential_id, tenant_id=tenant_id, user_id=user_id
+    )
+    await enqueue_import_workflow(
+        credential_id=credential_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        import_run_id=run_id,
+        workflow_id=import_workflow_id(credential_id, run_id),
+    )
+    return {
+        "ok": True,
+        "status": "connected",
+        "import": {
+            "import_run_id": str(run_id),
+            "state": "queued",
+            "total": None,
+            "done": 0,
+        },
+    }
 
-            # NOTE: a brand-new credential has last_polled_at=NULL, so
-            # run_one_cycle does a full-folder backfill. For design-partner
-            # folders this is fast; a very large folder could approach
-            # Railway's ~5-min edge timeout (reference_railway_proxy_timeout).
-            # The api_client bounds each request (30s + max_pages); if
-            # production shows slow first polls, Phase 2.1 can move the first
-            # poll to a dispatched DBOS workflow. LOCKED-31 mandates the
-            # synchronous one-shot for the ~2s confirmation UX.
-            try:
-                cycle = await run_one_cycle(credential=credential, pool=pool)
-            except Exception:  # noqa: BLE001 — credential is saved; never 500 the connect
-                logger.exception(
-                    "granola /connect: first poll raised (credential saved + "
-                    "active; scheduler retries). tenant=%s user=%s",
-                    tenant_id, user_id,
-                )
-                return {
-                    "ok": False,
-                    "status": "connected",
-                    "first_poll": {**_first_poll_zero(), "errors": 1},
-                    "error_code": "first_poll_failed",
-                }
 
-            outcomes = cycle.outcomes or {}
-            first_poll = {
-                "notes_processed": cycle.notes_processed,
-                "ingested": outcomes.get("success", 0),
-                "deferred": outcomes.get("deferred_pending_account", 0),
-                "skipped": outcomes.get("skipped_no_business_attendees", 0),
-                "errors": (
-                    outcomes.get("failed", 0)
-                    + outcomes.get("failed_permanent", 0)
-                    + (1 if cycle.credential_error_code else 0)
+async def _recover_history_import(
+    *, status_row, tenant_id: UUID, user_id: UUID
+) -> None:
+    """Best-effort import recovery on the /status + /connect-retry surfaces.
+
+    Closes the enqueue-atomicity gap (C8) and re-kicks a lock-busy strand (A2)
+    for an ACTIVE history credential whose watermark is still NULL (the import
+    never set it):
+
+    * no import run (crash before create/dispatch) → create + dispatch with the
+      DETERMINISTIC id (idempotent: a live dispatch DBOS-dedups);
+    * a STALE ``queued`` run (lock-busy strand / crash before dispatch) →
+      re-dispatch with a window-stamped recovery id;
+    * running / complete / failed / cancelled → no action (don't auto-retry a
+      genuinely failed import — a failed import flips the credential non-active,
+      so this guard won't fire for it).
+
+    NEVER raises — a recovery blip must not break the read / connect response.
+    """
+    cfg = status_row.config or {}
+    if (
+        status_row.status != "active"
+        or cfg.get("import_scope") != "history"
+        or status_row.last_polled_at is not None
+    ):
+        return
+    try:
+        latest = await latest_import_run(
+            credential_id=status_row.id, tenant_id=tenant_id, user_id=user_id
+        )
+        if latest is None:
+            run_id, _ = await get_or_create_active_import_run(
+                credential_id=status_row.id, tenant_id=tenant_id, user_id=user_id
+            )
+            await enqueue_import_workflow(
+                credential_id=status_row.id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                import_run_id=run_id,
+                workflow_id=import_workflow_id(status_row.id, run_id),
+            )
+        elif latest["state"] == "queued" and _import_run_is_stale(latest.get("created_at")):
+            await enqueue_import_workflow(
+                credential_id=status_row.id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                import_run_id=latest["id"],
+                workflow_id=import_recovery_workflow_id(
+                    status_row.id, latest["id"], _current_cycle_window()
                 ),
-            }
-            # Report the credential's REAL post-poll lifecycle by mirroring the
-            # adapter's credential-level branch table (Codex P3 + R3 P2): only
-            # auth failure ('revoked') and folder-not-found ('error') are
-            # terminal; every other credential error (429/5xx/timeout/parse/
-            # http) is TRANSIENT — the adapter bumps consecutive_failures but
-            # leaves status='active' until the 3-cycle threshold and the
-            # scheduler keeps retrying, so report 'connected'.
-            err = cycle.credential_error_code
-            if err == GranolaErrorCode.GRANOLA_AUTH_FAILED.value:
-                connected_status = "revoked"
-            elif err == GranolaErrorCode.GRANOLA_FOLDER_NOT_FOUND.value:
-                connected_status = "error"
-            else:
-                connected_status = "connected"
-            return {
-                "ok": err is None,
-                "status": connected_status,
-                "first_poll": first_poll,
-                "error_code": err,
-            }
-        finally:
-            # Release before the connection returns to the pool — session
-            # advisory locks persist across pool checkin (matches
-            # run_cycle_step's finally-unlock).
-            try:
-                await lock_conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
-            except Exception:  # noqa: BLE001 — unlock must not mask the poll result
-                logger.exception(
-                    "granola /connect: pg_advisory_unlock failed for credential %s",
-                    credential_id,
-                )
+            )
+    except Exception:  # noqa: BLE001 — recovery must not break the surface
+        logger.exception(
+            "granola: history-import recovery (non-fatal) failed for credential %s",
+            status_row.id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -605,41 +591,40 @@ async def validate_granola_key(body: ValidateRequest, request: Request) -> dict:
 
 @router.post("/connect")
 async def connect_granola(body: ConnectRequest, request: Request) -> dict:
-    """Store the credential, then run one synchronous test poll (LOCKED-31).
+    """Store the credential, then ACK + dispatch a background import (B3).
 
     Storage path: try :func:`store_credential` (INSERT). If a row already
     exists for ``(tenant, user, provider)`` the INSERT fails the UNIQUE
-    constraint — which covers archived rows too — so we fall through to
-    :func:`reactivate_credential` (the reconnect-after-disconnect UPDATE).
-    If reactivate reports the row is already ACTIVE, the user is already
-    connected → 409 (use /rotate or /disconnect first).
+    constraint — which covers archived rows too — so we either RECONFIGURE an
+    ACTIVE row's folders in place (C5) or :func:`reactivate_credential` an
+    ARCHIVED row.
 
-    "Save & test" (LOCKED-31): after the row is durable, we load it back
-    (exercising the full encrypt → store → decrypt round-trip) and run ONE
-    ``run_one_cycle`` synchronously so the response carries a real first-poll
-    result. The credential is active either way; the scheduler will keep
-    polling it every 5 min, so a slow or failed first poll is not fatal —
-    we surface it and move on.
+    B3 retires the synchronous "save & test" first poll (LOCKED-31, amended by
+    decision #6). After the row is durable we branch on ``import_scope`` (D6):
+
+    * ``history`` (default): create a ``granola_import_runs`` row + dispatch the
+      background import on the dedicated ``GRANOLA_IMPORT_QUEUE`` and return an
+      ``import`` ACK (``{import_run_id, state:'queued', total:null, done:0}``).
+      The 33-83 min backfill never touches this request thread (Railway ~5-min
+      cap). The mode="all" guard is LIFTED now that there's no synchronous
+      backfill.
+    * ``forward``: anchor ``last_polled_at`` to the route-ENTRY timestamp (C4),
+      run no backfill, return ``import: null``; the 5-min poll picks up new
+      meetings.
+
+    Active-row reconfigure keeps B2 behavior (update ``config.folders`` in
+    place; no new import / re-anchor — newly-added-folder backfill is the #21a
+    fast-follow). The reconfigure path doubles as a /connect-retry recovery
+    surface (C8) via :func:`_recover_history_import`.
     """
+    # C4: capture the forward-anchor timestamp at ROUTE ENTRY, BEFORE any awaits,
+    # so a meeting created during the connect round-trip isn't skipped by the
+    # forward watermark (the store/encrypt round-trip can take a beat).
+    forward_anchor_at = datetime.now(timezone.utc)
+
     ctx = get_auth_context_polling(request)
     tenant_id, user_id = _resolve_identity(ctx)
     pool = await get_asyncpg_pool()
-
-    # C10: B1's contract accepts mode="all" (watch everything), but the
-    # synchronous "save & test" first poll below (LOCKED-31 / C13; retired in
-    # B3) would try to backfill the WHOLE account inside this HTTP request and
-    # blow the Railway ~5-min request cap, and the multi-folder/"all" poll loop
-    # only lands in B2. Reject "all" here until B2 — this also stops the adapter
-    # from sending folder_id="" to Granola (a 400). The field stays in the
-    # contract so the wire shape is stable; B2 lifts this guard.
-    if body.mode == "all":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Watching all folders isn't available yet — select one or more "
-                "specific folders to connect."
-            ),
-        )
 
     # Folder-LIST config (decision #5): stores mode + import_scope + folders[]
     # AND mirrors folders[0] into the legacy singular folder_id/folder_name for
@@ -757,15 +742,22 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                     )
                 except VaultError as exc:
                     raise _http_from_vault_error(exc)
-            # Lock released → save-and-test re-acquires it for the poll, now over
-            # the reconfigured folder set.
-            return await _run_save_and_test(
-                credential_id=existing.id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                pool=pool,
-                trace_id=ctx.trace_id,
+            # A4: reconfigure keeps B2 behavior — update config.folders in place,
+            # NO new import + NO re-anchor (newly-added-folder backfill is the
+            # #21a fast-follow). This path also doubles as the /connect-retry
+            # recovery surface (C8): if a prior /connect crashed after creating
+            # the credential but before creating/dispatching its import, recover
+            # it here. Then report the connection + its current import block.
+            await _recover_history_import(
+                status_row=existing, tenant_id=tenant_id, user_id=user_id
             )
+            import_block = await _build_import_block(
+                credential_id=existing.id, tenant_id=tenant_id, user_id=user_id
+            )
+            resp: dict = {"ok": True, "status": "connected"}
+            if import_block is not None:
+                resp["import"] = import_block
+            return resp
         # Archived row → reconnect: reactivate UPDATEs in place (preserving the
         # credential UUID so EncryptionContext stays consistent), resetting
         # last_polled_at=NULL so the new folder is fully re-scanned. Serialize
@@ -811,12 +803,14 @@ async def connect_granola(body: ConnectRequest, request: Request) -> dict:
                     )
                 raise _http_from_vault_error(react_exc)
 
-    # --- Save & test (LOCKED-31): one synchronous poll, serialized against
-    # the scheduler via the shared per-credential advisory lock. Every failure
-    # path inside reports the connection's real state rather than 500ing —
-    # the credential is durable + active before this runs.
-    return await _run_save_and_test(
+    # B3: the credential is durable + active (new INSERT or reactivated archived
+    # row). Branch on import_scope (D6): history → create + dispatch the
+    # background import and return the ACK; forward → anchor the route-entry
+    # watermark (no backfill) and return import:null.
+    return await _finalize_connect_with_scope(
         credential_id=credential_id,
+        import_scope=body.import_scope,
+        forward_anchor_at=forward_anchor_at,
         tenant_id=tenant_id,
         user_id=user_id,
         pool=pool,
@@ -885,12 +879,17 @@ async def rotate_granola_key(body: RotateRequest, request: Request) -> dict:
 
 @router.get("/status")
 async def granola_status(request: Request) -> dict:
-    """Connection health + 7-day activity. Never decrypts the key.
+    """Connection health + 7-day activity + import progress. Never decrypts the key.
 
     Returns ``connected=False`` when there's no credential or it's archived
     (the frontend shows the connect wizard); otherwise ``connected=True``
     with the real ``status`` (active / revoked / error) so the UI can render
-    the right banner, plus the chosen folder and a 7-day activity rollup.
+    the right banner, the watched folders, a 7-day activity rollup, and — for a
+    history connection with a background import — an ``import`` block (C18) the
+    FE polls (indeterminate until ``total`` is known, then "N of M"; stops on a
+    terminal state). The block is OMITTED for forward connections + pre-B3
+    legacy credentials (no import run). /status also best-effort recovers a
+    stuck import (C8 + A2) while the connect screen is open.
     """
     ctx = get_auth_context_polling(request)
     tenant_id, user_id = _resolve_identity(ctx)
@@ -911,6 +910,14 @@ async def granola_status(request: Request) -> dict:
             "folder": None,  # legacy singular mirror (one release) — null when disconnected
             "last_error": None,
         }
+
+    # C8 + A2: recover a stuck history import (no run after a crash, or a
+    # lock-busy strand) while the connect screen is open — the instant half of
+    # the founder-approved "both surfaces" recovery (the 5-min cron is the
+    # headless backstop). Self-gates + best-effort (never raises).
+    await _recover_history_import(
+        status_row=status_row, tenant_id=tenant_id, user_id=user_id
+    )
 
     activity = await _activity_counts_7d(pool=pool, tenant_id=tenant_id, user_id=user_id)
     # Array-shaped folders (B1, decision #5). Read the canonical config.folders;
@@ -934,7 +941,12 @@ async def granola_status(request: Request) -> dict:
         if folders_cfg
         else None
     )
-    return {
+    # C18: the import block (latest run + DERIVED progress). Omitted when the
+    # credential never had an import (forward + pre-B3 legacy rows).
+    import_block = await _build_import_block(
+        credential_id=status_row.id, tenant_id=tenant_id, user_id=user_id
+    )
+    resp = {
         "connected": True,
         "status": status_row.status,
         "last_polled_at": (
@@ -942,6 +954,7 @@ async def granola_status(request: Request) -> dict:
         ),
         "activity": activity,
         "mode": cfg.get("mode", "folders"),
+        "import_scope": cfg.get("import_scope"),  # "history" | "forward" | None (legacy)
         "folders": [
             {"id": f["id"], "name": f.get("name"), "status": f.get("status", "ok")}
             for f in folders_cfg
@@ -949,6 +962,9 @@ async def granola_status(request: Request) -> dict:
         "folder": legacy_folder,
         "last_error": status_row.last_error,
     }
+    if import_block is not None:
+        resp["import"] = import_block
+    return resp
 
 
 @router.delete("", status_code=status.HTTP_200_OK)
