@@ -121,8 +121,6 @@ _IMPORT_RECOVERY_LIMIT = 50
 # the allowlist already includes ``"services.granola_ingestion.scheduler"``.
 _CALLER_MODULE = "services.granola_ingestion.scheduler"
 
-_PROVIDER = "granola"
-
 # Explicit retry budget for list_active_credentials (Codex PR-#28 R1 P2).
 # The cron handler calls it OUTSIDE a workflow context, so a @DBOS.step
 # decorator's retry semantics would not fire — retries must be explicit.
@@ -222,7 +220,7 @@ class RecoverableImport:
 # per credential via set_tenant_guc, so tenant isolation holds from there.
 _LIST_ACTIVE_CREDENTIALS_SQL = """
 SELECT id, tenant_id, user_id
-FROM vault.list_active_credentials_xt($1)
+FROM vault.list_active_credentials_xt()
 """
 
 
@@ -268,7 +266,7 @@ async def list_active_credentials() -> list[CredentialMetadata]:
         try:
             pool = await get_asyncpg_pool()
             async with pool.acquire() as conn:
-                rows = await conn.fetch(_LIST_ACTIVE_CREDENTIALS_SQL, _PROVIDER)
+                rows = await conn.fetch(_LIST_ACTIVE_CREDENTIALS_SQL)
             return [
                 CredentialMetadata(
                     id=row["id"],

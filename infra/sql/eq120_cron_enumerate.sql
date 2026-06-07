@@ -20,7 +20,10 @@
 -- (Phase C step 0). Idempotent (CREATE OR REPLACE + IF EXISTS guards). Same file is
 -- safe in dev (the eqprod_transcription GRANT is skipped when the role is absent).
 
-CREATE OR REPLACE FUNCTION vault.list_active_credentials_xt(p_provider text)
+-- Granola-specific by design (Codex review P2): a SECURITY DEFINER cross-tenant
+-- enumerator should not accept an arbitrary provider string. The only caller is the
+-- Granola cron, so the provider is hardcoded rather than parameterized.
+CREATE OR REPLACE FUNCTION vault.list_active_credentials_xt()
 RETURNS TABLE (id uuid, tenant_id uuid, user_id uuid)
 LANGUAGE sql
 STABLE
@@ -29,7 +32,7 @@ SET search_path = pg_catalog, vault, public
 AS $fn$
   SELECT id, tenant_id, user_id
   FROM vault.user_credentials
-  WHERE provider = p_provider
+  WHERE provider = 'granola'
     AND status = 'active'
     AND archived_at IS NULL
   ORDER BY id ASC
@@ -61,19 +64,24 @@ AS $fn$
   LIMIT p_limit
 $fn$;
 
-ALTER FUNCTION vault.list_active_credentials_xt(text) OWNER TO neondb_owner;
-ALTER FUNCTION vault.list_uninitialized_granola_creds_xt(integer) OWNER TO neondb_owner;
-
-REVOKE ALL ON FUNCTION vault.list_active_credentials_xt(text) FROM PUBLIC;
+-- REVOKE from PUBLIC is always safe (no role dependency).
+REVOKE ALL ON FUNCTION vault.list_active_credentials_xt() FROM PUBLIC;
 REVOKE ALL ON FUNCTION vault.list_uninitialized_granola_creds_xt(integer) FROM PUBLIC;
 
--- Grant EXECUTE to the prod service role only when it exists (prod). In dev the
--- owner connection runs the function directly, so no grant is needed there.
-DO $grant$
+-- Owner + grant are role-dependent (Codex review P2): guard each on role existence so
+-- this file applies cleanly anywhere. In our envs both roles exist (neondb_owner is the
+-- Neon DB owner — required as the SECURITY DEFINER owner so the function bypasses RLS;
+-- eqprod_transcription is the prod-only service role). In dev the owner connection runs
+-- the functions directly, so the eqprod_transcription grant is simply skipped.
+DO $perms$
 BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'neondb_owner') THEN
+    ALTER FUNCTION vault.list_active_credentials_xt() OWNER TO neondb_owner;
+    ALTER FUNCTION vault.list_uninitialized_granola_creds_xt(integer) OWNER TO neondb_owner;
+  END IF;
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'eqprod_transcription') THEN
-    GRANT EXECUTE ON FUNCTION vault.list_active_credentials_xt(text) TO eqprod_transcription;
+    GRANT EXECUTE ON FUNCTION vault.list_active_credentials_xt() TO eqprod_transcription;
     GRANT EXECUTE ON FUNCTION vault.list_uninitialized_granola_creds_xt(integer) TO eqprod_transcription;
   END IF;
 END
-$grant$;
+$perms$;
