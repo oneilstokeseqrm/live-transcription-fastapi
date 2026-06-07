@@ -5,3 +5,7 @@ config:
   #   pulumi config set --secret eq-live-transcription-prod:cron_secret <INTERNAL_CRON_SECRET>
   # Until granola_cron_endpoint is set, only the S3 upload bucket is provisioned
   # (Phase B applies S3 only; the EventBridge poll chain rides Phase D).
+
+  eq-live-transcription-prod:granola_cron_endpoint: https://live-transcription-production-032c.up.railway.app/internal/granola/cron-tick
+  eq-live-transcription-prod:cron_secret:
+    secure: AAABACId5DqnFgYO0ApAKxhBIFLmqzAvZIuHMyqnbLAPElzxyy9IqpTGFS3zgTKj1jvJquEb6upZi6R3NDqh2/4AswNapTTYz0+Q2h6UnFY=
