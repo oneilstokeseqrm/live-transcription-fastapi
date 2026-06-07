@@ -1,0 +1,10 @@
+name: eq-live-transcription-prod
+runtime:
+  name: python
+  options:
+    virtualenv: venv
+description: >-
+  Per-service prod AWS IaC for live-transcription-fastapi (EQ-120): S3 upload
+  bucket + Granola EventBridge self-poll chain, deployed keylessly via the
+  eq-prod-deploy OIDC role. IAM user/key + KMS key policy are admin-path
+  (see infra/README.md).
