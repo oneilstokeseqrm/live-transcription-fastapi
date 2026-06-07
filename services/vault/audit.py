@@ -33,6 +33,8 @@ from uuid import UUID
 import asyncpg
 import asyncpg.pool
 
+from services.tenant_scope import scoped_acquire
+
 from .errors import VaultError, VaultErrorCode
 
 logger = logging.getLogger(__name__)
@@ -149,9 +151,13 @@ async def write_audit_row(
 
     Returns the new audit row's UUID. Raises ``VaultError`` with code
     ``VAULT_AUDIT_LOG_WRITE_FAILED`` on any DB error.
+
+    EQ-120: ``vault.credential_access_log`` is RLS-armed in prod, so the
+    fresh-connection insert runs inside a tenant-scoped transaction
+    (``scoped_acquire`` sets ``app.tenant_id`` first, is_local).
     """
     try:
-        async with pool.acquire() as conn:
+        async with scoped_acquire(pool, tenant_id) as conn:
             return await write_audit_row_on_conn(
                 conn=conn,
                 credential_id=credential_id,

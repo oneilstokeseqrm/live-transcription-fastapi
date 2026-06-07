@@ -81,6 +81,7 @@ from services.pending_account_mappings import (
     reopen_archived_entry,
     upsert_queue_entry,
 )
+from services.tenant_scope import scoped_acquire, tenant_session
 
 # Defer the vault import so this module is loadable in environments where
 # the cryptography wheel isn't installed (some local dev .venvs). The
@@ -707,9 +708,11 @@ async def _classify_and_resolve(
         business_domains.append(att.domain)
 
     # Second pass: resolve domain → account_id for each business domain.
+    # EQ-120: tenant_session pins app.tenant_id for the txn so the RLS-armed
+    # account_domains read (lookup_account_by_domain) doesn't fail closed in prod.
     domain_to_account: dict[str, str] = {}
     if business_domains:
-        async with get_async_session() as session:
+        async with tenant_session(tenant_id) as session:
             for domain in business_domains:
                 account_id = await lookup_account_by_domain(
                     session=session, tenant_id=str(tenant_id), domain=domain
@@ -1635,7 +1638,10 @@ async def _resolve_known_account_contacts(
         return []
     seen: set[str] = set()
     resolved: list[ResolvedContactRow] = []
-    async with get_async_session() as session:
+    # EQ-120: tenant_session pins app.tenant_id and OWNS the transaction
+    # (commits at block exit) so the RLS-armed contacts find-or-create doesn't
+    # fail closed in prod. The prior explicit session.commit() is dropped.
+    async with tenant_session(str(credential.tenant_id)) as session:
         for att in known:
             email_norm = (att.email or "").strip().lower()
             if not email_norm or email_norm in seen:
@@ -1664,7 +1670,6 @@ async def _resolve_known_account_contacts(
                     email_norm, row.account_id, att.account_id,
                 )
             resolved.append(row)
-        await session.commit()
     return resolved
 
 
@@ -1957,7 +1962,9 @@ async def _credential_is_active(
     lock-free caller; that's tracked as a defense-in-depth follow-up, not a
     reachable bug today.
     """
-    async with pool.acquire() as conn:
+    # EQ-120: scoped_acquire pins app.tenant_id (is_local) so the RLS-armed
+    # vault.user_credentials liveness probe doesn't fail closed in prod.
+    async with scoped_acquire(pool, tenant_id) as conn:
         return bool(
             await conn.fetchval(
                 _CREDENTIAL_IS_ACTIVE_SQL, credential_id, tenant_id, user_id
@@ -2326,7 +2333,9 @@ async def _mark_credential_polled_success(
     per-folder statuses (config.folders[].status) persist — the success update
     wipes last_error every cycle, so per-folder status cannot live there.
     """
-    async with pool.acquire() as conn:
+    # EQ-120: scoped_acquire pins app.tenant_id (is_local) so the RLS-armed
+    # vault.user_credentials write doesn't fail closed in prod.
+    async with scoped_acquire(pool, credential.tenant_id) as conn:
         if updated_config is not None:
             await conn.execute(
                 _UPDATE_CREDENTIAL_POLL_SUCCESS_WITH_CONFIG_SQL,
@@ -2399,7 +2408,9 @@ async def _set_credential_status(
         "message": message,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
     }
-    async with pool.acquire() as conn:
+    # EQ-120: scoped_acquire pins app.tenant_id (is_local) so the RLS-armed
+    # vault.user_credentials write doesn't fail closed in prod.
+    async with scoped_acquire(pool, credential.tenant_id) as conn:
         await conn.execute(
             _UPDATE_CREDENTIAL_STATUS_SQL,
             credential.id,
@@ -2423,7 +2434,9 @@ async def _record_credential_transient_failure(
         "message": message,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
     }
-    async with pool.acquire() as conn:
+    # EQ-120: scoped_acquire pins app.tenant_id (is_local) so the RLS-armed
+    # vault.user_credentials write doesn't fail closed in prod.
+    async with scoped_acquire(pool, credential.tenant_id) as conn:
         row = await conn.fetchrow(
             _INCREMENT_CREDENTIAL_FAILURES_SQL,
             credential.id,

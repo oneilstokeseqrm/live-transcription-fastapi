@@ -23,6 +23,7 @@ from sqlalchemy import text
 from models.enrichment_models import ResolvedContact, EnrichmentResult
 from models.participant_spec import ParticipantSpec
 from services.database import get_async_session
+from services.tenant_scope import tenant_session
 from services.domain_classification import (
     DomainClass,
     classify_domain,
@@ -274,7 +275,9 @@ class TranscriptEnrichmentService:
                     continue
 
                 # BUSINESS domain — look up the account for this domain.
-                async with get_async_session() as session:
+                # EQ-120: tenant_session pins app.tenant_id for the txn so the
+                # RLS-armed account_domains read doesn't fail closed in prod.
+                async with tenant_session(tenant_id) as session:
                     resolved_account_id = await lookup_account_by_domain(
                         session=session,
                         tenant_id=tenant_id,
@@ -562,7 +565,10 @@ class TranscriptEnrichmentService:
                 if tavily_name:
                     first_name, last_name = tavily_name
 
-        async with get_async_session() as session:
+        # EQ-120: tenant_session pins app.tenant_id and OWNS the transaction
+        # (commits at block exit) so the RLS-armed contacts read/write doesn't
+        # fail closed in prod. The two explicit session.commit() calls are dropped.
+        async with tenant_session(tenant_id) as session:
             # Try to find existing contact
             result = await session.execute(
                 text("""
@@ -596,7 +602,8 @@ class TranscriptEnrichmentService:
                         ),
                         params,
                     )
-                    await session.commit()
+                    # EQ-120: tenant_session owns the transaction; it commits at
+                    # block exit. Explicit commit removed.
 
                 existing_name = _build_full_name(
                     row["first_name"] or first_name,
@@ -665,7 +672,8 @@ class TranscriptEnrichmentService:
                     session, tid, new_id, "name_unresolvable"
                 )
 
-            await session.commit()
+            # EQ-120: tenant_session owns the transaction; it commits at block
+            # exit. Explicit commit removed.
 
             return {
                 "contact_id": str(new_id),

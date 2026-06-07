@@ -26,6 +26,7 @@ from models.db_models import (
     RiskSeverityDBEnum,
 )
 from services.database import get_async_session
+from services.tenant_scope import tenant_session
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +269,11 @@ Do not invent or assume information not stated."""
             account_id: Optional account identifier.
             interaction_timestamp: When the interaction occurred.
         """
-        async with get_async_session() as session:
+        # EQ-120: scope to the tenant — interaction_summary_entries + interaction_insights
+        # are strict (tenant_isolation + FORCE), so under the non-owner prod role these
+        # ORM writes fail closed without app.tenant_id. tenant_session owns the tx
+        # (commits on block exit, rolls back on exception) — no manual commit/rollback below.
+        async with tenant_session(tenant_id) as session:
             try:
                 # Look up persona ID
                 persona_id = await self._get_persona_id(session, persona_code)
@@ -407,16 +412,14 @@ Do not invent or assume information not stated."""
                     )
                     session.add(insight)
                 
-                # Commit all in single transaction
-                await session.commit()
-                
+                # tenant_session owns the transaction; it commits on block exit.
                 logger.info(
                     f"Persisted intelligence: interaction_id={interaction_id}, "
                     f"summaries=5, insights={len(analysis.action_items) + len(analysis.decisions) + len(analysis.risks) + len(analysis.key_takeaways) + len(analysis.product_feedback) + len(analysis.market_intelligence)}"
                 )
                 
             except Exception as e:
-                await session.rollback()
+                # tenant_session rolls back on exception; just log + re-raise.
                 logger.error(
                     f"Database persistence failed: interaction_id={interaction_id}, "
                     f"error={str(e)}",

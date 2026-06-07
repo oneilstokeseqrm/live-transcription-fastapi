@@ -40,7 +40,7 @@ from services.account_provisioning.types import (
     MaterializationResult,
     UnmappedInteractionTypeError,
 )
-from services.database import get_async_session
+from services.tenant_scope import tenant_session
 
 logger = logging.getLogger(__name__)
 
@@ -380,7 +380,10 @@ async def fetch_interactions_for_emit(
         return []
 
     interactions: list[InteractionForEmit] = []
-    async with get_async_session() as session:
+    # EQ-120: tenant_session pins app.tenant_id for the txn so the RLS-armed
+    # contacts JOIN (SELECT_CONTACTS_FOR_INTERACTION_SQL) doesn't fail closed in
+    # prod. Read-only path; the block commits the empty read txn at exit.
+    async with tenant_session(materialization.tenant_id) as session:
         rows = (
             await session.execute(
                 SELECT_INTERACTIONS_FOR_EMIT_SQL,

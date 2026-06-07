@@ -53,6 +53,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
 from services.database import get_async_session
+from services.tenant_scope import tenant_session
 from services.queue_authorization import can_act_on_queue_entry
 from utils.context_utils import get_auth_context_polling
 from services.account_provisioning.eventbridge_emit import (
@@ -618,109 +619,113 @@ async def map_entry(queue_id: str, body: MapRequest, request: Request):
 
     is_replay = False  # set in the 0-row branch when this is a replay
 
-    async with get_async_session() as session:
-        async with session.begin():
-            await _load_and_authorize(
-                session, queue_id,
-                tenant_id=ctx.tenant_id,
-                user_id=_effective_user_id(ctx),
-            )
+    # EQ-120: tenant_session pins app.tenant_id and OWNS the transaction
+    # (commits on clean exit, rolls back on exception — same as the prior
+    # session.begin()) so the RLS-armed accounts read + contacts read/write
+    # below (SELECT_ACCOUNT_FOR_TENANT_SQL, _materialization_for_replay,
+    # materialize_account_approval) don't fail closed in prod.
+    async with tenant_session(ctx.tenant_id) as session:
+        await _load_and_authorize(
+            session, queue_id,
+            tenant_id=ctx.tenant_id,
+            user_id=_effective_user_id(ctx),
+        )
 
-            # P1 #1: tenant-scoped account lookup. Returning 404 (not 403)
-            # on cross-tenant accounts mirrors the cross-tenant queue
-            # behaviour: don't leak existence across tenants.
-            acct_result = await session.execute(
-                SELECT_ACCOUNT_FOR_TENANT_SQL,
-                {"account_id": body.account_id, "tenant_id": ctx.tenant_id},
+        # P1 #1: tenant-scoped account lookup. Returning 404 (not 403)
+        # on cross-tenant accounts mirrors the cross-tenant queue
+        # behaviour: don't leak existence across tenants.
+        acct_result = await session.execute(
+            SELECT_ACCOUNT_FOR_TENANT_SQL,
+            {"account_id": body.account_id, "tenant_id": ctx.tenant_id},
+        )
+        if acct_result.one_or_none() is None:
+            logger.info(
+                "Map blocked: account_id=%s not in tenant=%s (or does not exist)",
+                body.account_id, ctx.tenant_id,
             )
-            if acct_result.one_or_none() is None:
-                logger.info(
-                    "Map blocked: account_id=%s not in tenant=%s (or does not exist)",
-                    body.account_id, ctx.tenant_id,
-                )
-                raise HTTPException(status_code=404, detail="Account not found")
+            raise HTTPException(status_code=404, detail="Account not found")
 
-            # P2 #3: idempotency reservation. The UPDATE WHERE clause is:
-            #   archived_at IS NULL
-            #   AND (approval_attempt_id IS NULL OR = :attempt_id)
-            # A first-attempt OR same-attempt_id replay passes through.
-            # Different attempt_id → 0 rows → re-SELECT to discriminate.
-            reserve = await session.execute(
-                MAP_RESERVE_SQL,
-                {"queue_id": queue_id, "attempt_id": body.approval_attempt_id},
+        # P2 #3: idempotency reservation. The UPDATE WHERE clause is:
+        #   archived_at IS NULL
+        #   AND (approval_attempt_id IS NULL OR = :attempt_id)
+        # A first-attempt OR same-attempt_id replay passes through.
+        # Different attempt_id → 0 rows → re-SELECT to discriminate.
+        reserve = await session.execute(
+            MAP_RESERVE_SQL,
+            {"queue_id": queue_id, "attempt_id": body.approval_attempt_id},
+        )
+        if reserve.one_or_none() is None:
+            # 0 rows — re-SELECT to discriminate.
+            current_result = await session.execute(
+                SELECT_QUEUE_SQL, {"queue_id": queue_id},
             )
-            if reserve.one_or_none() is None:
-                # 0 rows — re-SELECT to discriminate.
-                current_result = await session.execute(
-                    SELECT_QUEUE_SQL, {"queue_id": queue_id},
-                )
-                current = current_result.one_or_none()
-                if current is None:
-                    raise HTTPException(status_code=404, detail="Queue entry not found")
+            current = current_result.one_or_none()
+            if current is None:
+                raise HTTPException(status_code=404, detail="Queue entry not found")
 
-                # Codex Round 4 P2 #3: replay-success requires ALL THREE
-                # of (status='mapped', resolved_account_id matches request,
-                # AND approval_attempt_id matches request). Pre-fix the
-                # attempt_id was not checked, so Bob retrying Alice's
-                # earlier-failed /map with Bob's own attempt_id but the
-                # same account_id falsely received 200 — as if Bob's call
-                # drove the map. Per the idempotency contract, only the
-                # SAME attempt_id should get 200; a different attempt_id
-                # on an already-mapped row is a different intent → 409.
-                if (current.status == "mapped"
-                        and current.resolved_account_id == body.account_id
-                        and current.approval_attempt_id == body.approval_attempt_id):
-                    # Codex P1 2026-05-16: replay must re-attempt
-                    # emission. The ORIGINAL /map may have committed
-                    # materialization then failed at emit (transient
-                    # EventBridge outage). Without a re-attempt,
-                    # downstream consumers would never see the event
-                    # even though the API reports success.
-                    # Reconstruct the MaterializationResult from DB
-                    # state (queue's signals + mapped account) and
-                    # re-emit. At-least-once + consumer MERGE = dedup.
-                    materialization = await _materialization_for_replay(
-                        session=session,
-                        queue_id=queue_id,
-                        tenant_id=ctx.tenant_id,
-                        account_id=body.account_id,
-                    )
-                    # Defer the actual emit + return to the post-txn
-                    # block at the bottom of the route. Marker:
-                    # the only way ``materialization`` is set without
-                    # going through reservation is the replay branch.
-                    is_replay = True
-                else:
-                    # Codex Round 3 P1 #1 + Round 4 P2 #3: explicit
-                    # conflict messaging. /map only operates on pending
-                    # entries with a matching attempt_id for replay.
-                    # Approved entries are owned by the workflow;
-                    # mapped entries with a different attempt_id signal
-                    # a different caller intent.
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Map conflict: queue entry is in status='{current.status}' "
-                            f"with a different approval_attempt_id or resolved_account_id "
-                            f"recorded. /map only operates on pending entries; mapped "
-                            f"entries replay successfully ONLY when the same "
-                            f"approval_attempt_id + account_id are presented. Reload and "
-                            f"retry."
-                        ),
-                    )
-            else:
-                # Reservation succeeded — inline-materialize.
-                # UPDATE_QUEUE_SQL inside materialize_account_approval
-                # sets status='mapped' + resolved_account_id. The
-                # context manager auto-commits on clean exit (or rolls
-                # back if materialize_account_approval raises).
-                materialization = await materialize_account_approval(
+            # Codex Round 4 P2 #3: replay-success requires ALL THREE
+            # of (status='mapped', resolved_account_id matches request,
+            # AND approval_attempt_id matches request). Pre-fix the
+            # attempt_id was not checked, so Bob retrying Alice's
+            # earlier-failed /map with Bob's own attempt_id but the
+            # same account_id falsely received 200 — as if Bob's call
+            # drove the map. Per the idempotency contract, only the
+            # SAME attempt_id should get 200; a different attempt_id
+            # on an already-mapped row is a different intent → 409.
+            if (current.status == "mapped"
+                    and current.resolved_account_id == body.account_id
+                    and current.approval_attempt_id == body.approval_attempt_id):
+                # Codex P1 2026-05-16: replay must re-attempt
+                # emission. The ORIGINAL /map may have committed
+                # materialization then failed at emit (transient
+                # EventBridge outage). Without a re-attempt,
+                # downstream consumers would never see the event
+                # even though the API reports success.
+                # Reconstruct the MaterializationResult from DB
+                # state (queue's signals + mapped account) and
+                # re-emit. At-least-once + consumer MERGE = dedup.
+                materialization = await _materialization_for_replay(
                     session=session,
-                    tenant_id=ctx.tenant_id,
                     queue_id=queue_id,
+                    tenant_id=ctx.tenant_id,
                     account_id=body.account_id,
-                    event_type="account_mapped",
                 )
+                # Defer the actual emit + return to the post-txn
+                # block at the bottom of the route. Marker:
+                # the only way ``materialization`` is set without
+                # going through reservation is the replay branch.
+                is_replay = True
+            else:
+                # Codex Round 3 P1 #1 + Round 4 P2 #3: explicit
+                # conflict messaging. /map only operates on pending
+                # entries with a matching attempt_id for replay.
+                # Approved entries are owned by the workflow;
+                # mapped entries with a different attempt_id signal
+                # a different caller intent.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Map conflict: queue entry is in status='{current.status}' "
+                        f"with a different approval_attempt_id or resolved_account_id "
+                        f"recorded. /map only operates on pending entries; mapped "
+                        f"entries replay successfully ONLY when the same "
+                        f"approval_attempt_id + account_id are presented. Reload and "
+                        f"retry."
+                    ),
+                )
+        else:
+            # Reservation succeeded — inline-materialize.
+            # UPDATE_QUEUE_SQL inside materialize_account_approval
+            # sets status='mapped' + resolved_account_id. The
+            # context manager auto-commits on clean exit (or rolls
+            # back if materialize_account_approval raises).
+            materialization = await materialize_account_approval(
+                session=session,
+                tenant_id=ctx.tenant_id,
+                queue_id=queue_id,
+                account_id=body.account_id,
+                event_type="account_mapped",
+            )
 
     # Emit downstream EnvelopeV1 events for the backfilled interactions
     # AFTER the route's transaction commits (so emission failures cannot

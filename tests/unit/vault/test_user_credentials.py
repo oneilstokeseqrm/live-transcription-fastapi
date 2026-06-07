@@ -436,8 +436,14 @@ class TestStoreCredential:
         # through the spy (which is monkeypatched, so no real acquire).
         fake_pool.acquire.assert_called_once()
         cred_conn = fake_pool._acquired_conns[0]
-        cred_conn.execute.assert_awaited_once()
-        execute_args = cred_conn.execute.await_args.args
+        # EQ-120: two execute() awaits now — set_config (GUC) FIRST, then INSERT,
+        # both inside the one tenant-scoped transaction.
+        assert cred_conn.execute.await_count == 2
+        guc_call, insert_call = cred_conn.execute.await_args_list
+        # (strengthened) the tenant GUC is pinned first, in-txn, for this tenant.
+        assert guc_call.args[0] == "SELECT set_config('app.tenant_id', $1, true)"
+        assert guc_call.args[1] == str(tenant_id)
+        execute_args = insert_call.args
         assert "INSERT INTO vault.user_credentials" in execute_args[0]
         assert execute_args[1] == new_id
         assert execute_args[2] == tenant_id
@@ -478,7 +484,18 @@ class TestStoreCredential:
         self, fake_pool: MagicMock, audit_spy: AsyncMock, encrypt_spy: MagicMock
     ):
         cred_conn = _make_fake_conn()
-        cred_conn.execute = AsyncMock(side_effect=RuntimeError("unique violation"))
+
+        # EQ-120: the GUC set_config now runs FIRST on cred_conn; only the
+        # INSERT must fail here (a blanket side_effect would trip set_config and
+        # mis-classify as DB_QUERY_FAILED instead of DB_INSERT_FAILED). Let the
+        # GUC succeed, raise only on the user_credentials INSERT — preserving
+        # this test's intent: an INSERT failure → VAULT_DB_INSERT_FAILED.
+        async def _execute(sql, *args, **kwargs):
+            if "INSERT INTO vault.user_credentials" in sql:
+                raise RuntimeError("unique violation")
+            return "OK"
+
+        cred_conn.execute = AsyncMock(side_effect=_execute)
         _configure_pool_to_yield(fake_pool, [cred_conn])
 
         with pytest.raises(VaultError) as exc_info:
@@ -585,8 +602,13 @@ class TestStoreAtomicityAndOrdering:
         cred_conn.fetchrow = AsyncMock(return_value=None)
         cred_conn._transactions = []  # type: ignore[attr-defined]
 
-        async def _trace_execute(*_args, **_kw):
-            call_order.append("credential_insert")
+        async def _trace_execute(sql, *_args, **_kw):
+            # EQ-120: distinguish the GUC set_config (runs first, in-txn) from
+            # the credential INSERT so the ordering assertion stays precise.
+            if "set_config('app.tenant_id'" in sql:
+                call_order.append("set_tenant_guc")
+            else:
+                call_order.append("credential_insert")
             return "INSERT 0 1"
 
         cred_conn.execute = AsyncMock(side_effect=_trace_execute)
@@ -609,9 +631,17 @@ class TestStoreAtomicityAndOrdering:
             pool=fake_pool,
         )
 
-        # Order must be: INSERT → audit → commit
-        assert call_order == ["credential_insert", "audit", "credential_commit"], (
-            f"audit must commit BEFORE credential commit; got {call_order}"
+        # EQ-120: the tenant GUC is pinned FIRST (in-txn), then INSERT → audit →
+        # commit. The load-bearing invariant is unchanged: audit completes
+        # BEFORE the credential transaction commits.
+        assert call_order == [
+            "set_tenant_guc",
+            "credential_insert",
+            "audit",
+            "credential_commit",
+        ], (
+            f"GUC must be set first and audit must commit BEFORE credential "
+            f"commit; got {call_order}"
         )
 
     @pytest.mark.asyncio

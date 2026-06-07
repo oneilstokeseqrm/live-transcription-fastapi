@@ -88,6 +88,13 @@ class _FakeConn:
         self.fetch_calls: list[tuple[str, tuple]] = []
         self.fetchval_calls: list[tuple[str, tuple]] = []
 
+    def transaction(self) -> "_FakeTxnCM":
+        # EQ-120: scoped_acquire / set_tenant_guc now open an explicit asyncpg
+        # transaction around every RLS-scoped statement. The fake transaction is
+        # a no-op context manager yielding this same conn, so the set_config
+        # GUC execute + the real statement are still recorded on execute_calls.
+        return _FakeTxnCM(self)
+
     async def execute(self, sql: str, *args: Any) -> str:
         self.execute_calls.append((sql, args))
         return "OK"
@@ -111,6 +118,25 @@ class _FakeConn:
                 return None
             return self.fetchval_seq.pop(0)
         return self.fetchval_returns
+
+
+class _FakeTxnCM:
+    """No-op stand-in for ``asyncpg.Connection.transaction()``.
+
+    EQ-120's ``scoped_acquire`` / ``set_tenant_guc`` open an explicit
+    transaction around RLS-scoped work. The fake yields the same conn so the
+    ``SELECT set_config('app.tenant_id', ...)`` GUC execute and the real
+    statement are still appended to ``execute_calls``/``fetch*_calls``.
+    """
+
+    def __init__(self, conn: _FakeConn) -> None:
+        self.conn = conn
+
+    async def __aenter__(self) -> _FakeConn:
+        return self.conn
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        return False
 
 
 class _FakeAcquireCM:
@@ -432,15 +458,17 @@ async def test_scenario_a_calls_text_clean_with_credential_tenant_id():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session") as get_sess, \
+         patch.object(adapter, "tenant_session") as tenant_sess, \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
 
-        # get_async_session is used in _classify_and_resolve for the
-        # per-domain account lookups; provide a contextmanager mock.
+        # EQ-120: _classify_and_resolve now opens tenant_session (RLS-scoped)
+        # for the per-domain account lookups; provide a contextmanager mock.
         sess_cm = MagicMock()
         sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
         sess_cm.__aexit__ = AsyncMock(return_value=None)
         get_sess.return_value = sess_cm
+        tenant_sess.return_value = sess_cm
 
         outcome = await adapter.process_note(
             credential=credential,  # type: ignore[arg-type]
@@ -482,6 +510,7 @@ async def test_scenario_a_records_success_row_in_external_integration_runs():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session") as get_sess, \
+         patch.object(adapter, "tenant_session") as tenant_sess, \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(return_value=text_clean_service.ProcessResult(
              interaction_id="00000000-0000-4000-8000-000000000002",
@@ -490,6 +519,7 @@ async def test_scenario_a_records_success_row_in_external_integration_runs():
         sess_cm.__aenter__ = AsyncMock(return_value=MagicMock())
         sess_cm.__aexit__ = AsyncMock(return_value=None)
         get_sess.return_value = sess_cm
+        tenant_sess.return_value = sess_cm
 
         await adapter.process_note(
             credential=credential,  # type: ignore[arg-type]
@@ -558,6 +588,7 @@ async def test_scenario_a_with_mixed_attendees_queues_signals_for_unknowns():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(side_effect=_lookup)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "reopen_archived_entry", new=AsyncMock(side_effect=_reopen)), \
          patch.object(adapter, "upsert_queue_entry", new=AsyncMock(side_effect=_upsert)), \
@@ -618,6 +649,7 @@ async def test_scenario_c_records_deferred_with_snapshot():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "reopen_archived_entry", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "upsert_queue_entry", new=AsyncMock(return_value="11111111-bbbb-4111-8111-111111111111")), \
@@ -1008,6 +1040,7 @@ async def test_reprocess_deferred_note_recovers_from_snapshot_when_404():
     # Now the domain unknown-co.com IS known.
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="55555555-aaaa-4111-8111-555555555555")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
         count = await adapter.reprocess_deferred_notes(
@@ -1144,6 +1177,7 @@ async def test_reprocess_pending_notes_retries_failed_rows():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="44444444-aaaa-4111-8111-444444444444")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(return_value=text_clean_service.ProcessResult(
              interaction_id="00000000-0000-4000-8000-0000000000bb",
@@ -1237,6 +1271,7 @@ async def test_scenario_a_writes_in_progress_row_before_publish():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
         outcome = await adapter.process_note(
@@ -1307,6 +1342,7 @@ async def test_scenario_a_retry_reuses_existing_interaction_id():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock(side_effect=_fake_process)):
         await adapter.process_note(
@@ -1365,6 +1401,7 @@ async def test_scenario_a_backpressure_failures_converge_to_failed_permanent():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "try_reserve_lane2_slot", return_value=False):
 
@@ -1416,6 +1453,7 @@ async def test_reprocess_pending_failed_row_classifies_to_scenario_c_defers():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "reopen_archived_entry", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "upsert_queue_entry", new=AsyncMock(return_value="11111111-bbbb-4111-8111-111111111111")), \
@@ -1462,6 +1500,7 @@ async def test_scenario_a_lane2_backpressure_records_failed_not_success():
 
     with patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="11111111-aaaa-4111-8111-111111111111")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "try_reserve_lane2_slot", return_value=False), \
          patch.object(text_clean_service, "process", new=AsyncMock()) as proc:
@@ -1522,6 +1561,12 @@ async def test_credential_is_active_queries_active_and_not_archived():
     assert "status = 'active'" in sql
     assert "archived_at IS NULL" in sql
     assert args == (credential.id, credential.tenant_id, credential.user_id)
+    # EQ-120 (strengthened): scoped_acquire pins app.tenant_id (is_local) FIRST,
+    # inside the same txn as the RLS-armed vault.user_credentials probe, so the
+    # liveness read doesn't fail closed under the prod non-owner role.
+    guc_sql, guc_args = conn_active.execute_calls[0]
+    assert guc_sql == "SELECT set_config('app.tenant_id', $1, true)"
+    assert guc_args == (str(credential.tenant_id),)
 
     conn_archived = _FakeConn(fetchval_returns=False)
     is_active2 = await adapter._credential_is_active(
@@ -1582,6 +1627,7 @@ async def test_run_one_cycle_aborts_remaining_notes_when_disconnected_after_a_no
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
         result = await adapter.run_one_cycle(
@@ -1632,6 +1678,7 @@ async def test_run_one_cycle_does_not_publish_when_disconnected_during_a_note():
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="33333333-aaaa-4111-8111-333333333333")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
         result = await adapter.run_one_cycle(
@@ -1748,6 +1795,7 @@ async def test_run_one_cycle_scenario_c_writes_nothing_when_disconnected_mid_not
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value=None)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "_queue_unknown_domain_signals", new=queue_mock):
         result = await adapter.run_one_cycle(
@@ -1799,6 +1847,7 @@ async def test_run_one_cycle_scenario_c_writes_nothing_when_disconnected_during_
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(side_effect=_lookup_then_disconnect)), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "_queue_unknown_domain_signals", new=queue_mock):
         result = await adapter.run_one_cycle(
@@ -1930,6 +1979,7 @@ async def test_run_one_cycle_skips_success_bookkeeping_on_mid_cycle_deactivation
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
         result = await adapter.run_one_cycle(
@@ -1988,6 +2038,7 @@ async def test_run_one_cycle_skips_success_bookkeeping_when_deactivated_during_r
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=AsyncMock()):
         result = await adapter.run_one_cycle(
@@ -2034,6 +2085,7 @@ async def test_run_one_cycle_publishes_all_notes_when_credential_stays_active():
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(text_clean_service, "process", new=process_mock):
         result = await adapter.run_one_cycle(
@@ -2083,6 +2135,7 @@ async def test_run_one_cycle_sets_import_total_after_listing_when_import_run_id_
          patch.object(adapter, "get_tenant_internal_domains", new=AsyncMock(return_value=set())), \
          patch.object(adapter, "lookup_account_by_domain", new=AsyncMock(return_value="22222222-aaaa-4111-8111-222222222222")), \
          patch.object(adapter, "get_async_session", return_value=sess_cm), \
+         patch.object(adapter, "tenant_session", return_value=sess_cm), \
          patch.object(adapter, "_resolve_known_account_contacts", new=AsyncMock(return_value=_FAKE_RESOLVED_CONTACTS)), \
          patch.object(adapter, "set_import_total", new=set_total_mock), \
          patch.object(text_clean_service, "process", new=process_mock):
@@ -2196,13 +2249,21 @@ async def test_resolve_known_account_contacts_dedupes_and_binds_per_attendee_acc
         calls.append((email, account_id))
         return _resolved(f"cid-{email}", email, display_name, account_id)
 
-    with patch.object(adapter, "get_async_session", return_value=sess_cm), \
+    # EQ-120: _resolve_known_account_contacts now runs inside tenant_session,
+    # which OWNS the transaction (commits at block exit). The helper no longer
+    # calls session.commit() itself.
+    with patch.object(adapter, "tenant_session", return_value=sess_cm) as tenant_sess, \
          patch.object(adapter, "find_or_create_contact", side_effect=fake_focc):
         resolved = await adapter._resolve_known_account_contacts(decision=decision, credential=cred)
 
     assert [r.email for r in resolved] == ["matt@palantir.com", "amy@snowflake.com"]  # deduped, ordered
     assert calls == [("matt@palantir.com", _ACCT_PAL), ("amy@snowflake.com", _ACCT_SNO)]  # per-attendee acct
-    session.commit.assert_awaited_once()
+    # EQ-120 (strengthened): the scoped session is opened for the credential's
+    # tenant, and the find-or-create work runs inside that single owned txn
+    # (helper no longer commits explicitly — tenant_session commits at exit).
+    tenant_sess.assert_called_once_with(str(cred.tenant_id))
+    sess_cm.__aenter__.assert_awaited_once()
+    session.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2215,11 +2276,13 @@ async def test_resolve_known_account_contacts_empty_when_no_known():
         known_account_attendees=[],
         unknown_business_attendees=[_known_att("x@unknown.com", "X", None)],
     )
-    with patch.object(adapter, "get_async_session") as gs, \
+    # EQ-120: the session opener is now tenant_session; assert IT stays unopened
+    # on the empty path (intent unchanged: no session, no find-or-create).
+    with patch.object(adapter, "tenant_session") as ts, \
          patch.object(adapter, "find_or_create_contact") as focc:
         resolved = await adapter._resolve_known_account_contacts(decision=decision, credential=cred)
     assert resolved == []
-    gs.assert_not_called()
+    ts.assert_not_called()
     focc.assert_not_called()
 
 
