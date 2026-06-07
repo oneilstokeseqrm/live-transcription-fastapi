@@ -17,12 +17,17 @@ from models.enrichment_models import ResolvedContact, EnrichmentResult
 
 @contextlib.contextmanager
 def _patched_session_and_lookup(account_id: str):
-    """Patch get_async_session + lookup_account_by_domain together.
+    """Patch tenant_session (+ get_async_session) + lookup_account_by_domain.
 
     Under Option A (T1.21), BUSINESS-domain attendees only produce contacts
     when their domain resolves to a known account. Tests that previously
     relied on the uniform "anchor account" behavior pass through this
     helper to seed a known account_id and bypass the real DB.
+
+    EQ-120: the BUSINESS-domain account lookup and the find-or-create-contact
+    paths now open ``tenant_session(tenant_id)`` (RLS-scoped, owns the txn and
+    commits at block exit) instead of ``get_async_session()``. The fake CM is
+    accepted with or without the tenant_id arg so it stands in for both.
     """
     fake_session = MagicMock()
     fake_session.execute = AsyncMock()
@@ -37,7 +42,10 @@ def _patched_session_and_lookup(account_id: str):
 
     with patch(
         "services.transcript_enrichment.get_async_session",
-        new=lambda: _AsyncCM(),
+        new=lambda *a, **k: _AsyncCM(),
+    ), patch(
+        "services.transcript_enrichment.tenant_session",
+        new=lambda *a, **k: _AsyncCM(),
     ), patch(
         "services.transcript_enrichment.lookup_account_by_domain",
         new_callable=AsyncMock,

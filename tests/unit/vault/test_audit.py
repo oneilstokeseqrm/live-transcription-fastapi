@@ -43,11 +43,31 @@ class _FakeAcquireContextManager:
         return False
 
 
+class _FakeTxnContextManager:
+    """Mimics ``asyncpg.Connection.transaction()`` as a no-op async CM.
+
+    EQ-120: ``write_audit_row`` now uses ``scoped_acquire``, which opens an
+    explicit transaction and issues ``SELECT set_config('app.tenant_id', ...)``
+    (is_local) before the INSERT. ``transaction()`` is a SYNC call returning a
+    transaction object usable as an async context manager — hence a plain
+    object here, not an AsyncMock (which would return an un-awaited coroutine).
+    """
+
+    async def __aenter__(self) -> "_FakeTxnContextManager":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
 @pytest.fixture
 def fake_audit_conn() -> AsyncMock:
     """Mock asyncpg connection for audit inserts (autocommits)."""
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="INSERT 0 1")
+    # EQ-120: scoped_acquire wraps the insert in conn.transaction(); make it a
+    # sync call returning a no-op async CM (AsyncMock would yield a coroutine).
+    conn.transaction = MagicMock(side_effect=lambda *a, **k: _FakeTxnContextManager())
     return conn
 
 
@@ -82,8 +102,15 @@ class TestWriteAuditRow:
 
         assert isinstance(returned_id, uuid.UUID)
         fake_pool.acquire.assert_called_once()
-        fake_audit_conn.execute.assert_awaited_once()
-        args = fake_audit_conn.execute.await_args.args
+        # EQ-120: scoped_acquire issues the GUC set_config FIRST, then the
+        # INSERT — two execute() awaits in one tenant-scoped transaction.
+        assert fake_audit_conn.execute.await_count == 2
+        guc_call, insert_call = fake_audit_conn.execute.await_args_list
+        # (strengthened) the first statement pins app.tenant_id to THIS tenant,
+        # in the same txn as the RLS-armed vault.credential_access_log INSERT.
+        assert guc_call.args[0] == "SELECT set_config('app.tenant_id', $1, true)"
+        assert guc_call.args[1] == str(tenant_id)
+        args = insert_call.args
         sql = args[0]
         assert "INSERT INTO vault.credential_access_log" in sql
         assert args[1] == returned_id

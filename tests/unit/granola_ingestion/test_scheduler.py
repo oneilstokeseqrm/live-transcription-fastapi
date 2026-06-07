@@ -259,8 +259,13 @@ async def test_list_active_credentials_returns_metadata_triples():
 
 @pytest.mark.asyncio
 async def test_list_active_credentials_filters_to_granola_provider():
-    """SQL binds 'granola' as the provider param so other future
-    integrations don't get polled by this scheduler."""
+    """EQ-120: the cross-tenant active-credential scan now routes through the
+    SECURITY DEFINER function vault.list_active_credentials_xt() (so the cron,
+    running as the non-owner role, still enumerates every tenant under RLS).
+
+    The granola-only filter moved INSIDE that function (it is hardcoded there,
+    not a caller-supplied param — Codex review P2), so the caller passes NO args.
+    Intent preserved: this scheduler only enumerates Granola credentials."""
     conn = _FakeConn(fetch_returns=[])
     pool = _FakePool(conn)
 
@@ -269,15 +274,20 @@ async def test_list_active_credentials_filters_to_granola_provider():
 
     assert len(conn.fetch_calls) == 1
     sql, args = conn.fetch_calls[0]
-    assert "provider = $1" in sql
-    assert args == ("granola",)
+    assert "vault.list_active_credentials_xt()" in sql
+    # provider is now baked into the definer function; no caller bind param.
+    assert args == ()
+    # And the unscoped inline cross-tenant SELECT must NOT be reintroduced.
+    assert "FROM vault.user_credentials" not in sql
 
 
 @pytest.mark.asyncio
 async def test_list_active_credentials_filters_to_active_unarchived():
-    """SQL must filter status='active' AND archived_at IS NULL so
-    revoked / error / archived credentials are skipped — they shouldn't
-    receive a dispatched workflow."""
+    """status='active' AND archived_at IS NULL filtering (revoked / error /
+    archived credentials get no dispatched workflow) now lives inside the
+    SECURITY DEFINER enumerator vault.list_active_credentials_xt() (EQ-120).
+    The scheduler delegates to it rather than inlining the cross-tenant scan,
+    which would return zero rows under RLS as the non-owner role."""
     conn = _FakeConn(fetch_returns=[])
     pool = _FakePool(conn)
 
@@ -285,8 +295,7 @@ async def test_list_active_credentials_filters_to_active_unarchived():
         await scheduler.list_active_credentials()
 
     sql, _ = conn.fetch_calls[0]
-    assert "status = 'active'" in sql
-    assert "archived_at IS NULL" in sql
+    assert "vault.list_active_credentials_xt()" in sql
 
 
 @pytest.mark.asyncio
@@ -1174,14 +1183,18 @@ async def test_list_uninitialized_credentials_returns_scope_and_filters():
         result = await scheduler.list_uninitialized_credentials()
     assert [c.import_scope for c in result] == ["history", "forward"]
     assert all(isinstance(c, scheduler.UninitializedCredential) for c in result)
-    sql, _ = conn.fetch_calls[0]
+    # EQ-120: the full predicate (status='active' / archived_at IS NULL /
+    # last_polled_at IS NULL / NOT EXISTS live run / import_scope IN
+    # ('history','forward') / the forward-always-qualifies branch) now lives in
+    # the SECURITY DEFINER enumerator vault.list_uninitialized_granola_creds_xt
+    # so the cron sees every tenant's row under RLS as the non-owner role. The
+    # caller delegates to it, still passing the recovery LIMIT as $1.
+    sql, args = conn.fetch_calls[0]
     low = sql.lower()
-    assert "status = 'active'" in low and "archived_at is null" in low
-    assert "last_polled_at is null" in low
-    assert "not exists" in low                      # excludes history creds with a live run
-    assert "config->>'import_scope' in ('history', 'forward')" in low
-    # forward creds always qualify (not masked by an old history run) — Codex P1
-    assert "config->>'import_scope' = 'forward'" in low
+    assert "vault.list_uninitialized_granola_creds_xt($1)" in low
+    assert args == (scheduler._IMPORT_RECOVERY_LIMIT,)
+    # The unscoped inline cross-tenant SELECT must NOT be reintroduced.
+    assert "from vault.user_credentials" not in low
 
 
 @pytest.mark.asyncio
