@@ -357,41 +357,57 @@ async def websocket_endpoint(websocket: WebSocket):
         websocket.query_params.get("interim_results", "false").lower() == "true"
     )
 
-    # --- JWT Authentication (optional, backward compatible) ---
+    # --- JWT Authentication (REQUIRED before accept) ---
+    # EQ-120: prod connects as the non-owner role, so every session must be
+    # tenant-scoped — a tokenless connection can no longer fall back to
+    # MOCK_TENANT_ID. Require a verified internal JWT (+ X-Account-ID) BEFORE
+    # websocket.accept(); reject otherwise. The desktop app sends the JWT in the
+    # `authorization` WS header + X-Account-ID and can refresh mid-session via a
+    # `session_reauth` message (both paths preserved below).
+    # NOTE: native browser WebSockets cannot set request headers, so when browser
+    # streaming is activated later it MUST carry the token via a subprotocol or a
+    # first-frame handshake (follow-up).
     context: Optional[RequestContext] = None
     auth_header = websocket.headers.get("authorization")
     token = extract_bearer_token(auth_header)
 
-    if token:
-        try:
-            claims = verify_internal_jwt(token)
-            # Account anchor must be supplied via header; backend rejects when absent.
-            # WebSocket headers are lowercased by Starlette.
-            account_id = websocket.headers.get("x-account-id")
-            if not account_id:
-                logger.warning(
-                    f"WebSocket /listen rejected: missing X-Account-ID, "
-                    f"session_id={session_id}"
-                )
-                await websocket.close(code=1008, reason="X-Account-ID required")
-                return
-            context = RequestContext(
-                tenant_id=claims.tenant_id,
-                user_id=claims.user_id,
-                pg_user_id=claims.pg_user_id,
-                user_name=claims.user_name,
-                account_id=account_id,
-                interaction_id=session_id,
-                trace_id=str(uuid.uuid4()),
+    if not token:
+        logger.warning(
+            f"WebSocket /listen rejected: missing Authorization token, "
+            f"session_id={session_id}"
+        )
+        await websocket.close(code=4001, reason="Authorization token required")
+        return
+
+    try:
+        claims = verify_internal_jwt(token)
+        # Account anchor must be supplied via header; backend rejects when absent.
+        # WebSocket headers are lowercased by Starlette.
+        account_id = websocket.headers.get("x-account-id")
+        if not account_id:
+            logger.warning(
+                f"WebSocket /listen rejected: missing X-Account-ID, "
+                f"session_id={session_id}"
             )
-            logger.info(
-                f"WebSocket authenticated via JWT: session_id={session_id}, "
-                f"tenant={claims.tenant_id[:8]}..."
-            )
-        except JWTVerificationError as e:
-            logger.warning(f"WebSocket JWT auth failed: {e.code}, session_id={session_id}")
-            await websocket.close(code=4001, reason=e.message)
+            await websocket.close(code=1008, reason="X-Account-ID required")
             return
+        context = RequestContext(
+            tenant_id=claims.tenant_id,
+            user_id=claims.user_id,
+            pg_user_id=claims.pg_user_id,
+            user_name=claims.user_name,
+            account_id=account_id,
+            interaction_id=session_id,
+            trace_id=str(uuid.uuid4()),
+        )
+        logger.info(
+            f"WebSocket authenticated via JWT: session_id={session_id}, "
+            f"tenant={claims.tenant_id[:8]}..."
+        )
+    except JWTVerificationError as e:
+        logger.warning(f"WebSocket JWT auth failed: {e.code}, session_id={session_id}")
+        await websocket.close(code=4001, reason=e.message)
+        return
 
     await websocket.accept()
     logger.info(f"WebSocket connection established: session_id={session_id}")

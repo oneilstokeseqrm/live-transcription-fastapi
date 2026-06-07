@@ -59,6 +59,8 @@ from uuid import UUID
 
 import asyncpg
 
+from services.tenant_scope import scoped_acquire, set_tenant_guc
+
 from . import audit, encryption
 from .errors import VaultError, VaultErrorCode, VaultPermissionError
 
@@ -230,9 +232,14 @@ SET encrypted_api_key = $1,
     last_polled_at = NULL,
     updated_at = CURRENT_TIMESTAMP
 WHERE id = $5
+  AND tenant_id = $6
+  AND user_id = $7
   AND archived_at IS NOT NULL
 RETURNING tenant_id
 """
+# EQ-120 (Codex P2): tenant_id + user_id added to the predicate. The id is
+# resolved by a tenant-scoped pre-read, but the mutation must not rely on RLS
+# invisibility alone — the application predicate stays tenant+user scoped too.
 
 # Non-decrypting lifecycle read for the Phase 2f admin endpoints. Returns
 # the row in ANY status (active / revoked / error / archived) so /status
@@ -489,8 +496,10 @@ async def get_granola_credential_for_user(
         raise
 
     # DB read wrapped to convert raw asyncpg errors into VaultError + audit.
+    # EQ-120: scoped_acquire pins app.tenant_id (is_local) for the read txn so
+    # the RLS-armed vault.user_credentials SELECT doesn't fail closed in prod.
     try:
-        async with pool.acquire() as conn:
+        async with scoped_acquire(pool, tenant_id) as conn:
             row = await conn.fetchrow(
                 _SELECT_GRANOLA_CREDENTIAL_SQL,
                 tenant_id,
@@ -673,6 +682,9 @@ async def store_credential(
     try:
         async with pool.acquire() as cred_conn:
             async with cred_conn.transaction():
+                # EQ-120: scope this tx before touching RLS-armed
+                # vault.user_credentials + vault.credential_access_log.
+                await set_tenant_guc(cred_conn, tenant_id)
                 try:
                     await cred_conn.execute(
                         _INSERT_CREDENTIAL_SQL,
@@ -803,8 +815,10 @@ async def rotate_credential_key(
     # Identity lookup — filters on (id, tenant_id, user_id) so cross-tenant
     # credential_ids return None rather than leaking another tenant's row.
     # Wrapped to convert raw asyncpg errors into VaultError + audit.
+    # EQ-120: scoped_acquire pins app.tenant_id (is_local) so the RLS-armed
+    # vault.user_credentials read doesn't fail closed in prod.
     try:
-        async with pool.acquire() as lookup_conn:
+        async with scoped_acquire(pool, tenant_id) as lookup_conn:
             identity_row = await lookup_conn.fetchrow(
                 _SELECT_ROTATE_IDENTITY_SQL,
                 credential_id,
@@ -882,6 +896,9 @@ async def rotate_credential_key(
     try:
         async with pool.acquire() as cred_conn:
             async with cred_conn.transaction():
+                # EQ-120: scope this tx before touching RLS-armed
+                # vault.user_credentials + vault.credential_access_log.
+                await set_tenant_guc(cred_conn, tenant_id)
                 updated = await cred_conn.fetchrow(
                     _UPDATE_ROTATE_SQL,
                     encrypted_api_key,
@@ -993,8 +1010,10 @@ async def reactivate_credential(
 
     # SELECT existing row to get its id + verify it is archived. Wrapped to
     # convert raw asyncpg errors into VaultError + audit.
+    # EQ-120: scoped_acquire pins app.tenant_id (is_local) so the RLS-armed
+    # vault.user_credentials read doesn't fail closed in prod.
     try:
-        async with pool.acquire() as lookup_conn:
+        async with scoped_acquire(pool, tenant_id) as lookup_conn:
             existing = await lookup_conn.fetchrow(
                 _SELECT_ANY_CREDENTIAL_ID_SQL,
                 tenant_id,
@@ -1084,6 +1103,9 @@ async def reactivate_credential(
     try:
         async with pool.acquire() as cred_conn:
             async with cred_conn.transaction():
+                # EQ-120: scope this tx before touching RLS-armed
+                # vault.user_credentials + vault.credential_access_log.
+                await set_tenant_guc(cred_conn, tenant_id)
                 updated = await cred_conn.fetchrow(
                     _UPDATE_REACTIVATE_SQL,
                     encrypted_api_key,
@@ -1091,6 +1113,8 @@ async def reactivate_credential(
                     nonce,
                     config_json,
                     credential_id,
+                    tenant_id,
+                    user_id,
                 )
                 if updated is None:
                     # Lost to a concurrent reactivate (another caller
@@ -1192,6 +1216,9 @@ async def update_credential_config(
     try:
         async with pool.acquire() as cred_conn:
             async with cred_conn.transaction():
+                # EQ-120: scope this tx before touching RLS-armed
+                # vault.user_credentials + vault.credential_access_log.
+                await set_tenant_guc(cred_conn, tenant_id)
                 updated = await cred_conn.fetchrow(
                     _UPDATE_CONFIG_SQL,
                     config_json,
@@ -1316,6 +1343,9 @@ async def anchor_credential_watermark(
     try:
         async with pool.acquire() as cred_conn:
             async with cred_conn.transaction():
+                # EQ-120: scope this tx before touching RLS-armed
+                # vault.user_credentials + vault.credential_access_log.
+                await set_tenant_guc(cred_conn, tenant_id)
                 updated = await cred_conn.fetchrow(
                     _UPDATE_WATERMARK_SQL,
                     ts,
@@ -1412,8 +1442,10 @@ async def get_credential_status(
         )
         raise
 
+    # EQ-120: scoped_acquire pins app.tenant_id (is_local) so the RLS-armed
+    # vault.user_credentials read doesn't fail closed in prod.
     try:
-        async with pool.acquire() as conn:
+        async with scoped_acquire(pool, tenant_id) as conn:
             row = await conn.fetchrow(
                 _SELECT_CREDENTIAL_STATUS_SQL,
                 tenant_id,
@@ -1522,6 +1554,9 @@ async def archive_credential(
     try:
         async with pool.acquire() as cred_conn:
             async with cred_conn.transaction():
+                # EQ-120: scope this tx before touching RLS-armed
+                # vault.user_credentials + vault.credential_access_log.
+                await set_tenant_guc(cred_conn, tenant_id)
                 archived = await cred_conn.fetchrow(
                     _ARCHIVE_CREDENTIAL_SQL,
                     credential_id,

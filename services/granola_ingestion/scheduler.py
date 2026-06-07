@@ -214,13 +214,15 @@ class RecoverableImport:
 # ---------------------------------------------------------------------------
 
 
+# EQ-120: under RLS+FORCE on vault.user_credentials, this cross-tenant scan
+# (the cron must enumerate EVERY tenant's active credentials) returns 0 rows as
+# the non-owner role eqprod_transcription. It routes through the SECURITY DEFINER
+# function vault.list_active_credentials_xt (infra/sql/eq120_cron_enumerate.sql),
+# which enumerates across tenants as the owner; every downstream poll re-scopes
+# per credential via set_tenant_guc, so tenant isolation holds from there.
 _LIST_ACTIVE_CREDENTIALS_SQL = """
 SELECT id, tenant_id, user_id
-FROM vault.user_credentials
-WHERE provider = $1
-  AND status = 'active'
-  AND archived_at IS NULL
-ORDER BY id ASC
+FROM vault.list_active_credentials_xt($1)
 """
 
 
@@ -884,24 +886,14 @@ class UninitializedCredential:
 #   strand is handled by list_recoverable_import_runs; a TERMINAL run that left
 #   the watermark NULL (a not_found folder) is handled by run_cycle_step's A1
 #   guard (the poll proceeds once the import is terminal) — not here.
+# EQ-120: same cross-tenant enumeration concern as _LIST_ACTIVE_CREDENTIALS_SQL.
+# The full predicate (incl. the NOT EXISTS against public.granola_import_runs) lives
+# in the SECURITY DEFINER function vault.list_uninitialized_granola_creds_xt
+# (infra/sql/eq120_cron_enumerate.sql); the cron calls it as the non-owner role and
+# re-scopes per credential downstream.
 _LIST_UNINITIALIZED_CREDS_SQL = """
-SELECT uc.id, uc.tenant_id, uc.user_id, uc.config->>'import_scope' AS import_scope
-FROM vault.user_credentials uc
-WHERE uc.provider = 'granola'
-  AND uc.status = 'active'
-  AND uc.archived_at IS NULL
-  AND uc.last_polled_at IS NULL
-  AND uc.config->>'import_scope' IN ('history', 'forward')
-  AND (
-    uc.config->>'import_scope' = 'forward'
-    OR NOT EXISTS (
-      SELECT 1 FROM public.granola_import_runs r
-      WHERE r.credential_id = uc.id
-        AND r.state IN ('queued', 'running', 'complete')
-    )
-  )
-ORDER BY uc.id ASC
-LIMIT $1
+SELECT id, tenant_id, user_id, import_scope
+FROM vault.list_uninitialized_granola_creds_xt($1)
 """
 
 

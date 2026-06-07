@@ -46,6 +46,7 @@ from services.account_provisioning.types import (
 )
 from services.agent_action_core_client import AgentActionCoreClient
 from services.database import get_async_session
+from services.tenant_scope import tenant_session
 
 logger = logging.getLogger(__name__)
 
@@ -363,14 +364,16 @@ async def resolve_or_create_account(
     """
     # Fast-path read in its own short transaction — avoids holding a
     # row-locking transaction open across the agent profile inspection.
-    async with get_async_session() as read_session:
-        async with read_session.begin():
-            existing = (
-                await read_session.execute(
-                    SELECT_ACCOUNT_BY_DOMAIN_SQL,
-                    {"tenant_id": tenant_id, "domain": domain},
-                )
-            ).one_or_none()
+    # EQ-120: tenant_session pins app.tenant_id and OWNS the transaction so the
+    # RLS-armed account_domains read doesn't fail closed in prod (replaces the
+    # explicit session.begin()).
+    async with tenant_session(tenant_id) as read_session:
+        existing = (
+            await read_session.execute(
+                SELECT_ACCOUNT_BY_DOMAIN_SQL,
+                {"tenant_id": tenant_id, "domain": domain},
+            )
+        ).one_or_none()
     if existing is not None:
         return existing.account_id
 
@@ -379,47 +382,50 @@ async def resolve_or_create_account(
     # back the accounts insert via SQLAlchemy's begin() context-manager
     # exit-on-exception behavior, then we re-resolve in a fresh session.
     account_id = str(uuid.uuid4())
+    # EQ-120: tenant_session pins app.tenant_id and OWNS the transaction (commits
+    # on clean exit, rolls back on exception — same as the prior session.begin())
+    # so the RLS-armed accounts + account_domains writes don't fail closed in prod.
     try:
-        async with get_async_session() as write_session:
-            async with write_session.begin():
+        async with tenant_session(tenant_id) as write_session:
+            await write_session.execute(
+                INSERT_ACCOUNT_SQL,
+                {
+                    "id": account_id,
+                    "tenant_id": tenant_id,
+                    "name": profile.name,
+                    "industry": profile.industry,
+                    "company_size": profile.company_size,
+                    "region": profile.region,
+                    "website": profile.website,
+                    "description": profile.description,
+                },
+            )
+            domain_row = (
                 await write_session.execute(
-                    INSERT_ACCOUNT_SQL,
+                    INSERT_ACCOUNT_DOMAIN_SQL,
                     {
-                        "id": account_id,
                         "tenant_id": tenant_id,
-                        "name": profile.name,
-                        "industry": profile.industry,
-                        "company_size": profile.company_size,
-                        "region": profile.region,
-                        "website": profile.website,
-                        "description": profile.description,
+                        "account_id": account_id,
+                        "domain": domain,
                     },
                 )
-                domain_row = (
-                    await write_session.execute(
-                        INSERT_ACCOUNT_DOMAIN_SQL,
-                        {
-                            "tenant_id": tenant_id,
-                            "account_id": account_id,
-                            "domain": domain,
-                        },
-                    )
-                ).one_or_none()
-                if domain_row is None:
-                    raise _DomainRaceLost()
-                return account_id
+            ).one_or_none()
+            if domain_row is None:
+                raise _DomainRaceLost()
+            return account_id
     except _DomainRaceLost:
         # Race: another concurrent provisioning won the domain bind.
         # Our accounts insert was rolled back; resolve to the winner.
-        async with get_async_session() as resolve_session:
-            async with resolve_session.begin():
-                row = (
-                    await resolve_session.execute(
-                        SELECT_ACCOUNT_BY_DOMAIN_SQL,
-                        {"tenant_id": tenant_id, "domain": domain},
-                    )
-                ).one()
-                return row.account_id
+        # EQ-120: tenant_session pins app.tenant_id and OWNS the transaction so
+        # the RLS-armed account_domains read doesn't fail closed in prod.
+        async with tenant_session(tenant_id) as resolve_session:
+            row = (
+                await resolve_session.execute(
+                    SELECT_ACCOUNT_BY_DOMAIN_SQL,
+                    {"tenant_id": tenant_id, "domain": domain},
+                )
+            ).one()
+            return row.account_id
 
 
 class _DomainRaceLost(Exception):
@@ -444,15 +450,18 @@ async def materialize_signals(
     so the existing SQL primitives (with M3's outbox-removed +
     ON CONFLICT-on-link changes) are reused without duplication.
     """
-    async with get_async_session() as session:
-        async with session.begin():
-            return await materialize_account_approval(
-                session=session,
-                tenant_id=tenant_id,
-                queue_id=queue_id,
-                account_id=account_id,
-                event_type="account_created",
-            )
+    # EQ-120: tenant_session pins app.tenant_id and OWNS the transaction
+    # (materialize_account_approval does NOT commit; the block commits on clean
+    # exit, rolls back on exception — same as the prior session.begin()) so the
+    # RLS-armed contacts writes inside it don't fail closed in prod.
+    async with tenant_session(tenant_id) as session:
+        return await materialize_account_approval(
+            session=session,
+            tenant_id=tenant_id,
+            queue_id=queue_id,
+            account_id=account_id,
+            event_type="account_created",
+        )
 
 
 # ---------------------------------------------------------------------------
