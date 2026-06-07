@@ -1,0 +1,61 @@
+name: deploy-prod-infra
+
+# Keyless prod AWS IaC deploy for live-transcription-fastapi (EQ-120 Phase B).
+# Mirrors eq-prod-foundation's deploy workflow: GitHub Actions OIDC assumes the
+# foundation's eq-prod-deploy role (org-wildcard trust repo:oneilstokeseqrm/*:ref:refs/heads/main),
+# then `pulumi up` the per-service stack. NO static AWS keys.
+#
+# Repo Actions secrets required (set out-of-band, no-echo):
+#   - AWS_DEPLOY_ROLE_ARN   = arn:aws:iam::009907129037:role/eq-prod-deploy
+#   - PULUMI_ACCESS_TOKEN   = the oneilstokeseqrm Pulumi Cloud token
+#
+# Only triggers on changes under infra/ (or this workflow) on main, plus manual dispatch.
+# The IAM USER + access key + the eq-user-secrets KMS key policy are admin-path artifacts
+# (NOT in this stack) — see infra/README.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/deploy-prod-infra.yml'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-prod-infra
+  cancel-in-progress: false
+
+jobs:
+  pulumi-up:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Pulumi program deps
+        working-directory: infra
+        run: |
+          python -m venv venv
+          ./venv/bin/python -m pip install --upgrade pip
+          ./venv/bin/python -m pip install -r requirements.txt
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: pulumi/actions@v6
+        with:
+          command: up
+          stack-name: oneilstokeseqrm/eq-live-transcription-prod/prod
+          work-dir: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}

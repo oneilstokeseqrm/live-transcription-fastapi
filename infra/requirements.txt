@@ -1,0 +1,4 @@
+pulumi>=3.100.0
+# Pinned to the exact provider version the prod stack was previewed/applied with,
+# so a keyless CI run never resolves a newer v7 than what was reviewed (Codex P2).
+pulumi-aws==7.32.0
