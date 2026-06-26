@@ -305,6 +305,110 @@ MAP_RESERVE_SQL = text("""
 """)
 
 
+# Owner-scoped batched list of pending queue entries with calendar context.
+# One statement: CTE + DISTINCT ON email-dedup + tenant-scoped + deterministic
+# ordering + LATERAL attendee count. V1 = calendar branch only (no
+# pending_interactions / email branch). Used by GET /queue (Task A3, EQ-95).
+# CAST(:x AS uuid) portable-bind convention throughout — never :x::uuid.
+LIST_QUEUE_SQL = text("""
+    WITH q AS (
+        SELECT id, domain, status, discovered_from_type,
+               created_at, expires_at, re_open_count
+        FROM pending_account_mappings
+        WHERE tenant_id = CAST(:tenant_id AS uuid)
+          AND owner_user_id = CAST(:owner_user_id AS uuid)
+          AND archived_at IS NULL
+          AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT :limit
+    ),
+    sig AS (  -- representative source + calendar anchor per queue (deterministic tie-break on s.id)
+        SELECT s.queue_id,
+               (array_agg(s.source_type ORDER BY s.created_at, s.id))[1] AS source_type,
+               (array_agg(s.calendar_event_id ORDER BY s.created_at, s.id)
+                  FILTER (WHERE s.calendar_event_id IS NOT NULL))[1] AS calendar_event_id
+        FROM pending_account_mapping_signals s
+        JOIN q ON q.id = s.queue_id
+        WHERE s.archived_at IS NULL
+        GROUP BY s.queue_id
+    ),
+    contacts AS (  -- dedup by email FIRST, so contact_count and contacts agree
+        SELECT queue_id,
+               count(*) AS contact_count,
+               jsonb_agg(jsonb_build_object(
+                   'email', contact_email,
+                   'displayName', contact_display_name,
+                   'role', contact_role) ORDER BY contact_email) AS contacts
+        FROM (
+            SELECT DISTINCT ON (s.queue_id, s.contact_email)
+                   s.queue_id, s.contact_email, s.contact_display_name, s.contact_role
+            FROM pending_account_mapping_signals s
+            JOIN q ON q.id = s.queue_id
+            WHERE s.archived_at IS NULL
+            ORDER BY s.queue_id, s.contact_email, s.created_at, s.id
+        ) d
+        GROUP BY queue_id
+    )
+    SELECT q.id::text AS queue_id,
+           q.domain,
+           q.status,
+           COALESCE(sig.source_type, q.discovered_from_type) AS source_type,
+           q.created_at,
+           q.expires_at,
+           q.re_open_count,
+           COALESCE(contacts.contact_count, 0) AS contact_count,
+           COALESCE(contacts.contacts, '[]'::jsonb) AS contacts,
+           CASE WHEN ce.id IS NOT NULL THEN 'calendar' ELSE 'none' END AS context_source,
+           ce.title AS meeting_title,
+           ce.start_time AS occurred_at,
+           att.attendee_count
+    FROM q
+    LEFT JOIN sig ON sig.queue_id = q.id
+    LEFT JOIN contacts ON contacts.queue_id = q.id
+    LEFT JOIN calendar_events ce
+           ON ce.id = sig.calendar_event_id
+          AND ce.tenant_id = CAST(:tenant_id AS uuid)   -- tenant-scope: no-RLS surface
+    LEFT JOIN LATERAL (
+        SELECT count(*) AS attendee_count
+        FROM calendar_event_attendees a
+        WHERE a.calendar_event_id = sig.calendar_event_id
+          AND a.is_resource = false
+    ) att ON ce.id IS NOT NULL   -- depend on the RESOLVED calendar row, not just the id
+    ORDER BY q.created_at DESC
+""")
+
+
+# Owner-scoped count of pending (non-archived) queue entries for the
+# authenticated user. Used by GET /queue/count (Task A1, EQ-95).
+# Both predicates use CAST(:x AS uuid) — never :x::uuid — per the
+# project-wide portable-bind convention (see APPROVE_SQL note above).
+COUNT_QUEUE_SQL = text("""
+    SELECT count(*) AS count
+    FROM pending_account_mappings
+    WHERE tenant_id = CAST(:tenant_id AS uuid)
+      AND owner_user_id = CAST(:owner_user_id AS uuid)
+      AND archived_at IS NULL
+      AND status = 'pending'
+""")
+
+
+# Single-row status read for the frontend polling loop after Approve.
+# Three-predicate WHERE: id (path param), tenant_id, and owner_user_id
+# so cross-tenant and cross-owner lookups transparently 404 without
+# leaking existence. Used by GET /queue/{queue_id} (Task A2, EQ-95).
+# CAST(:x AS uuid) portable-bind convention throughout — never :x::uuid.
+STATUS_QUEUE_SQL = text("""
+    SELECT id::text AS queue_id,
+           domain,
+           status,
+           resolved_account_id::text AS resolved_account_id
+    FROM pending_account_mappings
+    WHERE id = CAST(:queue_id AS uuid)
+      AND tenant_id = CAST(:tenant_id AS uuid)
+      AND owner_user_id = CAST(:owner_user_id AS uuid)
+""")
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -393,6 +497,24 @@ def _validate_uuid_path_param(value: str, field_name: str) -> str:
     return value
 
 
+def _require_owner_identity(ctx) -> str:
+    """Owner identity for READ endpoints: a UUID-shaped pg_user_id.
+
+    JWT-only enforcement without an auth-method flag: legacy header auth never
+    populates pg_user_id (utils/context_utils.py), so requiring it here rejects
+    spoofable X-Tenant-ID/X-User-ID headers on this non-RLS table. No fallback
+    to user_id (the Auth0 sub) — owner_user_id is a pg UUID.
+    """
+    owner = getattr(ctx, "pg_user_id", None)
+    if not owner:
+        raise HTTPException(status_code=403, detail="pg_user_id claim required")
+    try:
+        uuid.UUID(owner)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=403, detail="pg_user_id must be UUID-shaped")
+    return owner
+
+
 def _effective_user_id(ctx) -> str:
     """Return pg_user_id when present, falling back to the JWT subject.
 
@@ -421,6 +543,104 @@ def _effective_user_id(ctx) -> str:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+QUEUE_LIST_LIMIT = 50
+
+
+@router.get("")
+async def queue_list(request: Request):
+    """Return the paginated list of pending queue entries owned by the caller.
+
+    Batched: a single CTE query aggregates contacts and joins calendar context
+    so the response includes meeting title, attendee count, and contextSource
+    without N+1 queries.
+
+    V1 = calendar context branch only. No pending_interactions / email branch.
+    LIMIT 50 (QUEUE_LIST_LIMIT). JWT-only: requires a UUID-shaped pg_user_id
+    claim. Registered before GET /count and GET /{queue_id} as the empty-path
+    segment — @router.get("") on a prefixed router serves GET /queue.
+    """
+    ctx = get_auth_context_polling(request)
+    owner_id = _require_owner_identity(ctx)
+    async with get_async_session() as session:
+        rows = (await session.execute(
+            LIST_QUEUE_SQL,
+            {"tenant_id": ctx.tenant_id, "owner_user_id": owner_id, "limit": QUEUE_LIST_LIMIT},
+        )).all()
+    return {"entries": [
+        {
+            "queueId": r.queue_id,
+            "domain": r.domain,
+            "status": r.status,
+            "sourceType": r.source_type,
+            "createdAt": r.created_at,
+            "expiresAt": r.expires_at,
+            "reOpenCount": r.re_open_count,
+            "contactCount": int(r.contact_count),
+            "contacts": r.contacts,
+            "contextSource": r.context_source,
+            "meetingTitle": r.meeting_title,
+            "occurredAt": r.occurred_at,
+            "attendeeCount": r.attendee_count,
+        }
+        for r in rows
+    ]}
+
+
+@router.get("/count")
+async def queue_count(request: Request):
+    """Return the count of pending (non-archived) queue entries owned by the caller.
+
+    JWT-only: requires a UUID-shaped pg_user_id claim. Legacy header auth
+    (X-Tenant-ID / X-User-ID) never populates pg_user_id, so _require_owner_identity
+    rejects those requests with 403.
+
+    Registered before any GET /{queue_id} dynamic route so /count is matched as a
+    static path (routing order guarantee).
+    """
+    ctx = get_auth_context_polling(request)
+    owner_id = _require_owner_identity(ctx)
+    async with get_async_session() as session:
+        result = await session.execute(
+            COUNT_QUEUE_SQL,
+            {"tenant_id": ctx.tenant_id, "owner_user_id": owner_id},
+        )
+        count = result.scalar_one()
+    return {"count": int(count)}
+
+
+@router.get("/{queue_id}")
+async def queue_status(queue_id: str, request: Request):
+    """Return the status of a single pending_account_mappings row.
+
+    Owner + tenant scoped: STATUS_QUEUE_SQL includes all three predicates
+    (id, tenant_id, owner_user_id) so cross-tenant and cross-owner lookups
+    transparently 404 without leaking existence.
+
+    Used by the frontend polling loop after the user clicks Approve — the
+    caller polls until status=='mapped' and resolvedAccountId is not None.
+
+    Registered AFTER GET /count (static before dynamic) to avoid /count
+    being shadowed by the /{queue_id} dynamic segment.
+
+    JWT-only: requires a UUID-shaped pg_user_id claim (same guard as /count).
+    """
+    ctx = get_auth_context_polling(request)
+    _validate_uuid_path_param(queue_id, "queue_id")
+    owner_id = _require_owner_identity(ctx)
+    async with get_async_session() as session:
+        row = (await session.execute(
+            STATUS_QUEUE_SQL,
+            {"queue_id": queue_id, "tenant_id": ctx.tenant_id, "owner_user_id": owner_id},
+        )).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Queue entry not found")
+    return {
+        "queueId": row.queue_id,
+        "domain": row.domain,
+        "status": row.status,
+        "resolvedAccountId": row.resolved_account_id,
+    }
 
 
 @router.post("/{queue_id}/approve", status_code=202)
