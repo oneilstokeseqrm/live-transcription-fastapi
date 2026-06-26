@@ -319,6 +319,23 @@ COUNT_QUEUE_SQL = text("""
 """)
 
 
+# Single-row status read for the frontend polling loop after Approve.
+# Three-predicate WHERE: id (path param), tenant_id, and owner_user_id
+# so cross-tenant and cross-owner lookups transparently 404 without
+# leaking existence. Used by GET /queue/{queue_id} (Task A2, EQ-95).
+# CAST(:x AS uuid) portable-bind convention throughout — never :x::uuid.
+STATUS_QUEUE_SQL = text("""
+    SELECT id::text AS queue_id,
+           domain,
+           status,
+           resolved_account_id::text AS resolved_account_id
+    FROM pending_account_mappings
+    WHERE id = CAST(:queue_id AS uuid)
+      AND tenant_id = CAST(:tenant_id AS uuid)
+      AND owner_user_id = CAST(:owner_user_id AS uuid)
+""")
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -475,6 +492,40 @@ async def queue_count(request: Request):
         )
         count = result.scalar_one()
     return {"count": int(count)}
+
+
+@router.get("/{queue_id}")
+async def queue_status(queue_id: str, request: Request):
+    """Return the status of a single pending_account_mappings row.
+
+    Owner + tenant scoped: STATUS_QUEUE_SQL includes all three predicates
+    (id, tenant_id, owner_user_id) so cross-tenant and cross-owner lookups
+    transparently 404 without leaking existence.
+
+    Used by the frontend polling loop after the user clicks Approve — the
+    caller polls until status=='mapped' and resolvedAccountId is not None.
+
+    Registered AFTER GET /count (static before dynamic) to avoid /count
+    being shadowed by the /{queue_id} dynamic segment.
+
+    JWT-only: requires a UUID-shaped pg_user_id claim (same guard as /count).
+    """
+    ctx = get_auth_context_polling(request)
+    _validate_uuid_path_param(queue_id, "queue_id")
+    owner_id = _require_owner_identity(ctx)
+    async with get_async_session() as session:
+        row = (await session.execute(
+            STATUS_QUEUE_SQL,
+            {"queue_id": queue_id, "tenant_id": ctx.tenant_id, "owner_user_id": owner_id},
+        )).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Queue entry not found")
+    return {
+        "queueId": row.queue_id,
+        "domain": row.domain,
+        "status": row.status,
+        "resolvedAccountId": row.resolved_account_id,
+    }
 
 
 @router.post("/{queue_id}/approve", status_code=202)

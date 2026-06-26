@@ -87,14 +87,34 @@ def _fake_queue_row(
 
 def _execute_result(*, one_or_none=None, scalar_one=None, rowcount=0, all_rows=None):
     """Build a mock SQLAlchemy result object covering the access patterns
-    the queue route handlers need (.one_or_none, .scalar_one, .rowcount)."""
+    the queue route handlers need (.one_or_none, .scalar_one, .rowcount).
+
+    Carry-forward A1 review (Important): when scalar_one / all_rows are NOT
+    passed, accessing .scalar_one() / .all() raises AssertionError instead of
+    returning a truthy MagicMock — prevents silent false-passes where the test
+    never exercises the real return value.
+    """
     result = MagicMock()
     result.one_or_none = MagicMock(return_value=one_or_none)
     if scalar_one is not None:
         result.scalar_one = MagicMock(return_value=scalar_one)
+    else:
+        result.scalar_one = MagicMock(
+            side_effect=AssertionError(
+                "_execute_result: scalar_one not configured for this result — "
+                "pass scalar_one=<value> or the test is exercising an unexpected path"
+            )
+        )
     result.rowcount = rowcount
     if all_rows is not None:
         result.all = MagicMock(return_value=all_rows)
+    else:
+        result.all = MagicMock(
+            side_effect=AssertionError(
+                "_execute_result: all_rows not configured for this result — "
+                "pass all_rows=<list> or the test is exercising an unexpected path"
+            )
+        )
     return result
 
 
@@ -227,3 +247,59 @@ def test_count_rejects_legacy_header_auth(client, monkeypatch):
     # header set is incomplete it may 400/401 — either way, spoofed headers grant
     # NO access. The security property under test is "not 200".
     assert r.status_code in (400, 401, 403), r.text
+
+
+# Carry-forward A1 review item 2: non-UUID pg_user_id → 403 from
+# _require_owner_identity's uuid.UUID branch. _make_jwt can mint arbitrary
+# pg_user_id values so this is straightforward.
+def test_count_rejects_non_uuid_pg_user_id(client):
+    """JWT with a non-UUID pg_user_id claim → 403 from _require_owner_identity."""
+    token = _make_jwt(pg_user_id="not-a-uuid")
+    r = client.get("/queue/count", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403, r.text
+
+
+# ---------------------------------------------------------------------------
+# Task A2: GET /queue/{queue_id} tests
+# ---------------------------------------------------------------------------
+
+
+def test_status_rejects_bad_uuid(client):
+    token = _make_jwt(pg_user_id=PG_USER_UUID)
+    r = client.get("/queue/not-a-uuid", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 400, r.text
+
+
+def test_status_not_found_returns_404(client):
+    session = _SessionStub(execute_results=[_execute_result(one_or_none=None)])
+    qid = str(uuid.uuid4())
+    with _patch_session(session):
+        r = client.get(
+            f"/queue/{qid}",
+            headers={"Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}"},
+        )
+    assert r.status_code == 404, r.text
+
+
+def test_status_happy_path_pending(client):
+    qid = str(uuid.uuid4())
+    row = MagicMock(queue_id=qid, domain="acme.com", status="pending",
+                    resolved_account_id=None)
+    session = _SessionStub(execute_results=[_execute_result(one_or_none=row)])
+    with _patch_session(session):
+        r = client.get(
+            f"/queue/{qid}",
+            headers={"Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {"queueId": qid, "domain": "acme.com",
+                    "status": "pending", "resolvedAccountId": None}
+
+
+def test_status_sql_is_owner_and_tenant_scoped():
+    from routers.queue_actions import STATUS_QUEUE_SQL
+    sql = str(STATUS_QUEUE_SQL)
+    assert "id = CAST(:queue_id AS uuid)" in sql
+    assert "tenant_id = CAST(:tenant_id AS uuid)" in sql
+    assert "owner_user_id = CAST(:owner_user_id AS uuid)" in sql
