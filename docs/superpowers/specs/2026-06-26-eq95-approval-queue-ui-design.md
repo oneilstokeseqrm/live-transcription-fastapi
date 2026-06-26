@@ -1,8 +1,8 @@
 # EQ-95 — Account-Creation Approval-Queue Dropdown (per-user, source-agnostic)
 
 **Date:** 2026-06-26
-**Status:** Design approved; `/codex consult` hardening folded in 2026-06-26 (2 P1s + P2s) — pending founder spec review
-**Linear:** EQ-95 (currently filed under the Granola Integration project but **explicitly de-scoped** from it — founder decision 2026-06-04 — as a separate future project)
+**Status:** Design approved + Phase A merged (PR #44 / `9cf9458`); spec + plan hardened by 2× `/codex consult` + an opus whole-slice review. Remaining = Phases I / C / D.
+**Linear:** Dedicated project **"EQ-95 Approvals Queue"** (`35b53a66-bb36-490b-9798-ec5bd81cb1e8`, team Eq-core), de-scoped from Granola into its own project. Phase issues: EQ-222 (A, Done) · EQ-223 (I) · EQ-224 (C, next) · EQ-225 (D).
 **Repos:** `live-transcription-fastapi` (backend read API) + `eq-frontend` (UI). Smoke runs against **dev only**.
 
 ---
