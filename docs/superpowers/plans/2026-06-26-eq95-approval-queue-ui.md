@@ -958,6 +958,15 @@ git commit -m "test(EQ-95): dev-only script-first e2e smoke for the approvals wo
 
 ---
 
+## Phase A — final-review follow-ups (2026-06-26)
+
+Phase A (backend) is built, reviewed, and merged-to-branch (commits `9b56047`, `bc453d6`, `ed19592`, `8be9270`); 14/14 mock tests pass; `LIST_QUEUE_SQL` EXPLAIN-validated clean against eq-dev. The opus whole-slice review surfaced these non-blocking follow-ups:
+
+- **PRE-PROD (Important #1):** `GET /queue` is the first reader of `calendar_events` + `calendar_event_attendees`. Before prod repointing (EQ-120) wires the dropdown in prod, confirm the prod role `eqprod_transcription` has `SELECT` on both tables (`\dp calendar_events` / `\dp calendar_event_attendees`), or the list fails closed in prod while passing all dev tests. Operational check, not a code change.
+- **Frontend-contract notes (Minors, for Phase C):**
+  - A `403` from `/queue`, `/queue/count`, `/queue/{id}` means "pg identity not bridged," NOT "forbidden — stop retrying." The dropdown should treat it as a transient identity state, not a hard stop. (The frontend `protectedProcedure` already guarantees `pgUserId`, so this should not occur in practice.)
+  - `attendeeCount`, `meetingTitle`, `occurredAt` are JSON `null` (not `0`/empty) when `contextSource === 'none'`. The panel already falls back to domain + contacts in that case.
+
 ## Execution Notes
 - **Backend (Phase A) executes in this repo/session.** Frontend (Phase C) executes in an `eq-frontend` worktree. Index (Phase I) is an eq-frontend DDL change. E2E (Phase D) spans both, dev only.
 - **`/codex consult` on this plan: DONE 2026-06-26** (resumed session). 2 P1s + 6 P2s folded in: C3 snapshot-union (provisioning rows survive the pending-only list refetch); `LIST_QUEUE_SQL` `att ON ce.id IS NOT NULL` (no stray attendee_count when context='none'); tenant-scoped `calendar_events` join; email-deduped contacts (`DISTINCT ON`); deterministic tie-break (`created_at, id`); legacy-auth rejection test; partial index; C3 stall timeout. Codex confirmed (no change): route shape (`@router.get("")` serves `/queue`; static `/count` before dynamic `/{id}`), test-harness reuse (`_make_jwt(pg_user_id=None)`, `_execute_result(scalar_one=/all_rows=)` all exist), the completion predicate, and the index-in-eq-frontend call.
