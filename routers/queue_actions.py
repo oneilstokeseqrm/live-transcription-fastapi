@@ -305,6 +305,20 @@ MAP_RESERVE_SQL = text("""
 """)
 
 
+# Owner-scoped count of pending (non-archived) queue entries for the
+# authenticated user. Used by GET /queue/count (Task A1, EQ-95).
+# Both predicates use CAST(:x AS uuid) — never :x::uuid — per the
+# project-wide portable-bind convention (see APPROVE_SQL note above).
+COUNT_QUEUE_SQL = text("""
+    SELECT count(*) AS count
+    FROM pending_account_mappings
+    WHERE tenant_id = CAST(:tenant_id AS uuid)
+      AND owner_user_id = CAST(:owner_user_id AS uuid)
+      AND archived_at IS NULL
+      AND status = 'pending'
+""")
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -393,6 +407,24 @@ def _validate_uuid_path_param(value: str, field_name: str) -> str:
     return value
 
 
+def _require_owner_identity(ctx) -> str:
+    """Owner identity for READ endpoints: a UUID-shaped pg_user_id.
+
+    JWT-only enforcement without an auth-method flag: legacy header auth never
+    populates pg_user_id (utils/context_utils.py), so requiring it here rejects
+    spoofable X-Tenant-ID/X-User-ID headers on this non-RLS table. No fallback
+    to user_id (the Auth0 sub) — owner_user_id is a pg UUID.
+    """
+    owner = getattr(ctx, "pg_user_id", None)
+    if not owner:
+        raise HTTPException(status_code=403, detail="pg_user_id claim required")
+    try:
+        uuid.UUID(owner)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=403, detail="pg_user_id must be UUID-shaped")
+    return owner
+
+
 def _effective_user_id(ctx) -> str:
     """Return pg_user_id when present, falling back to the JWT subject.
 
@@ -421,6 +453,28 @@ def _effective_user_id(ctx) -> str:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+
+@router.get("/count")
+async def queue_count(request: Request):
+    """Return the count of pending (non-archived) queue entries owned by the caller.
+
+    JWT-only: requires a UUID-shaped pg_user_id claim. Legacy header auth
+    (X-Tenant-ID / X-User-ID) never populates pg_user_id, so _require_owner_identity
+    rejects those requests with 403.
+
+    Registered before any GET /{queue_id} dynamic route so /count is matched as a
+    static path (routing order guarantee).
+    """
+    ctx = get_auth_context_polling(request)
+    owner_id = _require_owner_identity(ctx)
+    async with get_async_session() as session:
+        result = await session.execute(
+            COUNT_QUEUE_SQL,
+            {"tenant_id": ctx.tenant_id, "owner_user_id": owner_id},
+        )
+        count = result.scalar_one()
+    return {"count": int(count)}
 
 
 @router.post("/{queue_id}/approve", status_code=202)
