@@ -303,3 +303,53 @@ def test_status_sql_is_owner_and_tenant_scoped():
     assert "id = CAST(:queue_id AS uuid)" in sql
     assert "tenant_id = CAST(:tenant_id AS uuid)" in sql
     assert "owner_user_id = CAST(:owner_user_id AS uuid)" in sql
+
+
+# ---------------------------------------------------------------------------
+# Task A3: GET /queue (list) tests
+# ---------------------------------------------------------------------------
+
+
+def test_list_rejects_missing_jwt(client):
+    assert client.get("/queue").status_code == 401
+
+
+def test_list_requires_pg_user_id(client):
+    token = _make_jwt(pg_user_id=None)
+    assert client.get("/queue", headers={"Authorization": f"Bearer {token}"}).status_code == 403
+
+
+def test_list_happy_path(client):
+    qid = str(uuid.uuid4())
+    row = MagicMock(
+        queue_id=qid, domain="acme.com", status="pending", source_type="transcript",
+        created_at="2026-06-26T00:00:00+00:00", expires_at="2026-07-26T00:00:00+00:00",
+        re_open_count=0, contact_count=2,
+        contacts=[{"email": "jane@acme.com", "displayName": "Jane", "role": "VP"}],
+        context_source="calendar", meeting_title="Q3 Sync",
+        occurred_at="2026-06-20T10:00:00+00:00", attendee_count=3,
+    )
+    session = _SessionStub(execute_results=[_execute_result(all_rows=[row])])
+    with _patch_session(session):
+        r = client.get("/queue", headers={"Authorization": f"Bearer {_make_jwt(pg_user_id=PG_USER_UUID)}"})
+    assert r.status_code == 200, r.text
+    entries = r.json()["entries"]
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["queueId"] == qid and e["domain"] == "acme.com"
+    assert e["contactCount"] == 2 and e["contextSource"] == "calendar"
+    assert e["meetingTitle"] == "Q3 Sync"
+
+
+def test_list_sql_is_owner_scoped_pending_and_batched():
+    from routers.queue_actions import LIST_QUEUE_SQL
+    sql = str(LIST_QUEUE_SQL)
+    assert "owner_user_id = CAST(:owner_user_id AS uuid)" in sql
+    assert "tenant_id = CAST(:tenant_id AS uuid)" in sql
+    assert "archived_at IS NULL" in sql
+    assert "status = 'pending'" in sql
+    assert "LIMIT" in sql
+    # batched: contacts aggregated, not per-row fetched
+    assert "jsonb_agg" in sql or "json_agg" in sql
+    # NO email/interaction_summary branch in V1 — calendar only
+    assert "pending_interactions" not in sql
