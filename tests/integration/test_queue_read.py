@@ -346,6 +346,7 @@ def test_list_sql_is_owner_scoped_pending_and_batched():
     sql = str(LIST_QUEUE_SQL)
     assert "owner_user_id = CAST(:owner_user_id AS uuid)" in sql
     assert "tenant_id = CAST(:tenant_id AS uuid)" in sql
+    assert "ce.tenant_id = CAST(:tenant_id AS uuid)" in sql
     assert "archived_at IS NULL" in sql
     assert "status = 'pending'" in sql
     assert "LIMIT" in sql
