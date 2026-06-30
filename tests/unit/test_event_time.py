@@ -82,6 +82,26 @@ def test_trusted_exactly_at_max_age_accepted():
     assert resolve_event_time(boundary, trusted=True, now=NOW) == boundary
 
 
+def test_max_past_age_is_three_years():
+    # Widened from 2y (730d) to 3y (1095d) for multi-year synthetic CRM
+    # histories (long_term_customer archetype reaches ~2.1y back).
+    assert MAX_PAST_AGE == timedelta(days=1095)
+
+
+def test_trusted_two_and_a_half_years_accepted():
+    # ~2.5y ago: rejected under the old 730d bound, accepted under 1095d.
+    past = NOW - timedelta(days=912)
+    assert resolve_event_time(past, trusted=True, now=NOW) == past
+
+
+def test_trusted_three_and_a_half_years_rejected():
+    # ~3.5y ago: still beyond the 3y bound — must stay rejected (no over-widen).
+    too_old = NOW - timedelta(days=1278)
+    with pytest.raises(HTTPException) as exc:
+        resolve_event_time(too_old, trusted=True, now=NOW)
+    assert exc.value.status_code == 400
+
+
 def test_naive_now_rejected_on_omitted_path():
     """A naive ``now`` is a caller (EQ-231) bug — fail loud, even when occurred_at
     is omitted, so a naive timestamp never reaches the 'append Z' serializer."""

@@ -168,7 +168,8 @@ def test_trusted_future_occurred_at_rejected_400():
 
 
 def test_trusted_too_old_occurred_at_rejected_400():
-    too_old = datetime.now(timezone.utc) - timedelta(days=800)
+    # Beyond the ~3-year (1095-day) past bound.
+    too_old = datetime.now(timezone.utc) - timedelta(days=1200)
     response, _ = _run_clean(occurred_at=too_old.isoformat(), trusted=True)
     assert response.status_code == 400, response.text
 
