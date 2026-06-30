@@ -24,6 +24,12 @@ class RequestContext:
         account_id: Account anchor; required for ingestion auth contexts.
         interaction_id: UUID v4 uniquely identifying this specific request
         trace_id: UUID v4 for distributed tracing (from X-Trace-Id header or generated)
+        trusted_event_time: True only when identity came through the verified
+            internal-JWT path. Gates whether a caller-supplied ``occurred_at``
+            is honored (EQ-230). Defaults False so any context built outside
+            the verified-JWT path — legacy headers, the lenient/websocket
+            fallback, or a bare construction — is untrusted by default. Trust
+            is never inferred from a header.
     """
     tenant_id: str
     user_id: str
@@ -32,3 +38,4 @@ class RequestContext:
     trace_id: str
     pg_user_id: Optional[str] = None
     user_name: Optional[str] = None
+    trusted_event_time: bool = False
