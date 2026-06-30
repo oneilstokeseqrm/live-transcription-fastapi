@@ -24,10 +24,12 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
-# Freshness guardrails (DECISIONS-LOG #4/#14): accept event-times up to ~2 years
-# in the past; allow a small future skew for clock drift between the caller and
-# this service. Reject anything outside that window.
-MAX_PAST_AGE = timedelta(days=730)  # ~2 years
+# Freshness guardrails (DECISIONS-LOG #4/#14, widened in #25): accept event-times
+# up to ~3 years in the past; allow a small future skew for clock drift between
+# the caller and this service. Reject anything outside that window.
+# Widened 2y->3y (730->1095d) so multi-year synthetic CRM histories (the
+# long_term_customer archetype reaches ~2.1y back) aren't rejected. Dev-only need.
+MAX_PAST_AGE = timedelta(days=1095)  # ~3 years
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 
 
@@ -58,7 +60,7 @@ def resolve_event_time(
 
     Raises:
         HTTPException: 400 when a trusted, well-formed ``occurred_at`` is outside
-            the accepted window (older than ~2 years or more than ~5 minutes in
+            the accepted window (older than ~3 years or more than ~5 minutes in
             the future), or — defense-in-depth — if a naive ``occurred_at``
             reaches this helper on the trusted path.
         ValueError: when ``now`` is naive. ``now`` is supplied by our own code
