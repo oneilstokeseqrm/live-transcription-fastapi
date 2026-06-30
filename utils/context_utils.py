@@ -368,6 +368,12 @@ def _extract_context_from_jwt(
         trace_id=trace_id,
         pg_user_id=claims.pg_user_id,
         user_name=claims.user_name,
+        # This is the ONLY constructor that sets trusted_event_time=True:
+        # identity was proven by a verified internal JWT. The legacy-header
+        # path (get_validated_context) and the lenient path
+        # (get_request_context) leave it at the False default so a
+        # caller-supplied occurred_at is honored only from trusted callers.
+        trusted_event_time=True,
     )
 
 

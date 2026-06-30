@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -62,14 +63,19 @@ async def _call_process(envelope: EnvelopeV1, lane2_extras: Optional[Lane2Extras
 # ---------------------------------------------------------------------------
 
 
-def _build_envelope(*, text: str = "raw text", interaction_id: Optional[uuid.UUID] = None) -> EnvelopeV1:
+def _build_envelope(
+    *,
+    text: str = "raw text",
+    interaction_id: Optional[uuid.UUID] = None,
+    timestamp: Optional[datetime] = None,
+) -> EnvelopeV1:
     """Construct an EnvelopeV1 with sensible defaults."""
     return EnvelopeV1(
         tenant_id=uuid.uuid4(),
         user_id="auth0|test-user",
         interaction_type="note",
         content=ContentModel(text=text, format="plain"),
-        timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        timestamp=timestamp or datetime.now(timezone.utc),
         source="api",
         extras={},
         interaction_id=interaction_id or uuid.uuid4(),
@@ -287,6 +293,62 @@ async def test_process_lane2_uses_cleaned_transcript_override():
     assert call_kwargs["calendar_event_id"] == "cal-1"
     assert call_kwargs["enrichment_confidence"] == "high"
     assert call_kwargs["enrichment_match_method"] == "conference_url"
+
+
+@pytest.mark.asyncio
+async def test_process_threads_envelope_timestamp_into_lane2():
+    """process() passes envelope.timestamp as Lane-2 interaction_timestamp.
+
+    Single source of event-time (EQ-231 / A2): the envelope's timestamp — now()
+    for real-time, occurred_at for backdated /text/clean, detail.created_at for
+    Granola — must become the Lane-2 interaction_timestamp (which lands in
+    raw_interactions / interaction_summary_entries) rather than a fresh utcnow()
+    inside IntelligenceService. Centralizing here fixes every caller at once.
+    """
+    assert try_reserve_lane2_slot()
+    pub_patch, _ = _patch_aws_publisher()
+    int_patch, intelligence_instance = _patch_intelligence_service()
+
+    event_time = datetime(2026, 3, 1, 14, 30, 0, tzinfo=timezone.utc)
+    envelope = _build_envelope(timestamp=event_time)
+    with pub_patch, int_patch:
+        await _call_process(envelope, lane2_extras=None)
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if intelligence_instance.process_transcript.await_count > 0:
+                break
+
+    call_kwargs = intelligence_instance.process_transcript.await_args.kwargs
+    assert call_kwargs["interaction_timestamp"] == event_time
+
+
+@pytest.mark.asyncio
+async def test_process_granola_historical_timestamp_threads_into_lane2():
+    """Granola Lane-2 fix (mandatory): a Granola-shaped envelope built with a
+    historical timestamp (Granola sets timestamp=detail.created_at) must stamp
+    Lane-2's interaction_timestamp with that past date, NOT utcnow().
+
+    This pins the latent-drift fix: pre-EQ-231, process() never passed
+    interaction_timestamp, so IntelligenceService defaulted to utcnow() and
+    Granola's true meeting date was silently lost at the Lane-2 layer even
+    though its envelope.timestamp was correct. Granola passes no
+    cleaned_transcript override, so this mirrors that call shape.
+    """
+    assert try_reserve_lane2_slot()
+    pub_patch, _ = _patch_aws_publisher()
+    int_patch, intelligence_instance = _patch_intelligence_service()
+
+    granola_created_at = datetime(2025, 11, 15, 18, 0, 0, tzinfo=timezone.utc)
+    envelope = _build_envelope(text="granola meeting", timestamp=granola_created_at)
+    with pub_patch, int_patch:
+        await _call_process(envelope, lane2_extras=None)
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if intelligence_instance.process_transcript.await_count > 0:
+                break
+
+    call_kwargs = intelligence_instance.process_transcript.await_args.kwargs
+    assert call_kwargs["interaction_timestamp"] == granola_created_at
 
 
 @pytest.mark.asyncio

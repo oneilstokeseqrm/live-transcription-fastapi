@@ -24,6 +24,7 @@ from services.transcript_enrichment import TranscriptEnrichmentService
 from services.internal_domains import get_tenant_internal_domains
 from services import text_clean_service
 from utils.context_utils import get_auth_context_ingestion
+from utils.event_time import resolve_event_time
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,20 @@ async def clean_text(body: TextCleanRequest, request: Request):
             ),
         )
 
+    # Resolve the interaction event-time ONCE — the single source that feeds
+    # BOTH enrich(transcript_timestamp=...) (calendar match window + front-matter
+    # date) AND EnvelopeV1.timestamp below. Trusted internal-JWT callers may
+    # supply a historical occurred_at (normalized + bounds-checked in
+    # resolve_event_time); everyone else (and the omitted case) gets now(), so
+    # real-time ingestion is byte-for-byte unchanged. Computed BEFORE reserving
+    # a Lane 2 slot so an out-of-bounds occurred_at (400) produces zero side
+    # effects (no slot reserved, no enrichment writes).
+    transcript_ts = resolve_event_time(
+        body.occurred_at,
+        trusted=context.trusted_event_time,
+        now=datetime.now(timezone.utc),
+    )
+
     # Backpressure: cap concurrent Lane 2 background tasks so bursty traffic
     # can't spawn unbounded OpenAI calls + DB sessions. Atomic check +
     # reserve happens BEFORE any side-effecting awaits (enrichment writes
@@ -134,7 +149,6 @@ async def clean_text(body: TextCleanRequest, request: Request):
         # for caller-wins semantics when both a calendar match and
         # body.participants are present. (Task 1.26.6)
         enrichment_service = TranscriptEnrichmentService()
-        transcript_ts = datetime.now(timezone.utc)
         enrichment = await enrichment_service.enrich(
             tenant_id=context.tenant_id,
             transcript_timestamp=transcript_ts,
