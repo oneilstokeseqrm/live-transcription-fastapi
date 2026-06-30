@@ -423,6 +423,15 @@ async def process(
                     trace_id=envelope.trace_id or "",
                     interaction_type=envelope.interaction_type,
                     account_id=envelope.account_id,
+                    # Single source of event-time: thread the envelope's
+                    # timestamp into Lane 2 so raw_interactions /
+                    # interaction_summary_entries.interaction_timestamp matches
+                    # the envelope (now() for real-time, occurred_at for a
+                    # backdated /text/clean, detail.created_at for Granola)
+                    # instead of IntelligenceService defaulting to a fresh
+                    # utcnow(). Centralizing here fixes every caller — including
+                    # the latent Granola drift — in one place (EQ-231 / A2).
+                    interaction_timestamp=envelope.timestamp,
                     contact_ids=contact_ids,
                     calendar_event_id=calendar_event_id,
                     enrichment_confidence=enrichment_confidence,

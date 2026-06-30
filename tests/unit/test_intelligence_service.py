@@ -7,7 +7,7 @@ Tests the IntelligenceService methods with mocked dependencies.
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from models.extraction_models import (
     InteractionAnalysis,
@@ -251,6 +251,64 @@ class TestProcessTranscript:
         )
 
         assert result is None
+
+    async def _capture_persisted_timestamp(self, service, mock_analysis, *, interaction_timestamp):
+        """Run process_transcript with persistence mocked; return the
+        interaction_timestamp handed to _persist_intelligence."""
+        service._extract_intelligence = AsyncMock(return_value=mock_analysis)
+        captured: dict = {}
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+
+        service._persist_intelligence = AsyncMock(side_effect=_capture)
+        await service.process_transcript(
+            cleaned_transcript="t",
+            interaction_id="550e8400-e29b-41d4-a716-446655440000",
+            tenant_id="550e8400-e29b-41d4-a716-446655440001",
+            account_id="550e8400-e29b-41d4-a716-446655440003",
+            trace_id="550e8400-e29b-41d4-a716-446655440002",
+            interaction_type="meeting",
+            interaction_timestamp=interaction_timestamp,
+        )
+        return captured["interaction_timestamp"]
+
+    @pytest.mark.asyncio
+    async def test_process_transcript_normalizes_aware_utc_to_naive(self, service, mock_analysis):
+        """Lane-2 columns are TIMESTAMP WITHOUT TIME ZONE and asyncpg REJECTS
+        aware datetimes (DataError). Since /text/clean and Granola now pass an
+        aware envelope.timestamp, process_transcript must hand
+        _persist_intelligence a NAIVE UTC value — matching the legacy
+        datetime.utcnow() storage convention — or the background persist crashes.
+        """
+        aware = datetime(2026, 3, 1, 14, 30, tzinfo=timezone.utc)
+        ts = await self._capture_persisted_timestamp(
+            service, mock_analysis, interaction_timestamp=aware
+        )
+        assert ts.tzinfo is None
+        assert ts == datetime(2026, 3, 1, 14, 30)
+
+    @pytest.mark.asyncio
+    async def test_process_transcript_normalizes_offset_aware_to_naive_utc(self, service, mock_analysis):
+        """An offset-aware value is converted to UTC THEN made naive (UTC wall
+        clock), not just tz-stripped at local offset."""
+        offset = datetime(2026, 3, 1, 9, 30, tzinfo=timezone(timedelta(hours=-5)))
+        ts = await self._capture_persisted_timestamp(
+            service, mock_analysis, interaction_timestamp=offset
+        )
+        assert ts.tzinfo is None
+        assert ts == datetime(2026, 3, 1, 14, 30)  # 09:30-05:00 == 14:30Z
+
+    @pytest.mark.asyncio
+    async def test_process_transcript_naive_interaction_timestamp_unchanged(self, service, mock_analysis):
+        """A naive value (legacy/fallback convention = naive UTC) passes through
+        unchanged — byte-for-byte the pre-occurred_at behavior."""
+        naive = datetime(2026, 3, 1, 14, 30)
+        ts = await self._capture_persisted_timestamp(
+            service, mock_analysis, interaction_timestamp=naive
+        )
+        assert ts.tzinfo is None
+        assert ts == naive
 
 
 class TestServiceInitialization:

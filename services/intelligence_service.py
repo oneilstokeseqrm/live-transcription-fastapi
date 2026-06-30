@@ -7,7 +7,7 @@ them to Postgres (Neon).
 import os
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -29,6 +29,29 @@ from services.database import get_async_session
 from services.tenant_scope import tenant_session
 
 logger = logging.getLogger(__name__)
+
+
+def _to_naive_utc(dt: Optional[datetime]) -> datetime:
+    """Normalize an event-time for the naive TIMESTAMP columns Lane 2 writes.
+
+    The ``interaction_timestamp`` columns (``interaction_summary_entries``,
+    ``interaction_insights``) are ``TIMESTAMP WITHOUT TIME ZONE`` storing UTC
+    wall-clock — the legacy convention from ``datetime.utcnow()``. asyncpg
+    REJECTS tz-aware datetimes for those columns (DataError), so an aware value
+    threaded in from the route (``datetime.now(timezone.utc)``) or the Granola
+    adapter (``detail.created_at``) must be converted to UTC and made naive
+    before persistence, or the Lane 2 background write crashes. ``None`` falls
+    back to now() (naive UTC), preserving the pre-occurred_at default.
+    """
+    if dt is None:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+    # Aware iff tzinfo AND a concrete offset (mirrors resolve_event_time /
+    # TextCleanRequest's awareness check). A pathological tzinfo whose
+    # utcoffset() is None is NOT reliably convertible, so fall through and strip
+    # it to a clean naive value rather than letting astimezone() guess local.
+    if dt.tzinfo is not None and dt.utcoffset() is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.replace(tzinfo=None)
 
 
 class IntelligenceService:
@@ -108,7 +131,11 @@ class IntelligenceService:
                 persona_code=persona_code,
                 interaction_type=interaction_type,
                 account_id=account_id,
-                interaction_timestamp=interaction_timestamp or datetime.utcnow()
+                # Lane-2 columns are TIMESTAMP WITHOUT TIME ZONE (UTC wall-clock);
+                # asyncpg rejects aware datetimes. Normalize the (now possibly
+                # aware) event-time to naive UTC so /text/clean's occurred_at and
+                # Granola's detail.created_at persist instead of crashing.
+                interaction_timestamp=_to_naive_utc(interaction_timestamp),
             )
             
             logger.info(
